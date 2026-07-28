@@ -38,7 +38,12 @@ import {
 	getCodexCliConfigPath,
 	loadCodexCliState,
 } from "../codex-cli/state.js";
-import { setCodexCliActiveSelection } from "../codex-cli/writer.js";
+import {
+	ensureCodexCliFileAuthStore,
+	readTopLevelCodexCliAuthStoreMode,
+	setCodexCliActiveSelection,
+	shouldEnforceCodexCliFileAuthStore,
+} from "../codex-cli/writer.js";
 import { MODEL_FAMILIES, type ModelFamily } from "../prompts/codex.js";
 import { DEFAULT_PROBE_MODEL, resolveNormalizedModel } from "../request/helpers/model-map.js";
 import { loadPersistedRuntimeObservabilitySnapshot } from "../runtime/runtime-observability.js";
@@ -1778,14 +1783,17 @@ export async function runDoctor(
 		details: codexConfigPath,
 	});
 
+	const supplementalFixActions: DoctorFixAction[] = [];
+	// Tracked separately from account storage: pinning the auth store is a real
+	// remediation even on a machine with no accounts yet, which is exactly the
+	// state a user hitting repeated keychain prompts tends to be in.
+	let authStoreFixChanged = false;
+
 	let codexAuthStoreMode: string | undefined;
 	if (codexConfigFileExists) {
 		try {
 			const configRaw = await fs.readFile(codexConfigPath, "utf-8");
-			const match = configRaw.match(/^\s*cli_auth_credentials_store\s*=\s*"([^"]+)"\s*$/m);
-			if (match?.[1]) {
-				codexAuthStoreMode = match[1].trim();
-			}
+			codexAuthStoreMode = readTopLevelCodexCliAuthStoreMode(configRaw) ?? undefined;
 		} catch (error) {
 			addCheck({
 				key: "codex-auth-store",
@@ -1796,6 +1804,57 @@ export async function runDoctor(
 		}
 	}
 	if (!checks.some((check) => check.key === "codex-auth-store")) {
+		// A config that is not pinned to "file" is what makes the official CLI
+		// reach into the macOS login keychain, so `--fix` repairs it directly
+		// instead of waiting for the incidental `pendingCodexActiveSync` path
+		// below, which only fires when there is an active account to mirror.
+		if (
+			options.fix &&
+			codexAuthStoreMode !== "file" &&
+			shouldEnforceCodexCliFileAuthStore()
+		) {
+			if (options.dryRun) {
+				authStoreFixChanged = true;
+				supplementalFixActions.push({
+					key: "codex-auth-store",
+					message:
+						"Prepared Codex CLI credential store pin to file in config.toml (dry-run)",
+				});
+			} else {
+				try {
+					if (await ensureCodexCliFileAuthStore(codexConfigPath)) {
+						codexAuthStoreMode = "file";
+						authStoreFixChanged = true;
+						supplementalFixActions.push({
+							key: "codex-auth-store",
+							message: "Pinned Codex CLI credential store to file in config.toml",
+						});
+					}
+				} catch (error) {
+					addCheck({
+						key: "codex-auth-store-fix",
+						severity: "warn",
+						message: "Failed to pin Codex CLI credential store to file",
+						details: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		}
+
+		const authStoreDetails = [
+			codexAuthStoreMode ? `mode=${codexAuthStoreMode}` : "mode=unset",
+		];
+		if (codexAuthStoreMode !== "file" && !options.fix) {
+			authStoreDetails.push("run `codex-multi-auth doctor --fix` to pin it to file");
+		}
+		if (process.platform === "darwin" && codexAuthStoreMode === "file") {
+			// Purely informational: reading or deleting keychain items would
+			// itself raise the prompt this check exists to eliminate.
+			authStoreDetails.push(
+				"credentials saved by an earlier official `codex login` may still sit in the login keychain; they are no longer read and can be removed manually via Keychain Access",
+			);
+		}
+
 		addCheck({
 			key: "codex-auth-store",
 			severity: codexAuthStoreMode === "file" ? "ok" : "warn",
@@ -1803,7 +1862,7 @@ export async function runDoctor(
 				codexAuthStoreMode === "file"
 					? "Codex auth storage is set to file"
 					: "Codex auth storage is not explicitly set to file",
-			details: codexAuthStoreMode ? `mode=${codexAuthStoreMode}` : "mode=unset",
+			details: authStoreDetails.join("; "),
 		});
 	}
 
@@ -1824,7 +1883,6 @@ export async function runDoctor(
 	let fixChanged = false;
 	let storageFixChanged = false;
 	let structuralFixActions: DoctorFixAction[] = [];
-	const supplementalFixActions: DoctorFixAction[] = [];
 	let doctorRefreshMutation: DoctorRefreshMutation | null = null;
 	let pendingCodexActiveSync: {
 		accountId: string | undefined;
@@ -2203,7 +2261,11 @@ export async function runDoctor(
 
 	const fixActions = [...structuralFixActions, ...supplementalFixActions];
 
-	if (options.fix && storageForChecks && storageForChecks.accounts.length > 0) {
+	if (
+		options.fix &&
+		((storageForChecks && storageForChecks.accounts.length > 0) ||
+			authStoreFixChanged)
+	) {
 		fixChanged = storageFixChanged || fixActions.length > 0;
 		addCheck({
 			key: "auto-fix",

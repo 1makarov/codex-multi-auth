@@ -99,6 +99,46 @@ function createWrapperFixture(): string {
 	return fixtureRoot;
 }
 
+/**
+ * Stubs `dist/lib/codex-cli/writer.js` so the wrapper's startup auth-store
+ * guard has something to import. Each call drops a marker file named after the
+ * calling pid — one file per process rather than shared appends, so concurrent
+ * launches cannot race on the record itself. Throws when
+ * `CODEX_MULTI_AUTH_TEST_AUTH_STORE_FAIL` is set so the non-fatal path can be
+ * exercised. The real TOML rewrite is covered by test/codex-cli-writer.test.ts.
+ */
+function createAuthStoreWriterFixtureModule(fixtureRoot: string): string {
+	const writerDir = join(fixtureRoot, "dist", "lib", "codex-cli");
+	mkdirSync(writerDir, { recursive: true });
+	const callDir = join(fixtureRoot, "auth-store-calls");
+	mkdirSync(callDir, { recursive: true });
+	writeFileSync(
+		join(writerDir, "writer.js"),
+		[
+			'import { writeFileSync } from "node:fs";',
+			'import { join } from "node:path";',
+			"",
+			"export async function ensureCodexCliFileAuthStore(configPath) {",
+			`  writeFileSync(join(${JSON.stringify(callDir)}, String(process.pid)), String(configPath ?? "default"), "utf8");`,
+			"  if ((process.env.CODEX_MULTI_AUTH_TEST_AUTH_STORE_FAIL ?? '') === '1') {",
+			"    const error = new Error('EBUSY: resource busy or locked');",
+			"    error.code = 'EBUSY';",
+			"    throw error;",
+			"  }",
+			"  return true;",
+			"}",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	return callDir;
+}
+
+function readAuthStoreCallCount(callDir: string): number {
+	if (!existsSync(callDir)) return 0;
+	return readdirSync(callDir).length;
+}
+
 function createRuntimeObservabilityFixtureModule(fixtureRoot: string): string {
 	const runtimeDir = join(fixtureRoot, "dist", "lib", "runtime");
 	mkdirSync(runtimeDir, { recursive: true });
@@ -2982,6 +3022,123 @@ describe("codex bin wrapper", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("FORWARDED:exec status");
 		expect(result.stdout).not.toContain('cli_auth_credentials_store="file"');
+	});
+
+	// Issue #641: the per-invocation `-c` override only covers the process this
+	// wrapper spawns. Third-party front-ends exec the official binary directly
+	// and read config.toml, so the persisted value has to be reconciled too or
+	// they keep raising macOS login-keychain prompts.
+	it("reconciles the persisted auth store before forwarding", () => {
+		const fixtureRoot = createWrapperFixture();
+		const callDir = createAuthStoreWriterFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			'FORWARDED:exec status -c cli_auth_credentials_store="file"',
+		);
+		expect(readAuthStoreCallCount(callDir)).toBe(1);
+	});
+
+	it("skips the persisted auth-store reconcile when the opt-out env var is disabled", () => {
+		const fixtureRoot = createWrapperFixture();
+		const callDir = createAuthStoreWriterFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE: "0",
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).not.toContain('cli_auth_credentials_store="file"');
+		expect(readAuthStoreCallCount(callDir)).toBe(0);
+	});
+
+	// Windows locks config.toml aggressively (EPERM/EBUSY). A failed reconcile
+	// must never block the wrapped command — the per-invocation `-c` override
+	// still protects this run.
+	it("keeps forwarding when the persisted auth-store reconcile fails", () => {
+		const fixtureRoot = createWrapperFixture();
+		const callDir = createAuthStoreWriterFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_MULTI_AUTH_TEST_AUTH_STORE_FAIL: "1",
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			'FORWARDED:exec status -c cli_auth_credentials_store="file"',
+		);
+		expect(readAuthStoreCallCount(callDir)).toBe(1);
+	});
+
+	it("forwards normally when the compiled auth-store module is absent", () => {
+		const fixtureRoot = createWrapperFixture();
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			'FORWARDED:exec status -c cli_auth_credentials_store="file"',
+		);
+	});
+
+	// test/AGENTS.md requires the bin wrapper's lazy-load / missing-dist paths to
+	// be covered under concurrent invocations: the auth-store guard imports
+	// dist/ on every startup, so a missing module must degrade per-process
+	// rather than letting one launch's failed import affect another.
+	it("forwards every concurrent launch when the compiled auth-store module is absent", async () => {
+		const fixtureRoot = createWrapperFixture();
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const results = await Promise.all(
+			Array.from({ length: 4 }, () =>
+				runWrapperAsync(fixtureRoot, ["exec", "status"], {
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				}),
+			),
+		);
+
+		for (const result of results) {
+			expect(combinedOutput(result)).toContain(
+				'FORWARDED:exec status -c cli_auth_credentials_store="file"',
+			);
+			expect(result.status).toBe(0);
+		}
+	});
+
+	// Same shape, but with the module present: concurrent reconciles race on the
+	// same config.toml, and none of them may fail the wrapped command.
+	it("forwards every concurrent launch while reconciling the same config", async () => {
+		const fixtureRoot = createWrapperFixture();
+		const callDir = createAuthStoreWriterFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const results = await Promise.all(
+			Array.from({ length: 4 }, () =>
+				runWrapperAsync(fixtureRoot, ["exec", "status"], {
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				}),
+			),
+		);
+
+		for (const result of results) {
+			expect(combinedOutput(result)).toContain(
+				'FORWARDED:exec status -c cli_auth_credentials_store="file"',
+			);
+			expect(result.status).toBe(0);
+		}
+		expect(readAuthStoreCallCount(callDir)).toBe(4);
 	});
 
 	it("does not double-inject file auth store when caller already set it", () => {

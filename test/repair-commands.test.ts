@@ -1021,6 +1021,212 @@ describe("repair-commands direct deps coverage", () => {
 		);
 	});
 
+	// Issue #641: a config.toml still pointing at the keychain is what makes the
+	// official CLI raise repeated macOS login-keychain prompts, so `--fix` has to
+	// repair it directly rather than leaving a bare warning behind.
+	describe("runDoctor codex-auth-store remediation", () => {
+		// vi.clearAllMocks() keeps implementations, so a mockReturnValue/
+		// mockResolvedValue set by one case bleeds into the next unless reset here.
+		beforeEach(() => {
+			codexCliWriterMocks.shouldEnforceCodexCliFileAuthStore.mockReset();
+			codexCliWriterMocks.shouldEnforceCodexCliFileAuthStore.mockReturnValue(
+				true,
+			);
+			codexCliWriterMocks.ensureCodexCliFileAuthStore.mockReset();
+			codexCliWriterMocks.readTopLevelCodexCliAuthStoreMode.mockReset();
+		});
+
+		function arrangeAuthStore(mode: string | null): void {
+			existsSyncMock.mockImplementation(
+				(path) => path === "/mock/config.toml",
+			);
+			readFileMock.mockResolvedValue(
+				mode ? `cli_auth_credentials_store = "${mode}"\n` : "",
+			);
+			codexCliWriterMocks.readTopLevelCodexCliAuthStoreMode.mockReturnValue(mode);
+		}
+
+		function readPayload(consoleSpy: {
+			mock: { calls: unknown[][] };
+		}): Record<string, unknown> {
+			return JSON.parse(
+				String(consoleSpy.mock.calls.at(-1)?.[0] ?? "{}"),
+			) as Record<string, unknown>;
+		}
+
+		function readChecks(consoleSpy: {
+			mock: { calls: unknown[][] };
+		}): Array<Record<string, unknown>> {
+			return readPayload(consoleSpy).checks as Array<Record<string, unknown>>;
+		}
+
+		function readFix(consoleSpy: {
+			mock: { calls: unknown[][] };
+		}): { changed: boolean; actions: Array<Record<string, unknown>> } {
+			return readPayload(consoleSpy).fix as {
+				changed: boolean;
+				actions: Array<Record<string, unknown>>;
+			};
+		}
+
+		it("warns and points at --fix when the store is not pinned to file", async () => {
+			arrangeAuthStore("keychain");
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json"], createDeps());
+
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({
+					key: "codex-auth-store",
+					severity: "warn",
+					details: expect.stringContaining("doctor --fix") as unknown as string,
+				}),
+			);
+			expect(
+				codexCliWriterMocks.ensureCodexCliFileAuthStore,
+			).not.toHaveBeenCalled();
+		});
+
+		it("pins the store to file under --fix and reports the check as ok", async () => {
+			arrangeAuthStore("keychain");
+			codexCliWriterMocks.ensureCodexCliFileAuthStore.mockResolvedValue(true);
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix"], createDeps());
+
+			expect(codexCliWriterMocks.ensureCodexCliFileAuthStore).toHaveBeenCalledWith(
+				"/mock/config.toml",
+			);
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({
+					key: "codex-auth-store",
+					severity: "ok",
+					message: "Codex auth storage is set to file",
+				}),
+			);
+		});
+
+		// The #641 persona often has no accounts registered yet, so the fix
+		// summary must not report "nothing changed" after rewriting config.toml.
+		it("reports the remediation in fix metadata even with no accounts", async () => {
+			arrangeAuthStore("keychain");
+			codexCliWriterMocks.ensureCodexCliFileAuthStore.mockResolvedValue(true);
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix"], createDeps());
+
+			const fix = readFix(consoleSpy);
+			expect(fix.changed).toBe(true);
+			expect(fix.actions).toContainEqual(
+				expect.objectContaining({
+					key: "codex-auth-store",
+					message: "Pinned Codex CLI credential store to file in config.toml",
+				}),
+			);
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({ key: "auto-fix" }),
+			);
+		});
+
+		it("leaves an already-pinned store untouched", async () => {
+			arrangeAuthStore("file");
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix"], createDeps());
+
+			expect(
+				codexCliWriterMocks.ensureCodexCliFileAuthStore,
+			).not.toHaveBeenCalled();
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store", severity: "ok" }),
+			);
+		});
+
+		it("keeps doctor running when the config rewrite fails", async () => {
+			arrangeAuthStore("keychain");
+			codexCliWriterMocks.ensureCodexCliFileAuthStore.mockRejectedValue(
+				Object.assign(new Error("EBUSY: resource busy or locked"), {
+					code: "EBUSY",
+				}),
+			);
+			const consoleSpy = silenceConsole("log");
+
+			const exitCode = await runDoctor(["--json", "--fix"], createDeps());
+
+			expect(exitCode).toBe(0);
+			const checks = readChecks(consoleSpy);
+			expect(checks).toContainEqual(
+				expect.objectContaining({
+					key: "codex-auth-store-fix",
+					severity: "warn",
+					message: "Failed to pin Codex CLI credential store to file",
+				}),
+			);
+			expect(checks).toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store", severity: "warn" }),
+			);
+		});
+
+		// A dry run must not promise a rewrite the opt-out would suppress.
+		it("plans nothing when enforcement is opted out", async () => {
+			arrangeAuthStore("keychain");
+			codexCliWriterMocks.shouldEnforceCodexCliFileAuthStore.mockReturnValue(
+				false,
+			);
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix", "--dry-run"], createDeps());
+
+			expect(readFix(consoleSpy).actions).not.toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store" }),
+			);
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store", severity: "warn" }),
+			);
+		});
+
+		it("skips the rewrite entirely when enforcement is opted out", async () => {
+			arrangeAuthStore("keychain");
+			codexCliWriterMocks.shouldEnforceCodexCliFileAuthStore.mockReturnValue(
+				false,
+			);
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix"], createDeps());
+
+			expect(
+				codexCliWriterMocks.ensureCodexCliFileAuthStore,
+			).not.toHaveBeenCalled();
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store", severity: "warn" }),
+			);
+		});
+
+		it("does not rewrite config.toml on a dry run", async () => {
+			arrangeAuthStore("keychain");
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix", "--dry-run"], createDeps());
+
+			expect(
+				codexCliWriterMocks.ensureCodexCliFileAuthStore,
+			).not.toHaveBeenCalled();
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store", severity: "warn" }),
+			);
+			// A dry run still has to say what it would do, like every other fix.
+			const fix = readFix(consoleSpy);
+			expect(fix.changed).toBe(true);
+			expect(fix.actions).toContainEqual(
+				expect.objectContaining({
+					key: "codex-auth-store",
+					message:
+						"Prepared Codex CLI credential store pin to file in config.toml (dry-run)",
+				}),
+			);
+		});
+	});
+
 	it("runDoctor derives auto-fix state from the final action set", async () => {
 		const now = Date.now();
 		let persistedAccountStorage: unknown;

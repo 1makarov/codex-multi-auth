@@ -247,26 +247,111 @@ async function atomicWriteJson(path: string, payload: Record<string, unknown>): 
 	return atomicWriteText(path, JSON.stringify(payload, null, 2));
 }
 
-function shouldEnforceCodexCliFileAuthStore(): boolean {
+/**
+ * Whether `config.toml` may be rewritten to pin the credential store.
+ *
+ * Exported so callers that only *plan* a rewrite — `doctor --fix --dry-run` —
+ * can report the same outcome the real run would produce, instead of promising
+ * a change the opt-out would suppress.
+ */
+export function shouldEnforceCodexCliFileAuthStore(): boolean {
 	const override = (process.env.CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE ?? "1").trim();
 	return override !== "0";
 }
 
-function ensureTrailingNewline(value: string): string {
-	return value.endsWith("\n") ? value : `${value}\n`;
+/**
+ * Matches a complete TOML table header, mirroring `readTomlTableName` in
+ * `lib/runtime/config-toml.ts` (plus an optional trailing comment).
+ *
+ * A loose `/^\s*\[/` would also match a continuation line of a multi-line array
+ * such as `[1, 2],`, cutting the top-level scan short. The writer would then
+ * miss a real top-level assignment below it and insert a second one — a
+ * duplicate key, which is invalid TOML and stops the official CLI from starting.
+ */
+const TOML_TABLE_HEADER_PATTERN = /^\s*\[{1,2}\s*[^\]]+?\s*\]{1,2}\s*(?:#.*)?$/;
+
+function ensureTrailingNewline(value: string, lineEnding = "\n"): string {
+	return value.endsWith("\n") ? value : `${value}${lineEnding}`;
 }
 
-async function ensureCodexCliFileAuthStore(configPath: string): Promise<boolean> {
+/**
+ * Reads the top-level `cli_auth_credentials_store` value out of a raw
+ * `config.toml`.
+ *
+ * Mirrors the scoping rules of {@link ensureCodexCliFileAuthStore}: assignments
+ * inside a `[table]` belong to that table, so only lines before the first table
+ * header describe the official CLI's default credential store. Reporting a
+ * profile-scoped value as the effective one would let `doctor` call a config
+ * healthy while the CLI still reaches for the keychain.
+ *
+ * Both TOML string forms count. A literal string (`'file'`) is as valid as a
+ * basic string (`"file"`), so treating only the latter as real would make
+ * `doctor` warn about a perfectly healthy config. Literal strings have no
+ * escape sequences, and the values in play here are bare identifiers, so a
+ * non-greedy character class is an exact match for both forms.
+ *
+ * @param rawConfig - Full text of `config.toml`.
+ * @returns The declared mode, or `null` when no top-level assignment exists.
+ */
+export function readTopLevelCodexCliAuthStoreMode(rawConfig: string): string | null {
+	for (const line of rawConfig.split(/\r?\n/)) {
+		if (TOML_TABLE_HEADER_PATTERN.test(line)) break;
+		const match = line.match(
+			/^\s*cli_auth_credentials_store\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$/,
+		);
+		if (match) return (match[1] ?? match[2] ?? "").trim() || null;
+	}
+	return null;
+}
+
+/**
+ * Persists `cli_auth_credentials_store = "file"` as a top-level key in the
+ * official Codex CLI `config.toml`.
+ *
+ * The wrapper already appends `-c cli_auth_credentials_store="file"` to every
+ * command it forwards, but that only covers processes it launches itself.
+ * Third-party front-ends (menu-bar apps such as CodexBar, editor extensions)
+ * exec the official binary directly, so the *persisted* value is what decides
+ * whether the official CLI reaches into the macOS login keychain. Leaving it on
+ * `"keychain"` is what produces the repeated "Always Allow" prompts reported in
+ * issue #641.
+ *
+ * Only top-level assignments are rewritten. A `cli_auth_credentials_store`
+ * inside a `[profiles.*]` table must be left alone: rewriting it in place would
+ * mangle a scoped setting while still leaving the top-level default pointed at
+ * the keychain, so the prompts would continue.
+ *
+ * @param configPath - Config file to reconcile; defaults to the resolved Codex
+ * CLI `config.toml`.
+ * @returns `true` when the file was rewritten, `false` when it was already
+ * correct or enforcement is disabled.
+ */
+export async function ensureCodexCliFileAuthStore(
+	configPath: string = getCodexCliConfigPath(),
+): Promise<boolean> {
 	if (!shouldEnforceCodexCliFileAuthStore()) return false;
 
 	const desired = 'cli_auth_credentials_store = "file"';
 	const raw = existsSync(configPath) ? await fs.readFile(configPath, "utf-8") : "";
+
+	// Quote style is not ours to normalize: a literal-string `'file'` already
+	// keeps the CLI off the keychain, so rewriting it to `"file"` would churn a
+	// healthy config on every wrapper startup for no behavioral gain.
+	if (readTopLevelCodexCliAuthStoreMode(raw) === "file") return false;
+
+	// Preserve the file's existing line endings, as the runtime config rewriter
+	// does. Splitting on /\r?\n/ and rejoining with "\n" would silently convert a
+	// CRLF config.toml to LF -- an edit the user never asked for, and one this
+	// code now risks on every wrapper startup rather than only on account switch.
+	const lineEnding = raw.includes("\r\n") ? "\r\n" : "\n";
 	const lines = raw.length > 0 ? raw.split(/\r?\n/) : [];
 	const assignmentRegex = /^\s*cli_auth_credentials_store\s*=/;
 
 	let replaced = false;
+	let inTopLevelTable = true;
 	const nextLines = lines.map((line) => {
-		if (!replaced && assignmentRegex.test(line)) {
+		if (TOML_TABLE_HEADER_PATTERN.test(line)) inTopLevelTable = false;
+		if (inTopLevelTable && !replaced && assignmentRegex.test(line)) {
 			replaced = true;
 			return desired;
 		}
@@ -274,7 +359,9 @@ async function ensureCodexCliFileAuthStore(configPath: string): Promise<boolean>
 	});
 
 	if (!replaced) {
-		let insertAt = nextLines.findIndex((line) => /^\s*\[/.test(line));
+		let insertAt = nextLines.findIndex((line) =>
+			TOML_TABLE_HEADER_PATTERN.test(line),
+		);
 		if (insertAt < 0) insertAt = nextLines.length;
 		nextLines.splice(insertAt, 0, desired);
 		if (insertAt < nextLines.length - 1 && nextLines[insertAt + 1]?.trim().length !== 0) {
@@ -282,8 +369,8 @@ async function ensureCodexCliFileAuthStore(configPath: string): Promise<boolean>
 		}
 	}
 
-	const nextRaw = ensureTrailingNewline(nextLines.join("\n"));
-	if (nextRaw === ensureTrailingNewline(raw)) {
+	const nextRaw = ensureTrailingNewline(nextLines.join(lineEnding), lineEnding);
+	if (nextRaw === ensureTrailingNewline(raw, lineEnding)) {
 		return false;
 	}
 

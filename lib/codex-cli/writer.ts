@@ -266,14 +266,22 @@ function ensureTrailingNewline(value: string): string {
  * profile-scoped value as the effective one would let `doctor` call a config
  * healthy while the CLI still reaches for the keychain.
  *
+ * Both TOML string forms count. A literal string (`'file'`) is as valid as a
+ * basic string (`"file"`), so treating only the latter as real would make
+ * `doctor` warn about a perfectly healthy config. Literal strings have no
+ * escape sequences, and the values in play here are bare identifiers, so a
+ * non-greedy character class is an exact match for both forms.
+ *
  * @param rawConfig - Full text of `config.toml`.
  * @returns The declared mode, or `null` when no top-level assignment exists.
  */
 export function readTopLevelCodexCliAuthStoreMode(rawConfig: string): string | null {
 	for (const line of rawConfig.split(/\r?\n/)) {
 		if (/^\s*\[/.test(line)) break;
-		const match = line.match(/^\s*cli_auth_credentials_store\s*=\s*"([^"]*)"\s*(?:#.*)?$/);
-		if (match) return (match[1] ?? "").trim() || null;
+		const match = line.match(
+			/^\s*cli_auth_credentials_store\s*=\s*(?:"([^"]*)"|'([^']*)')\s*(?:#.*)?$/,
+		);
+		if (match) return (match[1] ?? match[2] ?? "").trim() || null;
 	}
 	return null;
 }
@@ -307,6 +315,12 @@ export async function ensureCodexCliFileAuthStore(
 
 	const desired = 'cli_auth_credentials_store = "file"';
 	const raw = existsSync(configPath) ? await fs.readFile(configPath, "utf-8") : "";
+
+	// Quote style is not ours to normalize: a literal-string `'file'` already
+	// keeps the CLI off the keychain, so rewriting it to `"file"` would churn a
+	// healthy config on every wrapper startup for no behavioral gain.
+	if (readTopLevelCodexCliAuthStoreMode(raw) === "file") return false;
+
 	const lines = raw.length > 0 ? raw.split(/\r?\n/) : [];
 	const assignmentRegex = /^\s*cli_auth_credentials_store\s*=/;
 	const tableHeaderRegex = /^\s*\[/;

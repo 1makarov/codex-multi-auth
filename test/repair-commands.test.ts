@@ -1035,11 +1035,27 @@ describe("repair-commands direct deps coverage", () => {
 			codexCliWriterMocks.readTopLevelCodexCliAuthStoreMode.mockReturnValue(mode);
 		}
 
+		function readPayload(consoleSpy: {
+			mock: { calls: unknown[][] };
+		}): Record<string, unknown> {
+			return JSON.parse(
+				String(consoleSpy.mock.calls.at(-1)?.[0] ?? "{}"),
+			) as Record<string, unknown>;
+		}
+
 		function readChecks(consoleSpy: {
 			mock: { calls: unknown[][] };
 		}): Array<Record<string, unknown>> {
-			return JSON.parse(String(consoleSpy.mock.calls.at(-1)?.[0] ?? "{}"))
-				.checks as Array<Record<string, unknown>>;
+			return readPayload(consoleSpy).checks as Array<Record<string, unknown>>;
+		}
+
+		function readFix(consoleSpy: {
+			mock: { calls: unknown[][] };
+		}): { changed: boolean; actions: Array<Record<string, unknown>> } {
+			return readPayload(consoleSpy).fix as {
+				changed: boolean;
+				actions: Array<Record<string, unknown>>;
+			};
 		}
 
 		it("warns and points at --fix when the store is not pinned to file", async () => {
@@ -1076,6 +1092,28 @@ describe("repair-commands direct deps coverage", () => {
 					severity: "ok",
 					message: "Codex auth storage is set to file",
 				}),
+			);
+		});
+
+		// The #641 persona often has no accounts registered yet, so the fix
+		// summary must not report "nothing changed" after rewriting config.toml.
+		it("reports the remediation in fix metadata even with no accounts", async () => {
+			arrangeAuthStore("keychain");
+			codexCliWriterMocks.ensureCodexCliFileAuthStore.mockResolvedValue(true);
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix"], createDeps());
+
+			const fix = readFix(consoleSpy);
+			expect(fix.changed).toBe(true);
+			expect(fix.actions).toContainEqual(
+				expect.objectContaining({
+					key: "codex-auth-store",
+					message: "Pinned Codex CLI credential store to file in config.toml",
+				}),
+			);
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({ key: "auto-fix" }),
 			);
 		});
 
@@ -1129,6 +1167,16 @@ describe("repair-commands direct deps coverage", () => {
 			).not.toHaveBeenCalled();
 			expect(readChecks(consoleSpy)).toContainEqual(
 				expect.objectContaining({ key: "codex-auth-store", severity: "warn" }),
+			);
+			// A dry run still has to say what it would do, like every other fix.
+			const fix = readFix(consoleSpy);
+			expect(fix.changed).toBe(true);
+			expect(fix.actions).toContainEqual(
+				expect.objectContaining({
+					key: "codex-auth-store",
+					message:
+						"Prepared Codex CLI credential store pin to file in config.toml (dry-run)",
+				}),
 			);
 		});
 	});

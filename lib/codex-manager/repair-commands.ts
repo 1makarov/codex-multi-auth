@@ -1783,6 +1783,10 @@ export async function runDoctor(
 	});
 
 	const supplementalFixActions: DoctorFixAction[] = [];
+	// Tracked separately from account storage: pinning the auth store is a real
+	// remediation even on a machine with no accounts yet, which is exactly the
+	// state a user hitting repeated keychain prompts tends to be in.
+	let authStoreFixChanged = false;
 
 	let codexAuthStoreMode: string | undefined;
 	if (codexConfigFileExists) {
@@ -1803,22 +1807,32 @@ export async function runDoctor(
 		// reach into the macOS login keychain, so `--fix` repairs it directly
 		// instead of waiting for the incidental `pendingCodexActiveSync` path
 		// below, which only fires when there is an active account to mirror.
-		if (options.fix && !options.dryRun && codexAuthStoreMode !== "file") {
-			try {
-				if (await ensureCodexCliFileAuthStore(codexConfigPath)) {
-					codexAuthStoreMode = "file";
-					supplementalFixActions.push({
-						key: "codex-auth-store",
-						message: "Pinned Codex CLI credential store to file in config.toml",
+		if (options.fix && codexAuthStoreMode !== "file") {
+			if (options.dryRun) {
+				authStoreFixChanged = true;
+				supplementalFixActions.push({
+					key: "codex-auth-store",
+					message:
+						"Prepared Codex CLI credential store pin to file in config.toml (dry-run)",
+				});
+			} else {
+				try {
+					if (await ensureCodexCliFileAuthStore(codexConfigPath)) {
+						codexAuthStoreMode = "file";
+						authStoreFixChanged = true;
+						supplementalFixActions.push({
+							key: "codex-auth-store",
+							message: "Pinned Codex CLI credential store to file in config.toml",
+						});
+					}
+				} catch (error) {
+					addCheck({
+						key: "codex-auth-store-fix",
+						severity: "warn",
+						message: "Failed to pin Codex CLI credential store to file",
+						details: error instanceof Error ? error.message : String(error),
 					});
 				}
-			} catch (error) {
-				addCheck({
-					key: "codex-auth-store-fix",
-					severity: "warn",
-					message: "Failed to pin Codex CLI credential store to file",
-					details: error instanceof Error ? error.message : String(error),
-				});
 			}
 		}
 
@@ -2242,7 +2256,11 @@ export async function runDoctor(
 
 	const fixActions = [...structuralFixActions, ...supplementalFixActions];
 
-	if (options.fix && storageForChecks && storageForChecks.accounts.length > 0) {
+	if (
+		options.fix &&
+		((storageForChecks && storageForChecks.accounts.length > 0) ||
+			authStoreFixChanged)
+	) {
 		fixChanged = storageFixChanged || fixActions.length > 0;
 		addCheck({
 			key: "auto-fix",

@@ -583,6 +583,29 @@ describe("codex-cli writer", () => {
       expect(await readFile(configPath, "utf-8")).toBe(original);
     });
 
+    // A TOML literal string is as valid as a basic string; rewriting it would
+    // churn a healthy config on every wrapper startup.
+    it("is a no-op when the store is a literal-string file", async () => {
+      const original = "cli_auth_credentials_store = 'file'\n";
+      await writeFile(configPath, original, "utf-8");
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(false);
+      expect(await readFile(configPath, "utf-8")).toBe(original);
+    });
+
+    it("rewrites a literal-string keychain value", async () => {
+      await writeFile(
+        configPath,
+        "cli_auth_credentials_store = 'keychain'\n",
+        "utf-8",
+      );
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
+      expect(await readFile(configPath, "utf-8")).toBe(
+        'cli_auth_credentials_store = "file"\n',
+      );
+    });
+
     it("creates the config file when it does not exist", async () => {
       expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
       expect(await readFile(configPath, "utf-8")).toBe(
@@ -633,6 +656,14 @@ describe("codex-cli writer", () => {
           'cli_auth_credentials_store = "keychain" # legacy\n',
         ),
       ).toBe("keychain");
+    });
+
+    it("reads literal-string values", () => {
+      expect(
+        readTopLevelCodexCliAuthStoreMode(
+          "cli_auth_credentials_store = 'file'\n",
+        ),
+      ).toBe("file");
     });
 
     it("ignores assignments scoped to a table", () => {

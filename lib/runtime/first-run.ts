@@ -10,7 +10,13 @@
 // command proceeds normally.
 
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { open, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
@@ -45,7 +51,7 @@ const CI_ENV_KEYS = [
 	"BITBUCKET_BUILD_NUMBER",
 ];
 
-type FirstRunStepStatus = "completed" | "skipped" | "failed";
+export type FirstRunStepStatus = "completed" | "skipped" | "failed";
 
 interface FirstRunSetupOutcome {
 	appBind: FirstRunStepStatus;
@@ -62,7 +68,17 @@ type FirstRunSkipReason =
 
 export type FirstRunResult =
 	| { ran: false; reason: FirstRunSkipReason }
+	| { ran: false; reason: "migrated"; authStore: FirstRunStepStatus }
 	| ({ ran: true } & FirstRunSetupOutcome);
+
+interface FirstRunMarker {
+	version?: number;
+	startedAt?: number;
+	completedAt?: number;
+	appBind?: FirstRunStepStatus;
+	launcher?: FirstRunStepStatus;
+	authStore?: FirstRunStepStatus;
+}
 
 export interface FirstRunSetupDeps {
 	env?: NodeJS.ProcessEnv;
@@ -401,6 +417,79 @@ async function defaultEnforceAuthStore(): Promise<FirstRunStepStatus> {
 	return (await ensureCodexCliFileAuthStore()) ? "completed" : "skipped";
 }
 
+function readFirstRunMarker(markerPath: string): FirstRunMarker | null {
+	try {
+		const parsed: unknown = JSON.parse(readFileSync(markerPath, "utf8"));
+		return typeof parsed === "object" && parsed !== null
+			? (parsed as FirstRunMarker)
+			: null;
+	} catch {
+		// An unreadable or truncated marker is treated as pre-v2 and migrated;
+		// the migration only replays the idempotent auth-store step.
+		return null;
+	}
+}
+
+/**
+ * Brings a marker written before the auth-store step existed up to the current
+ * version.
+ *
+ * `ensureFirstRunSetup` short-circuits on marker existence, so bumping
+ * `FIRST_RUN_MARKER_VERSION` on its own would leave every already-installed
+ * user — precisely the population reporting repeated keychain prompts — without
+ * the enforcement step forever.
+ *
+ * Only the auth-store step is replayed. Rerunning app bind or launcher install
+ * would reinstall shortcuts and rebind the desktop app, which the user may have
+ * deliberately removed since.
+ *
+ * No exclusive claim is taken, unlike the initial setup. Both operations here
+ * are idempotent and atomic — `ensureCodexCliFileAuthStore` skips a config
+ * already on `"file"`, and `atomicWriteMarker` renames into place — so
+ * concurrent invocations converge on the same result instead of racing.
+ */
+async function migrateFirstRunMarker(
+	markerPath: string,
+	marker: FirstRunMarker,
+	deps: FirstRunSetupDeps,
+	now: () => number,
+): Promise<FirstRunStepStatus> {
+	let authStore: FirstRunStepStatus;
+	try {
+		authStore = await (deps.enforceAuthStore
+			? deps.enforceAuthStore()
+			: defaultEnforceAuthStore());
+	} catch (error) {
+		authStore = "failed";
+		log.debug("first-run marker migration auth store step skipped", {
+			error: errorMessage(error),
+		});
+	}
+
+	const payload = `${JSON.stringify(
+		{
+			version: FIRST_RUN_MARKER_VERSION,
+			startedAt: marker.startedAt ?? now(),
+			completedAt: marker.completedAt ?? now(),
+			appBind: marker.appBind ?? "skipped",
+			launcher: marker.launcher ?? "skipped",
+			authStore,
+		},
+		null,
+		"\t",
+	)}\n`;
+	try {
+		await atomicWriteMarker(markerPath, payload);
+	} catch (error) {
+		// Leaving the marker at v1 just means the idempotent step runs again on
+		// the next invocation, so this is safe to swallow.
+		log.debug("first-run marker migration write failed", {
+			error: errorMessage(error),
+		});
+	}
+	return authStore;
+}
+
 async function defaultInstallLauncher(
 	env: NodeJS.ProcessEnv,
 	rotationEnabled: boolean,
@@ -430,8 +519,23 @@ export async function ensureFirstRunSetup(
 		const installed = deps.installedContext ?? isInstalledPackageContext();
 		if (!installed) return { ran: false, reason: "not-installed" };
 		const markerPath = deps.markerPath ?? getFirstRunMarkerPath();
-		if (existsSync(markerPath)) return { ran: false, reason: "already-done" };
 		const now = deps.now ?? Date.now;
+		if (existsSync(markerPath)) {
+			const marker = readFirstRunMarker(markerPath);
+			if ((marker?.version ?? 1) >= FIRST_RUN_MARKER_VERSION) {
+				return { ran: false, reason: "already-done" };
+			}
+			return {
+				ran: false,
+				reason: "migrated",
+				authStore: await migrateFirstRunMarker(
+					markerPath,
+					marker ?? {},
+					deps,
+					now,
+				),
+			};
+		}
 		const startedAt = now();
 		if (!claimFirstRunMarker(markerPath, startedAt)) {
 			return { ran: false, reason: "claim-race" };

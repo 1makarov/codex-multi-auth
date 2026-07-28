@@ -59,7 +59,17 @@ manager CLI invocation after install, the package records a one-shot marker and
 best-effort self-heals packaged app bind + launcher routing when runtime
 rotation is enabled. Concurrent first invocations claim the marker with an
 exclusive create so setup runs at most once. Failures are debug-logged and never
-block the user command. Deleting the marker can re-trigger first-run setup on
+block the user command.
+
+The marker carries a `version`. A marker written before the Codex auth-store
+step existed (`version: 1`) is migrated in place on the next manager CLI
+invocation: only that step is replayed, and app bind / launcher install are
+deliberately not rerun so shortcuts the user removed stay removed. The migration
+takes no exclusive claim because both the `config.toml` rewrite and the marker
+write are idempotent and atomic. An unreadable or truncated marker is treated as
+pre-v2 and migrated the same way, rather than re-triggering full setup.
+
+Deleting the marker can re-trigger first-run setup on
 the next CLI run.
 
 Ownership note:
@@ -142,7 +152,7 @@ Runtime rotation adds local state only when enabled or when a helper has recentl
 | `~/.codex/multi-auth/app-bind/codex-config-backup.json` | backup metadata for restoring the real Codex `config.toml` |
 | `~/.codex/multi-auth/app-bind/runtime-rotation-app-bind-status.json` | persistent app router status |
 | `~/.codex/multi-auth/app-bind/runtime-rotation-app-router.log` | persistent app router log |
-| `~/.codex/multi-auth/first-run-setup.json` | one-shot first CLI run marker for app bind / launcher self-heal |
+| `~/.codex/multi-auth/first-run-setup.json` | one-shot first CLI run marker for Codex auth-store enforcement / app bind / launcher self-heal (versioned; v1 markers migrate in place) |
 
 The app bind writes a provider entry to the real `~/.codex/config.toml` only after taking a backup. `codex-multi-auth rotation disable` and `codex-multi-auth rotation unbind-app` restore the backup and remove the router startup entry.
 

@@ -334,6 +334,161 @@ describe("ensureFirstRunSetup", () => {
 		expect(marker.authStore).toBe("failed");
 	});
 
+	// Bumping FIRST_RUN_MARKER_VERSION alone would do nothing: setup
+	// short-circuits on marker existence, so already-installed users — exactly
+	// the population hitting repeated keychain prompts — would never get the
+	// auth-store step.
+	describe("v1 marker migration", () => {
+		function writeMarker(markerPath: string, payload: unknown): void {
+			mkdirSync(path.dirname(markerPath), { recursive: true });
+			writeFileSync(markerPath, `${JSON.stringify(payload)}\n`, "utf8");
+		}
+
+		it("replays only the auth-store step for a v1 marker", async () => {
+			const markerPath = createMarkerPath();
+			writeMarker(markerPath, {
+				version: 1,
+				startedAt: 111,
+				completedAt: 222,
+				appBind: "completed",
+				launcher: "failed",
+			});
+			const bindCodexApp = vi.fn(async () => "completed" as const);
+			const installLauncher = vi.fn(async () => "completed" as const);
+			const enforceAuthStore = vi.fn(async () => "completed" as const);
+
+			const result = await ensureFirstRunSetup({
+				env: {},
+				installedContext: true,
+				markerPath,
+				bindCodexApp,
+				installLauncher,
+				enforceAuthStore,
+			});
+
+			expect(result).toEqual({
+				ran: false,
+				reason: "migrated",
+				authStore: "completed",
+			});
+			expect(enforceAuthStore).toHaveBeenCalledTimes(1);
+			// Rerunning these would reinstall shortcuts the user may have removed.
+			expect(bindCodexApp).not.toHaveBeenCalled();
+			expect(installLauncher).not.toHaveBeenCalled();
+
+			const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(marker.version).toBe(FIRST_RUN_MARKER_VERSION);
+			expect(marker.authStore).toBe("completed");
+			expect(marker.appBind).toBe("completed");
+			expect(marker.launcher).toBe("failed");
+			expect(marker.startedAt).toBe(111);
+		});
+
+		it("does not migrate again once the marker is current", async () => {
+			const markerPath = createMarkerPath();
+			const enforceAuthStore = vi.fn(async () => "completed" as const);
+			const deps = {
+				env: {},
+				installedContext: true,
+				markerPath,
+				bindCodexApp: async () => "skipped" as const,
+				installLauncher: async () => "skipped" as const,
+				enforceAuthStore,
+			};
+
+			writeMarker(markerPath, { version: 1 });
+			await ensureFirstRunSetup(deps);
+			const second = await ensureFirstRunSetup(deps);
+
+			expect(second).toEqual({ ran: false, reason: "already-done" });
+			expect(enforceAuthStore).toHaveBeenCalledTimes(1);
+		});
+
+		it("treats an unreadable marker as pre-v2 without rerunning full setup", async () => {
+			const markerPath = createMarkerPath();
+			mkdirSync(path.dirname(markerPath), { recursive: true });
+			writeFileSync(markerPath, "{ truncated", "utf8");
+			const bindCodexApp = vi.fn(async () => "completed" as const);
+
+			const result = await ensureFirstRunSetup({
+				env: {},
+				installedContext: true,
+				markerPath,
+				bindCodexApp,
+				installLauncher: async () => "completed" as const,
+				enforceAuthStore: async () => "completed" as const,
+			});
+
+			expect(result).toEqual({
+				ran: false,
+				reason: "migrated",
+				authStore: "completed",
+			});
+			expect(bindCodexApp).not.toHaveBeenCalled();
+			const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(marker.version).toBe(FIRST_RUN_MARKER_VERSION);
+		});
+
+		it("records a failed auth-store step without throwing", async () => {
+			const markerPath = createMarkerPath();
+			writeMarker(markerPath, { version: 1 });
+
+			const result = await ensureFirstRunSetup({
+				env: {},
+				installedContext: true,
+				markerPath,
+				enforceAuthStore: async () => {
+					throw new Error("config.toml is locked");
+				},
+			});
+
+			expect(result).toEqual({
+				ran: false,
+				reason: "migrated",
+				authStore: "failed",
+			});
+			const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(marker.version).toBe(FIRST_RUN_MARKER_VERSION);
+			expect(marker.authStore).toBe("failed");
+		});
+
+		// The migration takes no exclusive claim; it relies on both the config
+		// rewrite and the marker write being idempotent and atomic.
+		it("converges when two processes migrate concurrently", async () => {
+			const markerPath = createMarkerPath();
+			writeMarker(markerPath, { version: 1, appBind: "completed" });
+			const deps = {
+				env: {},
+				installedContext: true,
+				markerPath,
+				enforceAuthStore: async () => "completed" as const,
+			};
+
+			const results = await Promise.all([
+				ensureFirstRunSetup(deps),
+				ensureFirstRunSetup(deps),
+			]);
+
+			expect(results.every((result) => !result.ran)).toBe(true);
+			const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<
+				string,
+				unknown
+			>;
+			expect(marker.version).toBe(FIRST_RUN_MARKER_VERSION);
+			expect(marker.authStore).toBe("completed");
+			expect(marker.appBind).toBe("completed");
+		});
+	});
+
 	it("skips setup on the second run once the marker exists", async () => {
 		const markerPath = createMarkerPath();
 		const bindCodexApp = vi.fn(async () => "completed" as const);

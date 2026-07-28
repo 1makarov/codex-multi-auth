@@ -100,7 +100,8 @@ The complete `pluginConfig` ↔ env accessor matrix is in [development/CONFIG_FI
 | `CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX` | Internal 0-based pin published by the wrapper after `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT` resolution |
 | `CODEX_MULTI_AUTH_STATUSLINE=0/1` | Disable/enable forwarded-session status line |
 | `CODEX_MULTI_AUTH_AUTO_SYNC_ON_STARTUP=0/1` | Control startup account sync |
-| `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0/1` | Opt out of wrapper-injected file auth store |
+| `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0/1` | Opt out of the wrapper-injected `-c` file auth store override and the wrapper-startup `config.toml` reconcile |
+| `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0/1` | Opt out of every persisted `cli_auth_credentials_store = "file"` rewrite in `~/.codex/config.toml` (first-run, switch/login sync, `doctor --fix`) |
 | `CODEX_MULTI_AUTH_DEBUG=1` | Verbose wrapper/debug notices |
 | `CODEX_AUTH_FAST_SESSION*` | Fast-session trimming knobs |
 | `CODEX_AUTH_RETRY_ALL_*` | All-accounts rate-limit wait/retry budgets |
@@ -177,6 +178,7 @@ For `codex app` launches that go through the wrapper, the wrapper automatically 
 
 Package install scripts stay side-effect-free (postinstall prints a short notice only). First-run self-heal of desktop defaults runs once on a durable global install when you invoke `codex-multi-auth ...`, and again as needed from `codex-multi-auth rotation enable`:
 
+- The official CLI credential store is pinned to `cli_auth_credentials_store = "file"` in `~/.codex/config.toml`, so front-ends that exec the official binary directly stop triggering macOS login-keychain prompts. Set `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0` to skip.
 - Packaged Codex app bind is repaired when a Codex desktop app is detected. Set `CODEX_MULTI_AUTH_APP_BIND=0` or `CODEX_MULTI_AUTH_APP_BIND_INSTALL=0` to skip, or `CODEX_MULTI_AUTH_APP_BIND_INSTALL=1` to force it.
 - Supported user-level launcher routing is installed for global installs. Set `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL=0` to skip shortcut routing, or run `codex-multi-auth-app-launcher --remove` to restore backed-up Windows shortcuts or remove the managed macOS wrapper later.
 - The one-time claim is recorded at `~/.codex/multi-auth/first-run-setup.json`. `npx` and project-local installs skip first-run setup so they do not consume the marker.

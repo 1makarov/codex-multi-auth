@@ -99,6 +99,43 @@ function createWrapperFixture(): string {
 	return fixtureRoot;
 }
 
+/**
+ * Stubs `dist/lib/codex-cli/writer.js` so the wrapper's startup auth-store
+ * guard has something to import. It records each call to a log file, and
+ * throws when `CODEX_MULTI_AUTH_TEST_AUTH_STORE_FAIL` is set so the non-fatal
+ * path can be exercised. The real TOML rewrite is covered by
+ * test/codex-cli-writer.test.ts.
+ */
+function createAuthStoreWriterFixtureModule(fixtureRoot: string): string {
+	const writerDir = join(fixtureRoot, "dist", "lib", "codex-cli");
+	mkdirSync(writerDir, { recursive: true });
+	const callLogPath = join(fixtureRoot, "auth-store-calls.log");
+	writeFileSync(
+		join(writerDir, "writer.js"),
+		[
+			'import { appendFileSync } from "node:fs";',
+			"",
+			"export async function ensureCodexCliFileAuthStore(configPath) {",
+			`  appendFileSync(${JSON.stringify(callLogPath)}, String(configPath ?? "default") + "\\n");`,
+			"  if ((process.env.CODEX_MULTI_AUTH_TEST_AUTH_STORE_FAIL ?? '') === '1') {",
+			"    const error = new Error('EBUSY: resource busy or locked');",
+			"    error.code = 'EBUSY';",
+			"    throw error;",
+			"  }",
+			"  return true;",
+			"}",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	return callLogPath;
+}
+
+function readAuthStoreCallCount(callLogPath: string): number {
+	if (!existsSync(callLogPath)) return 0;
+	return readFileSync(callLogPath, "utf8").split("\n").filter(Boolean).length;
+}
+
 function createRuntimeObservabilityFixtureModule(fixtureRoot: string): string {
 	const runtimeDir = join(fixtureRoot, "dist", "lib", "runtime");
 	mkdirSync(runtimeDir, { recursive: true });
@@ -2982,6 +3019,75 @@ describe("codex bin wrapper", () => {
 		expect(result.status).toBe(0);
 		expect(result.stdout).toContain("FORWARDED:exec status");
 		expect(result.stdout).not.toContain('cli_auth_credentials_store="file"');
+	});
+
+	// Issue #641: the per-invocation `-c` override only covers the process this
+	// wrapper spawns. Third-party front-ends exec the official binary directly
+	// and read config.toml, so the persisted value has to be reconciled too or
+	// they keep raising macOS login-keychain prompts.
+	it("reconciles the persisted auth store before forwarding", () => {
+		const fixtureRoot = createWrapperFixture();
+		const callLogPath = createAuthStoreWriterFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			'FORWARDED:exec status -c cli_auth_credentials_store="file"',
+		);
+		expect(readAuthStoreCallCount(callLogPath)).toBe(1);
+	});
+
+	it("skips the persisted auth-store reconcile when the opt-out env var is disabled", () => {
+		const fixtureRoot = createWrapperFixture();
+		const callLogPath = createAuthStoreWriterFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE: "0",
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).not.toContain('cli_auth_credentials_store="file"');
+		expect(readAuthStoreCallCount(callLogPath)).toBe(0);
+	});
+
+	// Windows locks config.toml aggressively (EPERM/EBUSY). A failed reconcile
+	// must never block the wrapped command — the per-invocation `-c` override
+	// still protects this run.
+	it("keeps forwarding when the persisted auth-store reconcile fails", () => {
+		const fixtureRoot = createWrapperFixture();
+		const callLogPath = createAuthStoreWriterFixtureModule(fixtureRoot);
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_MULTI_AUTH_TEST_AUTH_STORE_FAIL: "1",
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			'FORWARDED:exec status -c cli_auth_credentials_store="file"',
+		);
+		expect(readAuthStoreCallCount(callLogPath)).toBe(1);
+	});
+
+	it("forwards normally when the compiled auth-store module is absent", () => {
+		const fixtureRoot = createWrapperFixture();
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+
+		const result = runWrapper(fixtureRoot, ["exec", "status"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			'FORWARDED:exec status -c cli_auth_credentials_store="file"',
+		);
 	});
 
 	it("does not double-inject file auth store when caller already set it", () => {

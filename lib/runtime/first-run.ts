@@ -16,6 +16,7 @@ import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, sep } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { ensureCodexCliFileAuthStore } from "../codex-cli/writer.js";
 import { getCodexRuntimeRotationProxy, loadPluginConfig } from "../config.js";
 import { withFileOperationRetry } from "../fs-retry.js";
 import { createLogger } from "../logger.js";
@@ -25,7 +26,8 @@ import { bindCodexAppRuntimeRotation, getAppBindStatus } from "./app-bind.js";
 const log = createLogger("first-run");
 
 const FIRST_RUN_MARKER_FILE = "first-run-setup.json";
-export const FIRST_RUN_MARKER_VERSION = 1;
+// v2 adds the `authStore` step to the marker payload.
+export const FIRST_RUN_MARKER_VERSION = 2;
 
 const TRUE_VALUES = new Set(["1", "true", "yes"]);
 const FALSE_VALUES = new Set(["0", "false", "no"]);
@@ -48,6 +50,7 @@ type FirstRunStepStatus = "completed" | "skipped" | "failed";
 interface FirstRunSetupOutcome {
 	appBind: FirstRunStepStatus;
 	launcher: FirstRunStepStatus;
+	authStore: FirstRunStepStatus;
 }
 
 type FirstRunSkipReason =
@@ -69,6 +72,7 @@ export interface FirstRunSetupDeps {
 	resolveRotation?: () => boolean;
 	bindCodexApp?: () => Promise<FirstRunStepStatus>;
 	installLauncher?: () => Promise<FirstRunStepStatus>;
+	enforceAuthStore?: () => Promise<FirstRunStepStatus>;
 	notify?: (message: string) => void;
 	now?: () => number;
 }
@@ -314,6 +318,7 @@ async function finalizeFirstRunMarker(
 			completedAt: now(),
 			appBind: outcome.appBind,
 			launcher: outcome.launcher,
+			authStore: outcome.authStore,
 		},
 		null,
 		"\t",
@@ -377,6 +382,25 @@ async function defaultBindCodexApp(
 	return "completed";
 }
 
+/**
+ * Pins the official Codex CLI to the file-backed credential store.
+ *
+ * Enforcement used to be lazy — it only happened when something called
+ * `setCodexCliActiveSelection` (switch, login, health check, repair). A user who
+ * installed the package and drove Codex through a third-party front-end could
+ * therefore stay on `cli_auth_credentials_store = "keychain"` indefinitely and
+ * keep getting macOS login-keychain prompts (issue #641). Doing it at first run
+ * closes that window before the official CLI ever reads its store.
+ *
+ * Deliberately not gated on `isCodexCliSyncEnabled()`: turning CLI sync off is a
+ * statement about account mirroring, not a request to re-enable keychain
+ * prompts. The `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0` opt-out is
+ * honored inside `ensureCodexCliFileAuthStore` itself.
+ */
+async function defaultEnforceAuthStore(): Promise<FirstRunStepStatus> {
+	return (await ensureCodexCliFileAuthStore()) ? "completed" : "skipped";
+}
+
 async function defaultInstallLauncher(
 	env: NodeJS.ProcessEnv,
 	rotationEnabled: boolean,
@@ -392,10 +416,10 @@ async function defaultInstallLauncher(
 }
 
 /**
- * Runs the lazily deferred install setup (Codex app bind + launcher routing)
- * exactly once per runtime root. Never throws and never blocks a command on
- * failure: every error path resolves with a skip/failed status and only
- * debug-logs sanitized messages.
+ * Runs the lazily deferred install setup (Codex auth-store enforcement + app
+ * bind + launcher routing) exactly once per runtime root. Never throws and
+ * never blocks a command on failure: every error path resolves with a
+ * skip/failed status and only debug-logs sanitized messages.
  */
 export async function ensureFirstRunSetup(
 	deps: FirstRunSetupDeps = {},
@@ -425,7 +449,18 @@ export async function ensureFirstRunSetup(
 		const outcome: FirstRunSetupOutcome = {
 			appBind: "skipped",
 			launcher: "skipped",
+			authStore: "skipped",
 		};
+		try {
+			outcome.authStore = await (deps.enforceAuthStore
+				? deps.enforceAuthStore()
+				: defaultEnforceAuthStore());
+		} catch (error) {
+			outcome.authStore = "failed";
+			log.debug("first-run codex auth store enforcement skipped", {
+				error: errorMessage(error),
+			});
+		}
 		try {
 			outcome.appBind = await (deps.bindCodexApp
 				? deps.bindCodexApp()

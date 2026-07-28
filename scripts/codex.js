@@ -1083,6 +1083,34 @@ async function loadRuntimeConfigTomlModule() {
 	}
 }
 
+// Reconciles the persisted `cli_auth_credentials_store` in ~/.codex/config.toml
+// to "file" before forwarding.
+//
+// `buildForwardArgs` already appends `-c cli_auth_credentials_store="file"`, but
+// that only covers the process this wrapper spawns. Third-party front-ends
+// (CodexBar and friends) exec the official binary directly and read config.toml
+// instead, so a config still pointing at "keychain" keeps producing macOS login
+// keychain prompts (issue #641). Running the reconcile here self-heals a config
+// that something else flipped back — e.g. a fresh official `codex login`.
+//
+// Idempotent: the lib helper returns without writing when the value is already
+// "file", so this adds no write amplification on the common path.
+async function ensurePersistedCodexFileAuthStore() {
+	const forceFileAuthStore = (process.env.CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE ?? "1").trim() !== "0";
+	if (!forceFileAuthStore) return;
+
+	try {
+		const mod = await import("../dist/lib/codex-cli/writer.js");
+		if (typeof mod.ensureCodexCliFileAuthStore !== "function") return;
+		await mod.ensureCodexCliFileAuthStore();
+	} catch (error) {
+		if (isModuleNotFoundError(error)) return;
+		// Best effort only. A read-only or locked config.toml (Windows
+		// EPERM/EBUSY) must never block the wrapped command: the per-invocation
+		// `-c` override still protects this run.
+	}
+}
+
 async function autoSyncManagerActiveSelectionIfEnabled() {
 	const enabled = (process.env.CODEX_MULTI_AUTH_AUTO_SYNC_ON_STARTUP ?? "1").trim() !== "0";
 	if (!enabled) return;
@@ -5045,6 +5073,7 @@ async function main() {
 	}
 	const forwardArgs = forcedAccount.forwardArgs;
 
+	await ensurePersistedCodexFileAuthStore();
 	await autoSyncManagerActiveSelectionIfEnabled();
 	await maybePrintForwardStatusLine(forwardArgs);
 	maybeRefreshQuotaCacheInBackground();

@@ -264,6 +264,8 @@ export function codexCliSyncModuleMock(
 export function createCodexCliWriterMocks() {
 	return {
 		setCodexCliActiveSelection: vi.fn(),
+		ensureCodexCliFileAuthStore: vi.fn(),
+		readTopLevelCodexCliAuthStoreMode: vi.fn(),
 	};
 }
 
@@ -272,7 +274,11 @@ export type CodexCliWriterMocks = ReturnType<typeof createCodexCliWriterMocks>;
 export function codexCliWriterModuleMock(
 	mocks: CodexCliWriterMocks,
 ): Record<string, unknown> {
-	return { setCodexCliActiveSelection: mocks.setCodexCliActiveSelection };
+	return {
+		setCodexCliActiveSelection: mocks.setCodexCliActiveSelection,
+		ensureCodexCliFileAuthStore: mocks.ensureCodexCliFileAuthStore,
+		readTopLevelCodexCliAuthStoreMode: mocks.readTopLevelCodexCliAuthStoreMode,
+	};
 }
 
 // ---------------------------------------------------------------------------

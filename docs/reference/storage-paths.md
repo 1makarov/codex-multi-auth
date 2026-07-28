@@ -67,7 +67,11 @@ Ownership note:
 - `~/.codex/multi-auth/*` is managed by this project.
 - `~/.codex/accounts.json`, `~/.codex/auth.json`, and `~/.codex/config.toml` are managed by official Codex CLI.
 - The `codex-multi-auth-codex` wrapper preserves that official CLI file-backed auth layout by forwarding non-auth commands with `-c cli_auth_credentials_store="file"`, unless the caller already set `cli_auth_credentials_store` explicitly.
-- Set `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0` to opt out of that wrapper-injected file-store override and leave the downstream CLI auth store untouched.
+- That `-c` override only covers processes the wrapper launches. Third-party front-ends (menu-bar apps such as CodexBar, editor extensions) exec the official binary directly and read `~/.codex/config.toml` instead, so a config left on `cli_auth_credentials_store = "keychain"` keeps raising macOS login-keychain "Always Allow" prompts. The *persisted* top-level value is therefore reconciled to `"file"` at three points: first-run setup, wrapper startup before forwarding, and `doctor --fix`.
+- Only the top-level assignment is rewritten. A `cli_auth_credentials_store` inside a `[profiles.*]` table is left as authored, and a top-level key is inserted above the first table instead.
+- Set `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0` to opt out of both the wrapper-injected `-c` override and the wrapper-startup config reconcile, leaving the downstream CLI auth store untouched.
+- Set `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0` to opt out of every `config.toml` rewrite (first-run, account switch/login sync, and `doctor --fix`) while leaving the per-invocation `-c` override in place.
+- Neither the keychain nor the `security` CLI is ever read or written: reading a keychain item would itself raise the prompt this behavior exists to eliminate. Credentials saved by an earlier official `codex login` stay where they are, are no longer read once the store is pinned to `"file"`, and can be removed manually via Keychain Access.
 - Runtime rotation may create a temporary shadow `CODEX_HOME` under the operating-system temp directory while a forwarded Codex command is running. The wrapper syncs refreshed official state files back to the original Codex home before cleanup.
 - When `CODEX_HOME` is set to a non-default directory, multi-auth resolves strictly to `$CODEX_HOME/multi-auth` and does not scan `~/.codex/multi-auth` for existing pools.
 - V3 account storage may also carry `pinnedAccountIndex` and `affinityGeneration` for CLI pin / session-affinity invalidation.
@@ -76,7 +80,7 @@ Compatibility note:
 
 - This file-store forwarding keeps auth state readable from disk outside interactive terminals, so wrapper forwarding and non-TTY auth flows stay deterministic after the Ink migration.
 
-> **Windows note:** The wrapper keeps the official Codex CLI file-store layout unchanged, so Windows `EPERM`/`EBUSY` retry handling still lives with the downstream CLI writes rather than this wrapper layer. Opting out with `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0` stops injecting the file-store override for future wrapper launches, but it does not rewrite or expose previously written CLI auth files beyond the standard `~/.codex/auth.json` and `~/.codex/accounts.json` locations.
+> **Windows note:** The wrapper keeps the official Codex CLI file-store layout unchanged, so Windows `EPERM`/`EBUSY` retry handling still lives with the downstream CLI writes rather than this wrapper layer. Opting out with `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0` stops injecting the file-store override for future wrapper launches, but it does not rewrite or expose previously written CLI auth files beyond the standard `~/.codex/auth.json` and `~/.codex/accounts.json` locations. The wrapper-startup `config.toml` reconcile writes through the same atomic rename with `EPERM`/`EBUSY` retries; if it still fails (locked or read-only config), the failure is swallowed and forwarding proceeds, because the per-invocation `-c` override already protects that run.
 
 Backup metadata:
 

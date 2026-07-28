@@ -287,7 +287,8 @@ Cross-process refresh lease knobs: `CODEX_AUTH_REFRESH_LEASE`, `CODEX_AUTH_REFRE
 | `CODEX_MULTI_AUTH_SYNC_CODEX_CLI` | Toggle Codex CLI state sync |
 | `CODEX_MULTI_AUTH_REAL_CODEX_BIN` | Force official Codex binary path |
 | `CODEX_MULTI_AUTH_BYPASS` | Bypass local auth handling |
-| `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE` | Opt out of wrapper-injected official Codex file-backed auth store when set to `0` |
+| `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE` | Opt out of wrapper-injected official Codex file-backed auth store when set to `0`; also skips the wrapper-startup `config.toml` reconcile (`scripts/codex.js`) |
+| `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE` | Opt out of persisting `cli_auth_credentials_store = "file"` into `~/.codex/config.toml` when set to `0` (`lib/codex-cli/writer.ts`) |
 | `CODEX_MULTI_AUTH_AUTO_SYNC_ON_STARTUP` | Opt out of best-effort active-account sync around forwarded Codex launches when set to `0` |
 | `CODEX_MULTI_AUTH_CAPTURE_FORWARD_OUTPUT` | Force or disable capture of forwarded Codex output for unsupported-model fallback handling |
 | `CODEX_MULTI_AUTH_WINDOWS_BATCH_SHIM_GUARD` | Install Windows shim guards when enabled |

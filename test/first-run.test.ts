@@ -244,6 +244,7 @@ describe("ensureFirstRunSetup", () => {
 		const markerPath = createMarkerPath();
 		const bindCodexApp = vi.fn(async () => "completed" as const);
 		const installLauncher = vi.fn(async () => "completed" as const);
+		const enforceAuthStore = vi.fn(async () => "completed" as const);
 
 		const result = await ensureFirstRunSetup({
 			env: {},
@@ -251,16 +252,86 @@ describe("ensureFirstRunSetup", () => {
 			markerPath,
 			bindCodexApp,
 			installLauncher,
+			enforceAuthStore,
 		});
 
-		expect(result).toEqual({ ran: true, appBind: "completed", launcher: "completed" });
+		expect(result).toEqual({
+			ran: true,
+			appBind: "completed",
+			launcher: "completed",
+			authStore: "completed",
+		});
 		expect(bindCodexApp).toHaveBeenCalledTimes(1);
 		expect(installLauncher).toHaveBeenCalledTimes(1);
+		expect(enforceAuthStore).toHaveBeenCalledTimes(1);
 		expect(existsSync(markerPath)).toBe(true);
 		const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
 		expect(marker.version).toBe(FIRST_RUN_MARKER_VERSION);
 		expect(marker.appBind).toBe("completed");
 		expect(marker.launcher).toBe("completed");
+		expect(marker.authStore).toBe("completed");
+	});
+
+	// Regression guard for #641: a keychain-backed config.toml is what makes the
+	// official CLI (and third-party front-ends driving it) raise repeated macOS
+	// login-keychain prompts, so first run must pin it to the file store even
+	// when the user never switches or logs in through the manager.
+	it("pins the Codex CLI credential store to file on first run", async () => {
+		const markerPath = createMarkerPath();
+		const configPath = path.join(
+			mkdtempSync(path.join(tmpdir(), "codex-first-run-config-")),
+			"config.toml",
+		);
+		writeFileSync(configPath, 'cli_auth_credentials_store = "keychain"\n');
+		const previousConfigPath = process.env.CODEX_CLI_CONFIG_PATH;
+		process.env.CODEX_CLI_CONFIG_PATH = configPath;
+
+		try {
+			const result = await ensureFirstRunSetup({
+				env: {},
+				installedContext: true,
+				markerPath,
+				bindCodexApp: async () => "skipped" as const,
+				installLauncher: async () => "skipped" as const,
+			});
+
+			expect(result).toEqual({
+				ran: true,
+				appBind: "skipped",
+				launcher: "skipped",
+				authStore: "completed",
+			});
+			expect(readFileSync(configPath, "utf8")).toContain(
+				'cli_auth_credentials_store = "file"',
+			);
+		} finally {
+			if (previousConfigPath === undefined) delete process.env.CODEX_CLI_CONFIG_PATH;
+			else process.env.CODEX_CLI_CONFIG_PATH = previousConfigPath;
+		}
+	});
+
+	it("reports the auth-store step as failed without blocking the rest of setup", async () => {
+		const markerPath = createMarkerPath();
+
+		const result = await ensureFirstRunSetup({
+			env: {},
+			installedContext: true,
+			markerPath,
+			bindCodexApp: async () => "completed" as const,
+			installLauncher: async () => "completed" as const,
+			enforceAuthStore: async () => {
+				throw new Error("config.toml is locked");
+			},
+		});
+
+		expect(result).toEqual({
+			ran: true,
+			appBind: "completed",
+			launcher: "completed",
+			authStore: "failed",
+		});
+		const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
+		expect(marker.authStore).toBe("failed");
 	});
 
 	it("skips setup on the second run once the marker exists", async () => {
@@ -273,6 +344,7 @@ describe("ensureFirstRunSetup", () => {
 			markerPath,
 			bindCodexApp,
 			installLauncher,
+			enforceAuthStore: async () => "skipped" as const,
 		};
 
 		await ensureFirstRunSetup(deps);
@@ -293,6 +365,7 @@ describe("ensureFirstRunSetup", () => {
 			markerPath,
 			bindCodexApp,
 			installLauncher,
+			enforceAuthStore: async () => "skipped" as const,
 		};
 
 		const results = await Promise.all([
@@ -318,9 +391,15 @@ describe("ensureFirstRunSetup", () => {
 			installLauncher: async () => {
 				throw new Error("launcher exploded");
 			},
+			enforceAuthStore: async () => "skipped" as const,
 		});
 
-		expect(result).toEqual({ ran: true, appBind: "failed", launcher: "failed" });
+		expect(result).toEqual({
+			ran: true,
+			appBind: "failed",
+			launcher: "failed",
+			authStore: "skipped",
+		});
 		expect(existsSync(markerPath)).toBe(true);
 		const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
 		expect(marker.appBind).toBe("failed");

@@ -256,17 +256,66 @@ function ensureTrailingNewline(value: string): string {
 	return value.endsWith("\n") ? value : `${value}\n`;
 }
 
-async function ensureCodexCliFileAuthStore(configPath: string): Promise<boolean> {
+/**
+ * Reads the top-level `cli_auth_credentials_store` value out of a raw
+ * `config.toml`.
+ *
+ * Mirrors the scoping rules of {@link ensureCodexCliFileAuthStore}: assignments
+ * inside a `[table]` belong to that table, so only lines before the first table
+ * header describe the official CLI's default credential store. Reporting a
+ * profile-scoped value as the effective one would let `doctor` call a config
+ * healthy while the CLI still reaches for the keychain.
+ *
+ * @param rawConfig - Full text of `config.toml`.
+ * @returns The declared mode, or `null` when no top-level assignment exists.
+ */
+export function readTopLevelCodexCliAuthStoreMode(rawConfig: string): string | null {
+	for (const line of rawConfig.split(/\r?\n/)) {
+		if (/^\s*\[/.test(line)) break;
+		const match = line.match(/^\s*cli_auth_credentials_store\s*=\s*"([^"]*)"\s*(?:#.*)?$/);
+		if (match) return (match[1] ?? "").trim() || null;
+	}
+	return null;
+}
+
+/**
+ * Persists `cli_auth_credentials_store = "file"` as a top-level key in the
+ * official Codex CLI `config.toml`.
+ *
+ * The wrapper already appends `-c cli_auth_credentials_store="file"` to every
+ * command it forwards, but that only covers processes it launches itself.
+ * Third-party front-ends (menu-bar apps such as CodexBar, editor extensions)
+ * exec the official binary directly, so the *persisted* value is what decides
+ * whether the official CLI reaches into the macOS login keychain. Leaving it on
+ * `"keychain"` is what produces the repeated "Always Allow" prompts reported in
+ * issue #641.
+ *
+ * Only top-level assignments are rewritten. A `cli_auth_credentials_store`
+ * inside a `[profiles.*]` table must be left alone: rewriting it in place would
+ * mangle a scoped setting while still leaving the top-level default pointed at
+ * the keychain, so the prompts would continue.
+ *
+ * @param configPath - Config file to reconcile; defaults to the resolved Codex
+ * CLI `config.toml`.
+ * @returns `true` when the file was rewritten, `false` when it was already
+ * correct or enforcement is disabled.
+ */
+export async function ensureCodexCliFileAuthStore(
+	configPath: string = getCodexCliConfigPath(),
+): Promise<boolean> {
 	if (!shouldEnforceCodexCliFileAuthStore()) return false;
 
 	const desired = 'cli_auth_credentials_store = "file"';
 	const raw = existsSync(configPath) ? await fs.readFile(configPath, "utf-8") : "";
 	const lines = raw.length > 0 ? raw.split(/\r?\n/) : [];
 	const assignmentRegex = /^\s*cli_auth_credentials_store\s*=/;
+	const tableHeaderRegex = /^\s*\[/;
 
 	let replaced = false;
+	let inTopLevelTable = true;
 	const nextLines = lines.map((line) => {
-		if (!replaced && assignmentRegex.test(line)) {
+		if (tableHeaderRegex.test(line)) inTopLevelTable = false;
+		if (inTopLevelTable && !replaced && assignmentRegex.test(line)) {
 			replaced = true;
 			return desired;
 		}

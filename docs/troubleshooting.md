@@ -110,6 +110,28 @@ directories and do not share saved accounts. Sign in to each one independently.
 | Requests fail with budget / `budget_blocked` | Local budget guard limit hit | Inspect `codex-multi-auth budget list --json` / `budget check <key>`; raise or clear the limit |
 | All accounts look unhealthy | The entire pool is stale or damaged | Run `codex-multi-auth doctor --fix`, then add at least one fresh account |
 | The dashboard shows old account state | Local files were updated outside the current session | Run `codex-multi-auth list`, then `codex-multi-auth check` |
+| macOS keeps asking to unlock the login keychain, even after "Always Allow" | `~/.codex/config.toml` still has `cli_auth_credentials_store = "keychain"`, so the official CLI — and any front-end that execs it directly, such as CodexBar or an editor extension — keeps reading the keychain | Run `codex-multi-auth doctor --fix`, then confirm `codex-auth-store` reports `mode=file` |
+
+### macOS login-keychain prompts
+
+This project never stores accounts in the keychain — its own state is plain JSON
+under `~/.codex/multi-auth`. The prompts come from the *official* Codex CLI when
+its `cli_auth_credentials_store` is left on `"keychain"`.
+
+The `codex-multi-auth-codex` wrapper forwards `-c cli_auth_credentials_store="file"`
+on every command it launches, but that only covers processes it spawns. A
+third-party front-end that execs the official binary itself reads
+`~/.codex/config.toml` instead, so the persisted value is what matters.
+
+`codex-multi-auth doctor --fix` pins the top-level key to `"file"`; first-run
+setup and wrapper startup now do the same automatically. Credentials saved by an
+earlier official `codex login` remain in the login keychain but are no longer
+read — remove them manually in Keychain Access if you want them gone. Nothing in
+this project reads or deletes keychain items, because doing so would raise the
+very prompt this fix removes.
+
+To keep the keychain store deliberately, set
+`CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0`.
 
 ---
 

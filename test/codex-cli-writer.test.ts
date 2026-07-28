@@ -8,7 +8,11 @@ import {
   resetCodexCliMetricsForTests,
 } from "../lib/codex-cli/observability.js";
 import { clearCodexCliStateCache } from "../lib/codex-cli/state.js";
-import { setCodexCliActiveSelection } from "../lib/codex-cli/writer.js";
+import {
+  ensureCodexCliFileAuthStore,
+  readTopLevelCodexCliAuthStoreMode,
+  setCodexCliActiveSelection,
+} from "../lib/codex-cli/writer.js";
 
 describe("codex-cli writer", () => {
   let tempDir: string;
@@ -551,5 +555,96 @@ describe("codex-cli writer", () => {
     expect(writtenAuth.tokens?.refresh_token).toBe("old-refresh");
     expect(writtenAuth.tokens?.account_id).toBe("old-account");
     expect(writtenAuth.email).toBeUndefined();
+  });
+
+  // Issue #641: the official CLI reads config.toml directly, so third-party
+  // front-ends that exec it (CodexBar, editor extensions) keep hitting the macOS
+  // login keychain until the persisted value is pinned to "file".
+  describe("ensureCodexCliFileAuthStore", () => {
+    it("rewrites a keychain-backed store to file", async () => {
+      await writeFile(
+        configPath,
+        'model = "gpt-5.3-codex"\ncli_auth_credentials_store = "keychain"\n',
+        "utf-8",
+      );
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
+      const written = await readFile(configPath, "utf-8");
+      expect(written).toContain('cli_auth_credentials_store = "file"');
+      expect(written).not.toContain('cli_auth_credentials_store = "keychain"');
+      expect(written).toContain('model = "gpt-5.3-codex"');
+    });
+
+    it("is a no-op when the store is already file", async () => {
+      const original = 'cli_auth_credentials_store = "file"\n';
+      await writeFile(configPath, original, "utf-8");
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(false);
+      expect(await readFile(configPath, "utf-8")).toBe(original);
+    });
+
+    it("creates the config file when it does not exist", async () => {
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
+      expect(await readFile(configPath, "utf-8")).toBe(
+        'cli_auth_credentials_store = "file"\n',
+      );
+    });
+
+    // Rewriting the profile-scoped key in place would mangle a deliberate
+    // per-profile setting while leaving the top-level default on the keychain,
+    // so the prompts would keep coming.
+    it("leaves profile-scoped assignments alone and adds a top-level one", async () => {
+      await writeFile(
+        configPath,
+        '[profiles.work]\ncli_auth_credentials_store = "keychain"\n',
+        "utf-8",
+      );
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
+      const written = await readFile(configPath, "utf-8");
+      expect(written).toContain('cli_auth_credentials_store = "keychain"');
+      expect(
+        written.indexOf('cli_auth_credentials_store = "file"'),
+      ).toBeLessThan(written.indexOf("[profiles.work]"));
+      expect(readTopLevelCodexCliAuthStoreMode(written)).toBe("file");
+    });
+
+    it("respects the enforcement opt-out", async () => {
+      process.env.CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE = "0";
+      const original = 'cli_auth_credentials_store = "keychain"\n';
+      await writeFile(configPath, original, "utf-8");
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(false);
+      expect(await readFile(configPath, "utf-8")).toBe(original);
+    });
+
+    it("defaults to the resolved Codex CLI config path", async () => {
+      expect(await ensureCodexCliFileAuthStore()).toBe(true);
+      expect(await readFile(configPath, "utf-8")).toContain(
+        'cli_auth_credentials_store = "file"',
+      );
+    });
+  });
+
+  describe("readTopLevelCodexCliAuthStoreMode", () => {
+    it("reads a top-level assignment and ignores trailing comments", () => {
+      expect(
+        readTopLevelCodexCliAuthStoreMode(
+          'cli_auth_credentials_store = "keychain" # legacy\n',
+        ),
+      ).toBe("keychain");
+    });
+
+    it("ignores assignments scoped to a table", () => {
+      expect(
+        readTopLevelCodexCliAuthStoreMode(
+          '[profiles.work]\ncli_auth_credentials_store = "file"\n',
+        ),
+      ).toBeNull();
+    });
+
+    it("returns null when unset", () => {
+      expect(readTopLevelCodexCliAuthStoreMode('model = "gpt-5.3-codex"\n')).toBeNull();
+    });
   });
 });

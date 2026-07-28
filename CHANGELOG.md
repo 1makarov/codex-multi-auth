@@ -7,6 +7,22 @@ This repository's current stable release line is `2.x`.
 Current stable release notes live in `docs/releases/`.
 This top-level changelog preserves the foundational `0.x` milestones and points older iteration history to `docs/releases/legacy-pre-0.1-history.md`.
 
+## [2.8.0] - 2026-07-28
+
+Two fixes that change where the official Codex CLI keeps its state, plus a diagnostic that can now repair the first one instead of only reporting it. A minor rather than a patch release because behaviour changes: the wrapper now writes `cli_auth_credentials_store` into `~/.codex/config.toml` at first run and on wrapper startup, where before it only did so on switch or login. Both opt-outs are documented.
+Closes [#641](https://github.com/ndycode/codex-multi-auth/issues/641). Landed as [#642](https://github.com/ndycode/codex-multi-auth/pull/642), [#639](https://github.com/ndycode/codex-multi-auth/pull/639), and [#643](https://github.com/ndycode/codex-multi-auth/pull/643). See [docs/releases/v2.8.0.md](docs/releases/v2.8.0.md) for full details.
+
+### Fixed
+
+- **macOS asked to unlock the login keychain repeatedly, and "Always Allow" never stuck.** The prompts come from the official CLI reading `cli_auth_credentials_store` from `~/.codex/config.toml`, not from this project's own storage, which is plain JSON and never touches the keychain. The wrapper appended `-c cli_auth_credentials_store="file"` to what it spawned, but a front-end that execs the official binary directly reads `config.toml` instead — and persisting that value only happened on switch, login, health check, or repair. It is now reconciled at first run and as an idempotent guard on wrapper startup. Only the top-level assignment is touched, a `[profiles.*]` value is left as authored, line endings are preserved, and both TOML string forms are recognised. The keychain itself is never read or deleted from, since that would raise the very prompt being removed ([#641](https://github.com/ndycode/codex-multi-auth/issues/641), [#642](https://github.com/ndycode/codex-multi-auth/pull/642))
+- **Interactive sessions reindexed their history on every launch.** Runtime rotation copied the Codex home into a temporary shadow directory and synced state back on exit. Interactive sessions now run against the canonical `CODEX_HOME` with the rotation provider passed as `-c` overrides, so state is read and written in place and the real `config.toml` is never rewritten. Non-interactive commands, `codex app`, and `app-server` are unchanged ([#639](https://github.com/ndycode/codex-multi-auth/pull/639))
+- **`doctor --fix` warned about the credential store but could not repair it.** It now pins the store directly and re-reports the check as `ok`, `--fix --dry-run` reports the planned action like every other fix, and the remediation is recorded correctly on a machine with no accounts registered yet ([#642](https://github.com/ndycode/codex-multi-auth/pull/642))
+
+### Added
+
+- Concurrent-session coverage for canonical-home interactive routing, asserting that two overlapping sessions both keep their state and that the sessions genuinely overlap ([#643](https://github.com/ndycode/codex-multi-auth/pull/643))
+- `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE` is now documented in `docs/configuration.md` and `docs/development/CONFIG_FIELDS.md`; it was previously undocumented ([#642](https://github.com/ndycode/codex-multi-auth/pull/642))
+
 ## [2.7.1] - 2026-07-24
 
 A correctness release with no new features and no configuration changes — the output of a whole-repo bug hunt across the refresh lease, quota forecasting, account storage, the request pipeline, and account routing. Every fix was reproduced first and ships with a regression test that fails against 2.7.0. Two of them could silently route requests to the wrong account or stall refreshes for every process on the machine, so upgrading is recommended for multi-account setups.

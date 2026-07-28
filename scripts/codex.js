@@ -74,6 +74,10 @@ const APP_RUNTIME_HELPER_OWNER_PID_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID";
 const APP_RUNTIME_HELPER_REAL_CODEX_HOME_ENV =
 	"CODEX_MULTI_AUTH_REAL_CODEX_HOME";
+const APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV =
+	"CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME";
+const APP_SERVER_CONFIG_ARGS_ENV =
+	"CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON";
 const APP_RUNTIME_HELPER_STATUS_FILE =
 	RUNTIME_CONSTANTS.APP_RUNTIME_HELPER_STATUS_FILE;
 const DEFAULT_APP_RUNTIME_HELPER_IDLE_MS = 12 * 60 * 60 * 1000;
@@ -3518,6 +3522,38 @@ function createRuntimeRotationProxyCodexHome(
 	};
 }
 
+function createRuntimeRotationProxyCanonicalCodexHome(
+	baseEnv,
+	proxyBaseUrl,
+	clientApiKey,
+	configTomlModule,
+) {
+	const originalCodexHome = resolveRuntimeRotationProxyOriginalCodexHome(baseEnv);
+	const providerTable = `model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}`;
+	const configArgs = [
+		`${providerTable}.name=${configTomlModule.tomlStringLiteral(APP_SERVER_ACCOUNT_DISPLAY_NAME)}`,
+		`${providerTable}.base_url=${configTomlModule.tomlStringLiteral(proxyBaseUrl)}`,
+		`${providerTable}.env_key=${configTomlModule.tomlStringLiteral("OPENAI_API_KEY")}`,
+		`${providerTable}.requires_openai_auth=false`,
+		`${providerTable}.wire_api=${configTomlModule.tomlStringLiteral("responses")}`,
+		"disable_response_storage=false",
+	].flatMap((assignment) => ["-c", assignment]);
+
+	return {
+		args: configArgs,
+		env: {
+			...baseEnv,
+			CODEX_HOME: originalCodexHome,
+			OPENAI_API_KEY: clientApiKey,
+			CODEX_MULTI_AUTH_DIR: resolveRuntimeRotationOriginalMultiAuthDir(
+				originalCodexHome,
+				baseEnv,
+			),
+		},
+		cleanup: () => {},
+	};
+}
+
 function appendNodeImportOption(nodeOptions, preloadPath) {
 	const importOption = `--import=${pathToFileURL(preloadPath).href}`;
 	const trimmed = (nodeOptions ?? "").trim();
@@ -3532,15 +3568,26 @@ function createRuntimeRotationAppServerPreloadSource(wrapperScriptPath) {
 		"",
 		`const wrapperScriptPath = ${JSON.stringify(wrapperScriptPath)};`,
 		`const accountLabelEnv = ${JSON.stringify(APP_SERVER_ACCOUNT_LABEL_ENV)};`,
+		`const configArgsEnv = ${JSON.stringify(APP_SERVER_CONFIG_ARGS_ENV)};`,
+		"let configArgs = [];",
+		"try {",
+		'  const parsed = JSON.parse(process.env[configArgsEnv] ?? "[]");',
+		"  if (Array.isArray(parsed)) {",
+		'    configArgs = parsed.filter((arg) => typeof arg === "string");',
+		"  }",
+		"} catch {",
+		"  // Ignore malformed internal metadata and preserve app-server startup.",
+		"}",
 		"const rawArgs = process.argv.slice(1);",
 		"const firstArg = rawArgs[0] ?? \"\";",
 		'if (basename(firstArg).toLowerCase() === "app-server") {',
-		'  const args = ["app-server", ...rawArgs.slice(1)];',
+		'  const args = ["app-server", ...rawArgs.slice(1), ...configArgs];',
 		"  const env = {",
 		"    ...process.env,",
 		'    CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",',
 		"    [accountLabelEnv]: \"1\",",
 		"  };",
+		"  delete env[configArgsEnv];",
 		"  const child = spawn(process.execPath, [wrapperScriptPath, ...args], {",
 		"    stdio: \"inherit\",",
 		"    env,",
@@ -3586,7 +3633,7 @@ function sweepStaleRuntimeRotationAppServerShimDirs(shimRootDir) {
 	}
 }
 
-function installRuntimeRotationAppServerCliShim(forwardedEnv) {
+function installRuntimeRotationAppServerCliShim(forwardedEnv, configArgs = []) {
 	const shadowCodexHome = forwardedEnv.CODEX_HOME;
 	if (!shadowCodexHome) {
 		throw new Error("runtime app-server shim requires CODEX_HOME");
@@ -3643,6 +3690,11 @@ function installRuntimeRotationAppServerCliShim(forwardedEnv) {
 	);
 	forwardedEnv.CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY = "0";
 	forwardedEnv[APP_SERVER_ACCOUNT_LABEL_ENV] = "1";
+	if (configArgs.length > 0) {
+		forwardedEnv[APP_SERVER_CONFIG_ARGS_ENV] = JSON.stringify(configArgs);
+	} else {
+		delete forwardedEnv[APP_SERVER_CONFIG_ARGS_ENV];
+	}
 	return shimDir;
 }
 
@@ -3743,6 +3795,7 @@ function pickRuntimeRotationAppHelperEnv(env) {
 		"CODEX_MULTI_AUTH_REAL_CODEX_BIN",
 		"CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY",
 		APP_SERVER_ACCOUNT_LABEL_ENV,
+		APP_SERVER_CONFIG_ARGS_ENV,
 	]) {
 		if (env[name]) {
 			picked[name] = env[name];
@@ -3804,7 +3857,7 @@ function createRuntimeRotationAppHelperStatus({
 
 async function runRuntimeRotationAppHelper() {
 	let proxyServer = null;
-	let shadowContext = null;
+	let runtimeContext = null;
 	let appServerShimDir = null;
 	let statusTimer = null;
 	let closing = false;
@@ -3841,7 +3894,7 @@ async function runRuntimeRotationAppHelper() {
 				}
 				appServerShimDir = null;
 			}
-			shadowContext?.cleanup?.();
+			runtimeContext?.cleanup?.();
 		} finally {
 			try {
 				await proxyServer?.close?.();
@@ -3872,13 +3925,33 @@ async function runRuntimeRotationAppHelper() {
 		}
 		const clientApiKey = createRuntimeRotationProxyClientApiKey();
 		proxyServer = await proxyModule.startRuntimeRotationProxy({ clientApiKey });
-		shadowContext = createRuntimeRotationProxyCodexHome(
-			process.env,
-			proxyServer.baseUrl,
-			clientApiKey,
-			configTomlModule,
+		const useCanonicalHome =
+			(process.env[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV] ?? "").trim() ===
+			"1";
+		runtimeContext = useCanonicalHome
+			? createRuntimeRotationProxyCanonicalCodexHome(
+					process.env,
+					proxyServer.baseUrl,
+					clientApiKey,
+					configTomlModule,
+				)
+			: createRuntimeRotationProxyCodexHome(
+					process.env,
+					proxyServer.baseUrl,
+					clientApiKey,
+					configTomlModule,
+				);
+		const appServerConfigArgs = useCanonicalHome
+			? [
+					...(runtimeContext.args ?? []),
+					"-c",
+					`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
+				]
+			: [];
+		appServerShimDir = installRuntimeRotationAppServerCliShim(
+			runtimeContext.env,
+			appServerConfigArgs,
 		);
-		appServerShimDir = installRuntimeRotationAppServerCliShim(shadowContext.env);
 		lastRequestCount = proxyServer.getStatus?.().totalRequests ?? 0;
 		publishStatus("running");
 		process.stdout.write(
@@ -3887,7 +3960,8 @@ async function runRuntimeRotationAppHelper() {
 				pid: process.pid,
 				baseUrl: proxyServer.baseUrl,
 				statusPath: resolveRuntimeRotationAppHelperStatusPath(),
-				env: pickRuntimeRotationAppHelperEnv(shadowContext.env),
+				args: runtimeContext.args ?? [],
+				env: pickRuntimeRotationAppHelperEnv(runtimeContext.env),
 			})}\n`,
 		);
 
@@ -3948,7 +4022,7 @@ function stopRuntimeRotationAppHelper(helper) {
 	return waitForRuntimeRotationAppHelperExit(helper);
 }
 
-function startRuntimeRotationAppHelper(baseContext) {
+function startRuntimeRotationAppHelper(baseContext, options = {}) {
 	const realCodexHome =
 		baseContext.originalCodexHome ??
 		resolveRuntimeRotationProxyOriginalCodexHome(baseContext.env);
@@ -3968,6 +4042,8 @@ function startRuntimeRotationAppHelper(baseContext) {
 					),
 					[APP_RUNTIME_HELPER_OWNER_PID_ENV]: String(process.pid),
 					[APP_RUNTIME_HELPER_REAL_CODEX_HOME_ENV]: realCodexHome,
+					[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV]:
+						options.useCanonicalHome === true ? "1" : "0",
 				},
 				stdio: ["ignore", "pipe", "pipe"],
 				detached: true,
@@ -4033,8 +4109,14 @@ async function createRuntimeRotationAppHelperContext(
 	options = {},
 ) {
 	const startedAt = Date.now();
-	const { helper, message } = await startRuntimeRotationAppHelper(baseContext);
+	const { helper, message } = await startRuntimeRotationAppHelper(
+		baseContext,
+		options,
+	);
 	const helperEnv = message.env ?? {};
+	const helperArgs = Array.isArray(message.args)
+		? message.args.filter((arg) => typeof arg === "string")
+		: [];
 	const detachGraceMs = resolveRuntimeRotationAppHelperDetachGraceMs(baseContext.env);
 
 	const cleanup = async ({ exitCode } = {}) => {
@@ -4051,6 +4133,7 @@ async function createRuntimeRotationAppHelperContext(
 	return {
 		args: [
 			...baseContext.args,
+			...helperArgs,
 			"-c",
 			`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
 		],
@@ -4091,6 +4174,7 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	if (isCodexInteractiveTuiCommand(rawArgs)) {
 		return createRuntimeRotationAppHelperContext(baseContext, configTomlModule, {
 			detachOnExit: true,
+			useCanonicalHome: true,
 		});
 	}
 

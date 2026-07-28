@@ -2800,6 +2800,101 @@ describe("codex bin wrapper", () => {
 		expect(marker).toContain("close\n");
 	});
 
+	it("uses the canonical Codex home for interactive TUI runtime routing", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'const { spawnSync } = require("node:child_process");',
+			'const fs = require("node:fs");',
+			'const path = require("node:path");',
+			'const args = process.argv.slice(2);',
+			'if (args[0] === "app-server") {',
+			'  console.log(`APP_SERVER_FORWARDED:${args.join(" ")}`);',
+			"  process.exit(0);",
+			"}",
+			'const statePath = path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite");',
+			'const originalState = path.join(process.env.ORIGINAL_CODEX_HOME ?? "", "state_5.sqlite");',
+			'console.log(`TUI_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);',
+			'console.log(`TUI_STATE_EXISTED:${fs.existsSync(statePath)}`);',
+			'fs.writeFileSync(statePath, "first-run-state\\n", "utf8");',
+			'console.log(`TUI_STATE_PERSISTED:${fs.readFileSync(originalState, "utf8").includes("first-run-state")}`);',
+			'console.log(`TUI_HAS_BASE_URL_OVERRIDE:${args.some((arg) => arg.includes("model_providers.codex-multi-auth-runtime-proxy.base_url="))}`);',
+			'console.log(`TUI_HAS_ENV_KEY_OVERRIDE:${args.includes(\'model_providers.codex-multi-auth-runtime-proxy.env_key="OPENAI_API_KEY"\')}`);',
+			'console.log(`TUI_HAS_AUTH_OVERRIDE:${args.includes("model_providers.codex-multi-auth-runtime-proxy.requires_openai_auth=false")}`);',
+			'console.log(`TUI_HAS_WIRE_OVERRIDE:${args.includes(\'model_providers.codex-multi-auth-runtime-proxy.wire_api="responses"\')}`);',
+			'console.log(`TUI_HAS_STORAGE_OVERRIDE:${args.includes("disable_response_storage=false")}`);',
+			'console.log(`TUI_KEY_IN_ARGS:${args.includes(process.env.OPENAI_API_KEY ?? "__missing__")}`);',
+			'const shimExe = path.join(process.env.CODEX_CLI_PATH ?? "", process.platform === "win32" ? "codex.exe" : "codex");',
+			'const shimResult = spawnSync(shimExe, ["app-server", "--canonical-shim"], { encoding: "utf8", env: process.env });',
+			'console.log(`TUI_SHIM_STATUS:${shimResult.status}`);',
+			'console.log(`TUI_SHIM_STDOUT:${(shimResult.stdout ?? "").trim()}`);',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, [], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("TUI_HOME_IS_ORIGINAL:true");
+		expect(output).toContain("TUI_STATE_EXISTED:false");
+		expect(output).toContain("TUI_STATE_PERSISTED:true");
+		expect(output).toContain("TUI_HAS_BASE_URL_OVERRIDE:true");
+		expect(output).toContain("TUI_HAS_ENV_KEY_OVERRIDE:true");
+		expect(output).toContain("TUI_HAS_AUTH_OVERRIDE:true");
+		expect(output).toContain("TUI_HAS_WIRE_OVERRIDE:true");
+		expect(output).toContain("TUI_HAS_STORAGE_OVERRIDE:true");
+		expect(output).toContain("TUI_KEY_IN_ARGS:false");
+		expect(output).toContain("TUI_SHIM_STATUS:0");
+		expect(output).toContain(
+			"APP_SERVER_FORWARDED:app-server --canonical-shim",
+		);
+		expect(output).toContain(
+			"model_providers.codex-multi-auth-runtime-proxy.base_url=",
+		);
+		expect(output).toContain(
+			'model_providers.codex-multi-auth-runtime-proxy.env_key="OPENAI_API_KEY"',
+		);
+		expect(output).toContain(
+			"model_providers.codex-multi-auth-runtime-proxy.requires_openai_auth=false",
+		);
+		expect(output).toContain(
+			'model_providers.codex-multi-auth-runtime-proxy.wire_api="responses"',
+		);
+		expect(output).toContain("disable_response_storage=false");
+		expect(output).toContain(
+			'model_provider="codex-multi-auth-runtime-proxy"',
+		);
+		expect(readFileSync(join(originalHome, "state_5.sqlite"), "utf8")).toBe(
+			"first-run-state\n",
+		);
+		expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toBe(
+			'model_provider = "openai"\n',
+		);
+		await waitForFileText(
+			markerPath,
+			"start:http://127.0.0.1:4567\nclose\n",
+		);
+	});
+
 	it("stops detached TUI app helpers after failed launches", async () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);

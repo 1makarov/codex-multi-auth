@@ -2895,6 +2895,99 @@ describe("codex bin wrapper", () => {
 		);
 	});
 
+	// Canonical-home routing drops the per-session shadow copy, so two concurrent
+	// interactive sessions now share the real Codex home. That is how the stock
+	// CLI already behaves, but it has to be proven rather than assumed: neither
+	// session may lose state written by the other, and neither may fail to launch.
+	it("keeps both sessions' state when two canonical TUI sessions overlap", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'const fs = require("node:fs");',
+			'const path = require("node:path");',
+			"const args = process.argv.slice(2);",
+			'if (args[0] === "app-server") {',
+			"  process.exit(0);",
+			"}",
+			'const id = process.env.CODEX_MULTI_AUTH_TEST_SESSION_ID ?? "unknown";',
+			'const home = process.env.CODEX_HOME ?? "";',
+			'console.log(`TUI_HOME_IS_ORIGINAL:${home === process.env.ORIGINAL_CODEX_HOME}`);',
+			'const sessionsDir = path.join(home, "sessions");',
+			"fs.mkdirSync(sessionsDir, { recursive: true });",
+			"const startedAt = Date.now();",
+			'fs.writeFileSync(path.join(sessionsDir, id + ".jsonl"), "session-" + id + "\\n", "utf8");',
+			"// Linger so both sessions are genuinely in-flight at the same time,",
+			"// rather than serialising by accident and proving nothing.",
+			"Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600);",
+			'console.log(`TUI_SESSION_WINDOW:${id}:${startedAt}:${Date.now()}`);',
+			'console.log(`TUI_SESSION_DONE:${id}`);',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const launch = (id: string) =>
+			runWrapperAsync(fixtureRoot, [], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				ORIGINAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(
+					fixtureRoot,
+					`proxy-marker-${id}.txt`,
+				),
+				CODEX_MULTI_AUTH_TEST_SESSION_ID: id,
+				OPENAI_API_KEY: undefined,
+			});
+
+		const results = await Promise.all([launch("alpha"), launch("beta")]);
+
+		for (const result of results) {
+			const output = combinedOutput(result);
+			if (result.status !== 0) {
+				throw new Error(output);
+			}
+			expect(output).toContain("TUI_HOME_IS_ORIGINAL:true");
+		}
+		expect(combinedOutput(results[0])).toContain("TUI_SESSION_DONE:alpha");
+		expect(combinedOutput(results[1])).toContain("TUI_SESSION_DONE:beta");
+
+		// Prove the sessions actually overlapped. If they serialised, the test
+		// would pass without ever exercising concurrency.
+		const windows = results.map((result) => {
+			const match = combinedOutput(result).match(
+				/TUI_SESSION_WINDOW:\w+:(\d+):(\d+)/,
+			);
+			if (!match) throw new Error("missing session window marker");
+			return { start: Number(match[1]), end: Number(match[2]) };
+		});
+		const [first, second] = windows as [
+			{ start: number; end: number },
+			{ start: number; end: number },
+		];
+		expect(first.start).toBeLessThan(second.end);
+		expect(second.start).toBeLessThan(first.end);
+
+		// Neither session's state may be lost to the other.
+		expect(
+			readFileSync(join(originalHome, "sessions", "alpha.jsonl"), "utf8"),
+		).toBe("session-alpha\n");
+		expect(
+			readFileSync(join(originalHome, "sessions", "beta.jsonl"), "utf8"),
+		).toBe("session-beta\n");
+		// The real config is still only touched via -c overrides.
+		expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toBe(
+			'model_provider = "openai"\n',
+		);
+	});
+
 	it("stops detached TUI app helpers after failed launches", async () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);

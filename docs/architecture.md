@@ -60,6 +60,7 @@ The standalone manager normalizes bare account-manager commands, so both `codex-
 - Handles multi-auth `auth` subcommands locally.
 - Forwards non-auth commands to official Codex.
 - For request-bearing sessions with runtime rotation enabled, creates a temporary shadow `CODEX_HOME`, writes a local provider (`codex-multi-auth-runtime-proxy`), and starts a loopback proxy for that process.
+- For interactive TUI sessions, keeps the canonical `CODEX_HOME` and passes the same provider as `-c` overrides instead, so session history and SQLite state are not copied into a shadow and reindexed on every launch.
 - Keeps forwarded sessions on file-backed auth state unless the caller opts out.
 - Supports ephemeral force-pin: `codex-multi-auth-codex --account <index|email|id>` (or `CODEX_MULTI_AUTH_FORCE_ACCOUNT`) for a single invocation only — never mutates the persisted `switch` pin.
 

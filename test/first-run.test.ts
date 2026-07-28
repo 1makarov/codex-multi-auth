@@ -332,6 +332,47 @@ describe("ensureFirstRunSetup", () => {
 		});
 		const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
 		expect(marker.authStore).toBe("failed");
+		// Left pre-v2 so the next invocation replays the step via the migration
+		// path; app bind and launcher stay done.
+		expect(marker.version).toBe(1);
+		expect(marker.appBind).toBe("completed");
+	});
+
+	it("replays only the auth-store step after initial setup failed it", async () => {
+		const markerPath = createMarkerPath();
+		const bindCodexApp = vi.fn(async () => "completed" as const);
+		const installLauncher = vi.fn(async () => "completed" as const);
+		const enforceAuthStore = vi
+			.fn<() => Promise<"completed">>()
+			.mockRejectedValueOnce(new Error("config.toml is locked"))
+			.mockResolvedValueOnce("completed");
+
+		const deps = {
+			env: {},
+			installedContext: true,
+			markerPath,
+			bindCodexApp,
+			installLauncher,
+			enforceAuthStore,
+		};
+
+		await ensureFirstRunSetup(deps);
+		const second = await ensureFirstRunSetup(deps);
+
+		expect(second).toEqual({
+			ran: false,
+			reason: "migrated",
+			authStore: "completed",
+		});
+		expect(enforceAuthStore).toHaveBeenCalledTimes(2);
+		expect(bindCodexApp).toHaveBeenCalledTimes(1);
+		expect(installLauncher).toHaveBeenCalledTimes(1);
+		const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<
+			string,
+			unknown
+		>;
+		expect(marker.version).toBe(FIRST_RUN_MARKER_VERSION);
+		expect(marker.authStore).toBe("completed");
 	});
 
 	// Bumping FIRST_RUN_MARKER_VERSION alone would do nothing: setup
@@ -435,30 +476,55 @@ describe("ensureFirstRunSetup", () => {
 			expect(marker.version).toBe(FIRST_RUN_MARKER_VERSION);
 		});
 
-		it("records a failed auth-store step without throwing", async () => {
+		// Recording the current version after a failed step would strand the user:
+		// one transient Windows EPERM/EBUSY on a locked config.toml would leave
+		// the CLI on keychain mode forever, which is the symptom being fixed.
+		it("keeps the marker pre-v2 when the auth-store step fails, then retries", async () => {
 			const markerPath = createMarkerPath();
 			writeMarker(markerPath, { version: 1 });
+			const enforceAuthStore = vi
+				.fn<() => Promise<"completed">>()
+				.mockRejectedValueOnce(new Error("config.toml is locked"))
+				.mockResolvedValueOnce("completed");
 
-			const result = await ensureFirstRunSetup({
+			const first = await ensureFirstRunSetup({
 				env: {},
 				installedContext: true,
 				markerPath,
-				enforceAuthStore: async () => {
-					throw new Error("config.toml is locked");
-				},
+				enforceAuthStore,
 			});
 
-			expect(result).toEqual({
+			expect(first).toEqual({
 				ran: false,
 				reason: "migrated",
 				authStore: "failed",
 			});
-			const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<
+			const afterFailure = JSON.parse(
+				readFileSync(markerPath, "utf8"),
+			) as Record<string, unknown>;
+			expect(afterFailure.version).toBe(1);
+			expect(afterFailure.authStore).toBe("failed");
+
+			// The lock clears; the next invocation must retry and converge.
+			const second = await ensureFirstRunSetup({
+				env: {},
+				installedContext: true,
+				markerPath,
+				enforceAuthStore,
+			});
+
+			expect(second).toEqual({
+				ran: false,
+				reason: "migrated",
+				authStore: "completed",
+			});
+			expect(enforceAuthStore).toHaveBeenCalledTimes(2);
+			const afterRetry = JSON.parse(readFileSync(markerPath, "utf8")) as Record<
 				string,
 				unknown
 			>;
-			expect(marker.version).toBe(FIRST_RUN_MARKER_VERSION);
-			expect(marker.authStore).toBe("failed");
+			expect(afterRetry.version).toBe(FIRST_RUN_MARKER_VERSION);
+			expect(afterRetry.authStore).toBe("completed");
 		});
 
 		// The migration takes no exclusive claim; it relies on both the config

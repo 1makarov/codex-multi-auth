@@ -69,6 +69,15 @@ takes no exclusive claim because both the `config.toml` rewrite and the marker
 write are idempotent and atomic. An unreadable or truncated marker is treated as
 pre-v2 and migrated the same way, rather than re-triggering full setup.
 
+A *failed* auth-store step deliberately leaves the marker pre-v2 so the next
+invocation retries it — otherwise one transient Windows `EPERM`/`EBUSY` on a
+locked `config.toml` would strand the CLI on keychain mode permanently. This
+applies to the initial setup too: if that step fails there, the marker records
+the older version and the next run replays only that step. A `skipped` result
+does advance the version, since it is the normal outcome both for a config
+already pinned to `"file"` and for an explicit
+`CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0` opt-out.
+
 Deleting the marker can re-trigger first-run setup on
 the next CLI run.
 

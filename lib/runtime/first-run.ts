@@ -327,9 +327,12 @@ async function finalizeFirstRunMarker(
 	outcome: FirstRunSetupOutcome,
 	now: () => number,
 ): Promise<void> {
+	// A failed auth-store step records a pre-v2 version so the next invocation
+	// replays it through the migration path — which reruns only that step, never
+	// app bind or launcher install.
 	const payload = `${JSON.stringify(
 		{
-			version: FIRST_RUN_MARKER_VERSION,
+			version: markerVersionFor(outcome.authStore, undefined),
 			startedAt,
 			completedAt: now(),
 			appBind: outcome.appBind,
@@ -417,6 +420,31 @@ async function defaultEnforceAuthStore(): Promise<FirstRunStepStatus> {
 	return (await ensureCodexCliFileAuthStore()) ? "completed" : "skipped";
 }
 
+/**
+ * Decides the version to persist after an auth-store attempt.
+ *
+ * Recording the current version after a *failed* step would strand the user:
+ * `ensureFirstRunSetup` short-circuits on version alone, so a single transient
+ * Windows `EPERM`/`EBUSY` on a locked `config.toml` would leave the CLI on
+ * keychain mode permanently — the exact symptom this whole change exists to
+ * remove. Staying pre-v2 costs one extra marker read per invocation and
+ * self-heals as soon as the write succeeds, because the step is idempotent.
+ *
+ * `"skipped"` deliberately does bump. It is the normal outcome for a config
+ * already pinned to `"file"`, so treating it as unfinished would mean the
+ * marker never reaches the current version for healthy installs. It also covers
+ * an explicit `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0` opt-out — a user
+ * choice, not a failure — and if that opt-out is later removed, the
+ * wrapper-startup guard and `doctor --fix` both still reconcile the config.
+ */
+function markerVersionFor(
+	authStore: FirstRunStepStatus,
+	previousVersion: number | undefined,
+): number {
+	if (authStore === "failed") return previousVersion ?? 1;
+	return FIRST_RUN_MARKER_VERSION;
+}
+
 function readFirstRunMarker(markerPath: string): FirstRunMarker | null {
 	try {
 		const parsed: unknown = JSON.parse(readFileSync(markerPath, "utf8"));
@@ -468,7 +496,7 @@ async function migrateFirstRunMarker(
 
 	const payload = `${JSON.stringify(
 		{
-			version: FIRST_RUN_MARKER_VERSION,
+			version: markerVersionFor(authStore, marker.version),
 			startedAt: marker.startedAt ?? now(),
 			completedAt: marker.completedAt ?? now(),
 			appBind: marker.appBind ?? "skipped",

@@ -42,6 +42,7 @@ import {
 	ensureCodexCliFileAuthStore,
 	readTopLevelCodexCliAuthStoreMode,
 	setCodexCliActiveSelection,
+	shouldEnforceCodexCliFileAuthStore,
 } from "../codex-cli/writer.js";
 import { MODEL_FAMILIES, type ModelFamily } from "../prompts/codex.js";
 import { DEFAULT_PROBE_MODEL, resolveNormalizedModel } from "../request/helpers/model-map.js";
@@ -1807,7 +1808,11 @@ export async function runDoctor(
 		// reach into the macOS login keychain, so `--fix` repairs it directly
 		// instead of waiting for the incidental `pendingCodexActiveSync` path
 		// below, which only fires when there is an active account to mirror.
-		if (options.fix && codexAuthStoreMode !== "file") {
+		if (
+			options.fix &&
+			codexAuthStoreMode !== "file" &&
+			shouldEnforceCodexCliFileAuthStore()
+		) {
 			if (options.dryRun) {
 				authStoreFixChanged = true;
 				supplementalFixActions.push({

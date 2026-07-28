@@ -266,6 +266,9 @@ export function createCodexCliWriterMocks() {
 		setCodexCliActiveSelection: vi.fn(),
 		ensureCodexCliFileAuthStore: vi.fn(),
 		readTopLevelCodexCliAuthStoreMode: vi.fn(),
+		// Defaults to the real default (enforcement on) so suites that do not care
+		// about the opt-out behave like production.
+		shouldEnforceCodexCliFileAuthStore: vi.fn(() => true),
 	};
 }
 
@@ -278,6 +281,8 @@ export function codexCliWriterModuleMock(
 		setCodexCliActiveSelection: mocks.setCodexCliActiveSelection,
 		ensureCodexCliFileAuthStore: mocks.ensureCodexCliFileAuthStore,
 		readTopLevelCodexCliAuthStoreMode: mocks.readTopLevelCodexCliAuthStoreMode,
+		shouldEnforceCodexCliFileAuthStore:
+			mocks.shouldEnforceCodexCliFileAuthStore,
 	};
 }
 

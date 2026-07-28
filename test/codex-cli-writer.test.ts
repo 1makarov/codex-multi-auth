@@ -632,6 +632,63 @@ describe("codex-cli writer", () => {
       expect(readTopLevelCodexCliAuthStoreMode(written)).toBe("file");
     });
 
+    // Rewriting a CRLF config as LF is an edit the user never asked for, and
+    // this path now runs on every wrapper startup rather than only on switch.
+    it("preserves CRLF line endings", async () => {
+      await writeFile(
+        configPath,
+        'model = "gpt-5.3-codex"\r\ncli_auth_credentials_store = "keychain"\r\n',
+        "utf-8",
+      );
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
+      const written = await readFile(configPath, "utf-8");
+      expect(written).toBe(
+        'model = "gpt-5.3-codex"\r\ncli_auth_credentials_store = "file"\r\n',
+      );
+      expect(written).not.toMatch(/[^\r]\n/);
+    });
+
+    it("preserves LF line endings when inserting a new key", async () => {
+      await writeFile(configPath, 'model = "gpt-5.3-codex"\n', "utf-8");
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
+      expect(await readFile(configPath, "utf-8")).not.toContain("\r");
+    });
+
+    // A continuation line of a multi-line array starts with "[" but is not a
+    // table header. Treating it as one would cut the top-level scan short and
+    // append a second top-level key -- a duplicate, which is invalid TOML and
+    // would stop the official CLI from starting.
+    it("does not mistake a multi-line array entry for a table header", async () => {
+      await writeFile(
+        configPath,
+        'pairs = [\n[1, 2],\n]\ncli_auth_credentials_store = "keychain"\n',
+        "utf-8",
+      );
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
+      const written = await readFile(configPath, "utf-8");
+      expect(
+        written.match(/^\s*cli_auth_credentials_store\s*=/gm) ?? [],
+      ).toHaveLength(1);
+      expect(written).toContain('cli_auth_credentials_store = "file"');
+      expect(written).toContain("[1, 2],");
+    });
+
+    it("still treats a commented table header as ending top-level scope", async () => {
+      await writeFile(
+        configPath,
+        "[profiles.work] # work profile\ncli_auth_credentials_store = 'keychain'\n",
+        "utf-8",
+      );
+
+      expect(await ensureCodexCliFileAuthStore(configPath)).toBe(true);
+      const written = await readFile(configPath, "utf-8");
+      expect(written).toContain("cli_auth_credentials_store = 'keychain'");
+      expect(readTopLevelCodexCliAuthStoreMode(written)).toBe("file");
+    });
+
     it("respects the enforcement opt-out", async () => {
       process.env.CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE = "0";
       const original = 'cli_auth_credentials_store = "keychain"\n';

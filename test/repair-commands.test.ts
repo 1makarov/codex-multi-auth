@@ -1025,6 +1025,17 @@ describe("repair-commands direct deps coverage", () => {
 	// official CLI raise repeated macOS login-keychain prompts, so `--fix` has to
 	// repair it directly rather than leaving a bare warning behind.
 	describe("runDoctor codex-auth-store remediation", () => {
+		// vi.clearAllMocks() keeps implementations, so a mockReturnValue/
+		// mockResolvedValue set by one case bleeds into the next unless reset here.
+		beforeEach(() => {
+			codexCliWriterMocks.shouldEnforceCodexCliFileAuthStore.mockReset();
+			codexCliWriterMocks.shouldEnforceCodexCliFileAuthStore.mockReturnValue(
+				true,
+			);
+			codexCliWriterMocks.ensureCodexCliFileAuthStore.mockReset();
+			codexCliWriterMocks.readTopLevelCodexCliAuthStoreMode.mockReset();
+		});
+
 		function arrangeAuthStore(mode: string | null): void {
 			existsSyncMock.mockImplementation(
 				(path) => path === "/mock/config.toml",
@@ -1152,6 +1163,41 @@ describe("repair-commands direct deps coverage", () => {
 				}),
 			);
 			expect(checks).toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store", severity: "warn" }),
+			);
+		});
+
+		// A dry run must not promise a rewrite the opt-out would suppress.
+		it("plans nothing when enforcement is opted out", async () => {
+			arrangeAuthStore("keychain");
+			codexCliWriterMocks.shouldEnforceCodexCliFileAuthStore.mockReturnValue(
+				false,
+			);
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix", "--dry-run"], createDeps());
+
+			expect(readFix(consoleSpy).actions).not.toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store" }),
+			);
+			expect(readChecks(consoleSpy)).toContainEqual(
+				expect.objectContaining({ key: "codex-auth-store", severity: "warn" }),
+			);
+		});
+
+		it("skips the rewrite entirely when enforcement is opted out", async () => {
+			arrangeAuthStore("keychain");
+			codexCliWriterMocks.shouldEnforceCodexCliFileAuthStore.mockReturnValue(
+				false,
+			);
+			const consoleSpy = silenceConsole("log");
+
+			await runDoctor(["--json", "--fix"], createDeps());
+
+			expect(
+				codexCliWriterMocks.ensureCodexCliFileAuthStore,
+			).not.toHaveBeenCalled();
+			expect(readChecks(consoleSpy)).toContainEqual(
 				expect.objectContaining({ key: "codex-auth-store", severity: "warn" }),
 			);
 		});

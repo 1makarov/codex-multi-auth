@@ -6,7 +6,7 @@
 > review" statuses, version stamps, and test counts are preserved as written at the time and
 > are **not** current repository state. For how these features behave today see
 > [../../../reference/commands.md](../../../reference/commands.md),
-> [../../../reference/settings.md](../../../reference/settings.md), and [../ARCHITECTURE.md](../../ARCHITECTURE.md).
+> [../../../reference/settings.md](../../../reference/settings.md), and [../../ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 Branch: `chore/roadmap-local-governance`
 Base: `origin/main` at `4308b56a14c132c5df9584a7b611a02b64891b2c`

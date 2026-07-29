@@ -6,7 +6,7 @@
 > review" statuses, version stamps, and test counts are preserved as written at the time and
 > are **not** current repository state. For how these features behave today see
 > [../../../reference/commands.md](../../../reference/commands.md),
-> [../../../reference/settings.md](../../../reference/settings.md), and [../ARCHITECTURE.md](../../ARCHITECTURE.md).
+> [../../../reference/settings.md](../../../reference/settings.md), and [../../ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 Branch: `feat/local-governance-review-stack`
 Base: open local governance review stack PR

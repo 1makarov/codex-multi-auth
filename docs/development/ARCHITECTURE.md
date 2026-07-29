@@ -57,7 +57,8 @@ Runtime rotation enabled -> one of three transports
   |
   |- interactive TUI (no forwarded subcommand)
   |    canonical CODEX_HOME + ephemeral -c provider overrides
-  |    (no shadow copy, no config.toml rewrite, detach on exit)
+  |    (no shadow copy, no provider/transport rewrite of config.toml,
+  |     detach on exit; the auth-store reconcile above still applies)
   |
   |- codex app
   |    app runtime helper process + shadow CODEX_HOME
@@ -165,7 +166,7 @@ Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained acco
 
    | Branch | Predicate | Transport |
    | --- | --- | --- |
-   | Interactive TUI | `isCodexInteractiveTuiCommand` — no forwarded subcommand at all | App runtime helper with `useCanonicalHome: true` and `detachOnExit: true`. Runs against the **canonical** `CODEX_HOME`; the provider is passed as ephemeral `-c model_providers.*` overrides. No shadow copy, no state sync-back, and `config.toml` is never rewritten on this path. |
+   | Interactive TUI | `isCodexInteractiveTuiCommand` — no forwarded subcommand at all | App runtime helper with `useCanonicalHome: true` and `detachOnExit: true`. Runs against the **canonical** `CODEX_HOME`; the provider is passed as ephemeral `-c model_providers.*` overrides. No shadow copy and no state sync-back. Nothing **provider- or transport-related** is written into `config.toml` on this path — the only top-level key the wrapper still reconciles there is `cli_auth_credentials_store`, which is transport-independent (see step 4 note). |
    | `codex app` | `isCodexAppCommand` — forwarded command is `app` | App runtime helper process with a shadow `CODEX_HOME`. |
    | Everything else | request-bearing forwarded command | Shadow `CODEX_HOME` created inline by the wrapper process. |
 
@@ -177,7 +178,11 @@ Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained acco
 9. Usage ledger rows and runtime counters are persisted for status/report/usage/budget commands.
 10. On exit, shadow-home branches sync refreshed official state files back and remove the temporary directory. The canonical-home branch has nothing to sync — it read and wrote official state in place.
 
-Why the interactive branch is different: copying the Codex home into a shadow made the official CLI reindex its thread history and SQLite state on every TUI launch. Running interactive sessions against the canonical home keeps that state reusable. Because neither session copies nor syncs state, two interactive sessions can run concurrently against the same home — the same as running the official CLI twice — so no lock is taken. Regression coverage lives in `test/codex-bin-wrapper.test.ts`.
+Why the interactive branch is different: copying the Codex home into a shadow made the official CLI reindex its thread history and SQLite state on every TUI launch. Running interactive sessions against the canonical home keeps that state reusable.
+
+Two interactive sessions can therefore run concurrently against the same home — the same as running the official CLI twice — and **no lock is taken over session state**: neither session copies or syncs it, so there is nothing to clobber. Regression coverage lives in `test/codex-bin-wrapper.test.ts`.
+
+Scope that guarantee to session state only. It does **not** extend to `config.toml`: `ensureCodexCliFileAuthStore` (`lib/codex-cli/writer.ts`) still read-modify-writes the canonical file when the store is not already `"file"`, and the atomic write does not serialize cross-process writers. That is safe in practice rather than by locking — the operation is idempotent, converges on a single value, and lands via atomic rename, so concurrent invocations agree instead of interleaving. Anything added to that write path that is *not* idempotent would need a real lock.
 
 Internal env used by these branches (not operator-facing): `CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME`, `CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON`, `CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID`, `CODEX_MULTI_AUTH_REAL_CODEX_HOME`.
 

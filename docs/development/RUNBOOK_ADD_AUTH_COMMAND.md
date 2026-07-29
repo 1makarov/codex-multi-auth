@@ -25,6 +25,8 @@ Add one new command path while keeping:
 - `README.md` when user-visible workflow changes
 - `test/codex-manager-cli.test.ts`
 - `test/documentation.test.ts`
+- `docs/upgrade.md` when the command changes user-visible behavior or a documented workflow
+- `package.json` scripts, when the command adds or changes a build/test entrypoint referenced by docs
 
 For the full dispatch contract and the two-registry trap, see [RUNBOOK_ADD_AUTH_MANAGER_COMMAND.md](RUNBOOK_ADD_AUTH_MANAGER_COMMAND.md).
 

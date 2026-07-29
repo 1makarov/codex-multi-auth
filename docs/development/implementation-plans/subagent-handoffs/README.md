@@ -6,7 +6,7 @@
 > review" statuses, version stamps, and test counts are preserved as written at the time and
 > are **not** current repository state. For how these features behave today see
 > [../../../reference/commands.md](../../../reference/commands.md),
-> [../../../reference/settings.md](../../../reference/settings.md), and [../ARCHITECTURE.md](../../ARCHITECTURE.md).
+> [../../../reference/settings.md](../../../reference/settings.md), and [../../ARCHITECTURE.md](../../ARCHITECTURE.md).
 
 Each roadmap PR must add or update a handoff file in this directory before
 handoff. The handoff should include branch, base, scope, files changed,

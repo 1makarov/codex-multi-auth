@@ -36,7 +36,8 @@ Aliases point at the same handler (`status` and `list` share `runListOrStatusCom
 4. Take collaborators as an injected `deps` object rather than importing singletons directly — this is what keeps the command testable.
 5. Keep JSON output stable and explicit if the command has `--json`.
 6. Update `docs/reference/commands.md` in the same change.
-7. Add or extend `test/codex-manager-cli.test.ts` for the new path.
+7. Add or extend `test/codex-manager-cli.test.ts` with a case for **each dispatch form**: `codex-multi-auth auth <name>` *and* the bare `codex-multi-auth <name>`. Only the bare-form case catches a missing `ACCOUNT_MANAGER_COMMANDS` entry — a handler-only registration passes the `auth`-prefixed test and still ships broken.
+8. If the command exercises token refresh or storage writes, add deterministic coverage for the refresh race and for Windows `EBUSY`/`EPERM` cleanup rather than relying on timing.
 
 ## Compatibility Checks
 

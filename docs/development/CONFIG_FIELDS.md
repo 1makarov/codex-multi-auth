@@ -336,7 +336,7 @@ Consumed by the optional plugin-host runtime (`index.ts`) rather than the CLI.
 | Variable | Purpose |
 | --- | --- |
 | `CODEX_AUTH_FAILOVER_MODE` | `conservative`, `balanced` (default; also the fallback for any unrecognised value), or `aggressive`. Selects the per-mode defaults below. Same-account retries: conservative `2`, balanced `1`, aggressive `0`. Soft stall timeout: `20000` / `15000` / `10000` ms |
-| `CODEX_AUTH_STREAM_FAILOVER_MAX` | Maximum stream failover attempts; overrides the per-mode default (`2` / `2` / `1`). Always clamped to `0..1` by `capStreamFailoverMax`, so the effective value is at most one failover regardless of mode or override |
+| `CODEX_AUTH_STREAM_FAILOVER_MAX` | Maximum stream failover attempts. The declared per-mode defaults are `2` / `2` / `1` (conservative / balanced / aggressive), but every value — default or override — passes through `capStreamFailoverMax`, which clamps to `0..1`. **Effective defaults are therefore `1` / `1` / `1`**, and the only override that changes behaviour is `0` (disable failover entirely); anything `>= 1` yields one failover |
 | `CODEX_AUTH_STREAM_STALL_SOFT_TIMEOUT_MS` | Soft stream-stall threshold before failover is considered; overrides the per-mode default, floor `1000` ms |
 | `CODEX_AUTH_STREAM_STALL_HARD_TIMEOUT_MS` | Hard stream-stall threshold that aborts the stream; never lower than the soft threshold, and defaults to `streamStallTimeoutMs` |
 | `CODEX_AUTH_PREWARM` | Set `0` to disable connection prewarming |

@@ -243,6 +243,32 @@ describe("Documentation Integrity", () => {
 		expect(agents).toContain(`Package version: ${packageVersion}`);
 	});
 
+	it("keeps reference-doc package-version stamps in sync with package.json", () => {
+		// These three headers silently drifted from 2.6.1 through the 2.7.0,
+		// 2.7.1, and 2.8.0 releases because nothing pinned them to the manifest.
+		// Same failure class as the AGENTS.md header above, so pin them too.
+		const stampedReferenceDocs = [
+			"docs/reference/commands.md",
+			"docs/reference/public-api.md",
+			"docs/reference/settings.md",
+		];
+		for (const docPath of stampedReferenceDocs) {
+			const contents = read(docPath);
+			const stamps = [...contents.matchAll(/\(package `([^`]+)`\)/g)].map(
+				(match) => match[1],
+			);
+			expect(
+				stamps.length,
+				`${docPath} must carry a (package \`x.y.z\`) version stamp`,
+			).toBeGreaterThan(0);
+			for (const stamp of stamps) {
+				expect(stamp, `${docPath} version stamp is stale`).toBe(
+					packageVersion,
+				);
+			}
+		}
+	});
+
 	it("uses codex-multi-auth as canonical package name", () => {
 		const canonicalPackageDocs = [
 			"README.md",

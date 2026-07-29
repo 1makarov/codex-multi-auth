@@ -17,18 +17,23 @@ Add one new command path while keeping:
 
 ## Primary Files
 
-- `lib/codex-manager.ts`
+- `lib/codex-manager/commands/<name>.ts` — command implementation
+- `lib/codex-manager.ts` — `CLI_COMMAND_HANDLERS` registration
+- `lib/codex-manager/account-manager-commands.ts` — `ACCOUNT_MANAGER_COMMANDS` registration (required for the bare `codex-multi-auth <name>` form)
+- `lib/codex-manager/help.ts` — `printUsage()` text
 - `docs/reference/commands.md`
 - `README.md` when user-visible workflow changes
 - `test/codex-manager-cli.test.ts`
 - `test/documentation.test.ts`
 
+For the full dispatch contract and the two-registry trap, see [RUNBOOK_ADD_AUTH_MANAGER_COMMAND.md](RUNBOOK_ADD_AUTH_MANAGER_COMMAND.md).
+
 * * *
 
 ## Implementation Steps
 
-1. Add the command logic in `lib/codex-manager.ts` or the current command handler module.
-2. Keep usage text literal and copy-pasteable.
+1. Add the command logic as a module under `lib/codex-manager/commands/`, then register it in both `CLI_COMMAND_HANDLERS` and `ACCOUNT_MANAGER_COMMANDS`.
+2. Keep usage text literal and copy-pasteable, and add the line to `printUsage()` in `lib/codex-manager/help.ts`.
 3. Reuse existing storage, refresh, and quota helpers instead of adding new command-local state.
 4. Add or extend CLI tests in `test/codex-manager-cli.test.ts` for:
    - success path

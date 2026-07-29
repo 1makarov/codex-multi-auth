@@ -295,6 +295,65 @@ Cross-process refresh lease knobs: `CODEX_AUTH_REFRESH_LEASE`, `CODEX_AUTH_REFRE
 | `CODEX_MULTI_AUTH_PWSH_PROFILE_GUARD` | Install PowerShell profile guard when enabled |
 | `CODEX_MULTI_AUTH_OVERWRITE_CUSTOM_BATCH_SHIM` | Allow Windows shim guard to overwrite custom shims when set to `1` |
 
+### Official Codex CLI state paths
+
+These point the Codex-CLI state layer (`lib/codex-cli/state.ts`) at non-default files. Useful for sandboxes and tests; rarely set by operators.
+
+| Variable | Purpose |
+| --- | --- |
+| `CODEX_HOME` | Official Codex home. When set to a non-default path, multi-auth resolves strictly to `$CODEX_HOME/multi-auth` and does not scan `~/.codex/multi-auth` |
+| `CODEX_CLI_AUTH_PATH` | Override the official `auth.json` path |
+| `CODEX_CLI_ACCOUNTS_PATH` | Override the official `accounts.json` path |
+| `CODEX_CLI_CONFIG_PATH` | Override the official `config.toml` path |
+| `CODEX_AUTH_SYNC_CODEX_CLI` | Legacy alias for `CODEX_MULTI_AUTH_SYNC_CODEX_CLI`; read only when the canonical name is unset |
+
+### Runtime rotation transport internals
+
+Set by the wrapper for its own child processes. Not intended to be set by hand.
+
+| Variable | Purpose |
+| --- | --- |
+| `CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME` | `1` when the app runtime helper must run against the canonical `CODEX_HOME` (interactive TUI path) instead of a shadow home |
+| `CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON` | JSON array of `-c` provider overrides the app-server preload replays on the canonical-home path |
+| `CODEX_MULTI_AUTH_RUNTIME_SHADOW_COPY_GENERATED_DIRS` | `1`/`true`/`yes` allows copying generated runtime directories into a shadow `CODEX_HOME` when they cannot be linked. Off by default: the wrapper skips such a directory rather than duplicating active runtime data |
+| `CODEX_MULTI_AUTH_WRAPPER_IMPORT_ONLY` | Import `scripts/codex.js` without running its main entrypoint (used by the preload shim) |
+| `CODEX_MULTI_AUTH_CLI_VERSION` | Version string the manager publishes for the dashboard header |
+| `CODEX_MULTI_AUTH_UPDATE_NOTICE_STARTUP_BUDGET_MS` | Time budget for the best-effort daily update check during wrapper startup |
+
+### Auth flow
+
+Consumed by the OAuth login path (`lib/auth/`, `lib/runtime/manual-oauth-flow.ts`) in both the CLI and the plugin host.
+
+| Variable | Purpose |
+| --- | --- |
+| `CODEX_AUTH_ACCOUNT_ID` | Bind an OAuth login to an explicit ChatGPT account/workspace id. This is the override mechanism behind `codex-multi-auth login --org <org_id>`, which lets the same email register its personal and its business/team workspace as separate accounts |
+| `CODEX_AUTH_NO_BROWSER` | Force the manual callback flow instead of launching a browser |
+
+### Plugin-host request pipeline
+
+Consumed by the optional plugin-host runtime (`index.ts`) rather than the CLI.
+
+| Variable | Purpose |
+| --- | --- |
+| `CODEX_AUTH_FAILOVER_MODE` | `conservative`, `balanced` (default; also the fallback for any unrecognised value), or `aggressive`. Selects the per-mode defaults below. Same-account retries: conservative `2`, balanced `1`, aggressive `0`. Soft stall timeout: `20000` / `15000` / `10000` ms |
+| `CODEX_AUTH_STREAM_FAILOVER_MAX` | Maximum stream failover attempts; overrides the per-mode default (`2` / `2` / `1`). Always clamped to `0..1` by `capStreamFailoverMax`, so the effective value is at most one failover regardless of mode or override |
+| `CODEX_AUTH_STREAM_STALL_SOFT_TIMEOUT_MS` | Soft stream-stall threshold before failover is considered; overrides the per-mode default, floor `1000` ms |
+| `CODEX_AUTH_STREAM_STALL_HARD_TIMEOUT_MS` | Hard stream-stall threshold that aborts the stream; never lower than the soft threshold, and defaults to `streamStallTimeoutMs` |
+| `CODEX_AUTH_PREWARM` | Set `0` to disable connection prewarming |
+| `CODEX_COLLABORATION_MODE` | Collaboration-mode hint applied by the request transformer |
+| `CODEX_THREAD_ID` | Thread id used as the session-affinity key. Takes precedence over the host-supplied prompt cache key |
+| `CODEX_SKIP_EMAIL_HYDRATE` | Set `1` to skip best-effort account email hydration |
+| `CODEX_MULTI_AUTH_EXPOSE_ADMIN_TOOLS` | Set `1` to expose admin tools on the plugin-host tool surface |
+
+### Benchmark and matrix scripts
+
+Used only by `scripts/` tooling, not by the shipped runtime.
+
+| Variable | Purpose |
+| --- | --- |
+| `CODEX_MATRIX_TIMEOUT_MS` | Per-probe timeout for `npm run test:model-matrix` |
+| `CODEX_MODELS_TIMEOUT_MS` | Timeout for model listing in the edit-format benchmark harness |
+
 * * *
 
 ## Runtime Rotation Architecture Fields

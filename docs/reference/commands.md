@@ -1,6 +1,6 @@
 # Command Reference
 
-Complete command, flag, and hotkey reference for `codex-multi-auth` (package `2.6.1`).
+Complete command, flag, and hotkey reference for `codex-multi-auth` (package `2.8.0`).
 
 ---
 
@@ -134,7 +134,7 @@ Turning `showQuotaDetails` off reduces the line to a bare `live session OK`.
 | `codex-multi-auth monitor` | Aggregate runtime, usage, policy, quota, model, and project state |
 | `codex-multi-auth why-selected [--now|--last]` | Explain which account the selector picks now or via the last persisted runtime snapshot |
 | `codex-multi-auth history [list\|show <id>]` | List every local Codex session across all providers, bypassing the `model_provider` filtering that hides threads in `codex resume` while runtime rotation / app bind is active |
-| `codex-multi-auth rotation enable\|disable\|status\|bind-app\|unbind-app` | Manage the default-on runtime Responses proxy for live Codex account rotation |
+| `codex-multi-auth rotation enable\|disable\|status\|bind-app\|unbind-app\|reset-runtime` | Manage the default-on runtime Responses proxy for live Codex account rotation. `reset-runtime` clears volatile in-process rotation state and, when app-bind helpers are available, unbinds and rebinds the packaged Codex app so the router picks the reset state up |
 | `codex-multi-auth rotation reset-rate-limits [--all \| --account <idx>]` | Clear local rate-limit cooldowns for all accounts or one account |
 
 ---

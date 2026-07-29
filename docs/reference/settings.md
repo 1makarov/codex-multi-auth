@@ -2,7 +2,7 @@
 
 Reference for dashboard display settings and runtime `pluginConfig` values available from `codex-multi-auth login` -> `Settings`.
 
-`pluginConfig` is the persisted compatibility name for runtime settings. It covers wrapper/runtime rotation behavior and optional plugin-host behavior. Defaults below match `DEFAULT_PLUGIN_CONFIG` in `lib/config.ts` (package `2.6.1`).
+`pluginConfig` is the persisted compatibility name for runtime settings. It covers wrapper/runtime rotation behavior and optional plugin-host behavior. Defaults below match `DEFAULT_PLUGIN_CONFIG` in `lib/config.ts` (package `2.8.0`).
 
 ---
 
@@ -203,6 +203,7 @@ These fields live in `pluginConfig` and are commonly overridden via environment 
 | `unsupportedCodexPolicy` | `strict` | How unsupported Codex model requests are handled |
 | `fallbackOnUnsupportedCodexModel` | `false` | Whether to fall back when a Codex model is unsupported |
 | `fallbackToGpt52OnUnsupportedGpt53` | `true` | Compatibility fallback for unsupported gpt-5.3-class requests |
+| `unsupportedCodexFallbackChain` | `{}` | Per-model ordered fallback chain consulted before the generic unsupported-model policy. Empty by default; keys are model ids, values are ordered candidate lists |
 | `rateLimitToastDebounceMs` | `60000` | Debounce window for rate-limit toast spam |
 | `toastDurationMs` | `5000` | Dashboard toast display duration |
 

@@ -16,6 +16,9 @@ Ownership map for source paths and documentation paths.
 | `config/` | Plugin-host config examples |
 | `vendor/` | Vendored codex-ai-plugin + codex-ai-sdk dist shims |
 | `assets/` | Static project assets |
+| `bench/` | Edit-format benchmark fixtures and prompts |
+| `skills/` | Packaged agent skill definitions |
+| `.codex-plugin/` | Plugin manifest consumed by the Codex plugin scanner |
 | `dist/` | Generated build output (do not edit directly) |
 
 * * *
@@ -26,8 +29,10 @@ Ownership map for source paths and documentation paths.
 | --- | --- |
 | CLI wrapper and forwarding | `scripts/codex.js`, `scripts/codex-routing.js`, `scripts/codex-bin-resolver.js` |
 | Convenience launcher | `scripts/mcodex.js` |
-| CLI auth manager | `lib/codex-manager.ts` |
+| CLI auth manager | `lib/codex-manager.ts` (`CLI_COMMAND_HANDLERS` dispatch) |
 | Manager command modules | `lib/codex-manager/commands/*` |
+| Manager command registry | `lib/codex-manager/account-manager-commands.ts`, `lib/codex-manager/help.ts` |
+| Official Codex CLI state | `lib/codex-cli/` (`state.ts`, `writer.ts`, `sync.ts`, `observability.ts`) |
 | Settings hub | `lib/codex-manager/settings-hub.ts`, `lib/codex-manager/settings-hub/` |
 | OAuth flow/server | `lib/auth/*` (`auth.ts`, `server.ts`, `browser.ts`, `device-auth.ts`) |
 | WSL / Windows host detection | `lib/wsl.ts` |

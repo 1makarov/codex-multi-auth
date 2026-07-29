@@ -47,17 +47,26 @@ scripts/codex.js
   |- handles auth subcommands locally
   |- discovers official Codex binary
   |- injects file-backed auth store unless caller opted out
+  |- reconciles top-level cli_auth_credentials_store on startup
   |- resolves --account / FORCE_ACCOUNT to ephemeral pin
-  |- optionally creates shadow CODEX_HOME for runtime rotation
+  |- picks a runtime-rotation transport (see below)
   v
 Official Codex CLI
 
-Runtime rotation enabled
+Runtime rotation enabled -> one of three transports
   |
-  v
-shadow CODEX_HOME/config.toml
-  |- model_provider = "codex-multi-auth-runtime-proxy"
-  |- provider base_url = localhost proxy
+  |- interactive TUI (no forwarded subcommand)
+  |    canonical CODEX_HOME + ephemeral -c provider overrides
+  |    (no shadow copy, no provider/transport rewrite of config.toml,
+  |     detach on exit; the auth-store reconcile above still applies)
+  |
+  |- codex app
+  |    app runtime helper process + shadow CODEX_HOME
+  |
+  |- every other request-bearing command
+  |    shadow CODEX_HOME/config.toml
+  |      |- model_provider = "codex-multi-auth-runtime-proxy"
+  |      |- provider base_url = localhost proxy
   v
 lib/runtime-rotation-proxy.ts
   |- validates local client token
@@ -103,7 +112,8 @@ Codex or ChatGPT-backed request flow
 | --- | --- | --- |
 | Standalone package CLI | `scripts/codex-multi-auth.js`, `scripts/codex-routing.js` | Primary account-manager entrypoint, bare-subcommand normalization, version surface |
 | Convenience launcher | `scripts/mcodex.js` | Cross-platform `mcodex` bin: forwards to the Codex wrapper; optional live monitor (`watch`) and tmux session helpers |
-| Optional forwarding wrapper | `scripts/codex.js`, `scripts/codex-routing.js`, `scripts/codex-bin-resolver.js` | Local auth routing, official Codex discovery, file-store forwarding, shadow-home setup, ephemeral `--account` pin |
+| Optional forwarding wrapper | `scripts/codex.js`, `scripts/codex-routing.js`, `scripts/codex-bin-resolver.js` | Local auth routing, official Codex discovery, file-store forwarding, canonical-home vs shadow-home transport selection, ephemeral `--account` pin |
+| Official Codex CLI state | `lib/codex-cli/` (`state.ts`, `writer.ts`, `sync.ts`, `observability.ts`) | Reads/writes the official `~/.codex` auth + accounts + `config.toml` surface, active-selection sync, and the `cli_auth_credentials_store = "file"` reconcile |
 | Auth flow | `lib/auth/auth.ts`, `lib/auth/server.ts`, `lib/auth/browser.ts` | PKCE OAuth flow, callback handling, browser/manual/device auth path |
 | Account manager | `lib/codex-manager.ts`, `lib/codex-manager/commands/`, `lib/accounts.ts` | Dashboard actions, account selection, health operations, repair commands |
 | Manager command surface | `lib/codex-manager/commands/*` | Focused modules: `account`, `best`, `bridge`, `budget`, `check`, `config-explain`, `debug-bundle`, `forecast`, `history`, `init-config`, `integrations`, `models`, `monitor`, `report`, `rotation`, `status`, `switch`, `uninstall`, `unpin`, `usage`, `verify`, `why-selected`, `workspace` (plus repair helpers in `repair-commands.ts`) |
@@ -152,14 +162,29 @@ Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained acco
 
 1. The wrapper checks `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY` and `codexRuntimeRotationProxy`.
 2. If disabled, the command forwards to the official Codex CLI unchanged except for normal wrapper compatibility settings.
-3. If enabled and the forwarded command is request-bearing, the wrapper starts `lib/runtime-rotation-proxy.ts` on `127.0.0.1` with a per-process client API key.
-4. The wrapper creates a temporary shadow `CODEX_HOME`, copies relevant official Codex state, and rewrites `config.toml` to select `codex-multi-auth-runtime-proxy`.
+3. If enabled, `createRuntimeRotationProxyContextIfEnabled` (`scripts/codex.js`) picks one of three transports from the forwarded argv:
+
+   | Branch | Predicate | Transport |
+   | --- | --- | --- |
+   | Interactive TUI | `isCodexInteractiveTuiCommand` — no forwarded subcommand at all | App runtime helper with `useCanonicalHome: true` and `detachOnExit: true`. Runs against the **canonical** `CODEX_HOME`; the provider is passed as ephemeral `-c model_providers.*` overrides. No shadow copy and no state sync-back. Nothing **provider- or transport-related** is written into `config.toml` on this path — the only top-level key the wrapper still reconciles there is `cli_auth_credentials_store`, which is transport-independent (see step 4 note). |
+   | `codex app` | `isCodexAppCommand` — forwarded command is `app` | App runtime helper process with a shadow `CODEX_HOME`. |
+   | Everything else | request-bearing forwarded command | Shadow `CODEX_HOME` created inline by the wrapper process. |
+
+4. The wrapper starts `lib/runtime-rotation-proxy.ts` on `127.0.0.1` with a per-process client API key. Shadow-home branches copy relevant official Codex state and rewrite `config.toml` to select `codex-multi-auth-runtime-proxy`; the canonical-home branch instead injects the same provider through `-c` arguments and passes the client key via `OPENAI_API_KEY`.
 5. The official Codex CLI sends Responses/model traffic to the local provider.
 6. The proxy validates the client token, evaluates runtime policy, selects a managed account, refreshes tokens if needed, and forwards to the official backend.
 7. The proxy rotates to another account before streaming response bytes when it sees retryable auth refresh failures, 429s, 5xx responses, or network errors (subject to pin and min-rotation-interval throttling).
 8. Successful responses stream back to the local Codex client with hop-by-hop/private/stale decoded headers removed.
 9. Usage ledger rows and runtime counters are persisted for status/report/usage/budget commands.
-10. On exit, the wrapper syncs refreshed official state files back from the shadow home and cleans up the temporary directory.
+10. On exit, shadow-home branches sync refreshed official state files back and remove the temporary directory. The canonical-home branch has nothing to sync — it read and wrote official state in place.
+
+Why the interactive branch is different: copying the Codex home into a shadow made the official CLI reindex its thread history and SQLite state on every TUI launch. Running interactive sessions against the canonical home keeps that state reusable.
+
+Two interactive sessions can therefore run concurrently against the same home — the same as running the official CLI twice — and **no lock is taken over session state**: neither session copies or syncs it, so there is nothing to clobber. Regression coverage lives in `test/codex-bin-wrapper.test.ts`.
+
+Scope that guarantee to session state only. It does **not** extend to `config.toml`: `ensureCodexCliFileAuthStore` (`lib/codex-cli/writer.ts`) still read-modify-writes the canonical file when the store is not already `"file"`, and the atomic write does not serialize cross-process writers. That is safe in practice rather than by locking — the operation is idempotent, converges on a single value, and lands via atomic rename, so concurrent invocations agree instead of interleaving. Anything added to that write path that is *not* idempotent would need a real lock.
+
+Internal env used by these branches (not operator-facing): `CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME`, `CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON`, `CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID`, `CODEX_MULTI_AUTH_REAL_CODEX_HOME`.
 
 * * *
 
@@ -197,11 +222,17 @@ High-level optional host flow:
 Package install scripts stay side-effect-free. On the first durable CLI invocation after install, `lib/runtime/first-run.ts`:
 
 - Claims a one-time marker at `~/.codex/multi-auth/first-run-setup.json` (exclusive create; concurrent claims race safely).
-- Best-effort self-heals packaged Codex app bind and user-level launcher routing when rotation is enabled and the environment is not CI/`npx`/project-local.
-- Records step outcomes (`completed` / `skipped` / `failed`) without secrets.
+- Runs three best-effort steps, each recording `completed` / `skipped` / `failed` without secrets:
+  1. **App bind** — packaged Codex app bind, when rotation is enabled and the environment is not CI/`npx`/project-local.
+  2. **Launcher** — user-level launcher routing, under the same gate.
+  3. **Auth store** — `ensureCodexCliFileAuthStore()` pins the top-level `cli_auth_credentials_store = "file"` in `~/.codex/config.toml` (`lib/codex-cli/writer.ts`).
 - Failures are debug-logged and never block the requested command.
 
-Explicit repair remains `codex-multi-auth rotation enable` / `bind-app` / launcher install helpers.
+The marker is versioned (`FIRST_RUN_MARKER_VERSION = 2`). Because `ensureFirstRunSetup` short-circuits on marker existence, a marker written before the auth-store step existed (`version: 1`, or any unreadable/truncated marker) is **migrated in place** on the next manager CLI run: only the auth-store step is replayed. App bind and launcher install are deliberately not rerun, so shortcuts the user removed stay removed. The migration takes no exclusive claim — both `ensureCodexCliFileAuthStore` and the atomic marker write are idempotent, so concurrent invocations converge instead of racing.
+
+A **failed** auth-store step deliberately records the pre-v2 version so the next run retries it; otherwise one transient Windows `EPERM`/`EBUSY` on a locked `config.toml` would strand the install on keychain mode permanently. A `skipped` result does advance the version, since that is the normal outcome both for a config already pinned to `"file"` and for an explicit `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0` opt-out.
+
+Explicit repair remains `codex-multi-auth rotation enable` / `bind-app` / launcher install helpers, plus `codex-multi-auth doctor --fix` for the auth-store pin.
 
 * * *
 
@@ -245,6 +276,8 @@ Official Codex-owned files remain under `~/.codex`, including `auth.json`, `acco
 7. **Ephemeral force-account pins** — `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT` never mutate the persisted switch pin and fail hard when the proxy is disabled or the target is unavailable.
 8. **Budget guards are soft under concurrency** — evaluations read a pre-request ledger snapshot; concurrent requests may briefly overshoot. This is intentional (best-effort, not a hard distributed quota).
 9. **First-run marker is not a secret** — it only records that durable-install self-heal ran; opt-out via env remains available.
+10. **The keychain is never touched** — the `cli_auth_credentials_store` reconcile only rewrites a top-level TOML assignment in `~/.codex/config.toml`. No keychain item and no `security` CLI is ever read or written, and credentials saved by an earlier official `codex login` are left in place (unread once the store is pinned to `"file"`). Opt out of the per-invocation `-c` override with `CODEX_MULTI_AUTH_FORCE_FILE_AUTH_STORE=0`, or of every persisted rewrite with `CODEX_MULTI_AUTH_ENFORCE_CLI_FILE_AUTH_STORE=0`.
+11. **Canonical-home overrides carry no secret on disk** — the interactive path passes provider config as `-c` arguments and the per-process client key through `OPENAI_API_KEY` in the child environment, so no credential is persisted into the user's `config.toml`.
 
 * * *
 
@@ -273,6 +306,9 @@ Official Codex-owned files remain under `~/.codex`, including `auth.json`, `acco
 11. Windows filesystem operations use retry helpers for transient `EBUSY`/`EPERM`/`ENOTEMPTY` behavior where lock-prone paths are touched.
 12. Account selection order remains pin → sequential|affinity → hybrid → scan unless a release intentionally changes that contract.
 13. `mcodex` is a convenience launcher only; it must not reimplement account-manager or Codex command logic.
+14. Interactive TUI sessions run against the canonical `CODEX_HOME`. They must not be moved back onto a shadow copy: doing so reintroduces per-launch thread-history reindexing, and the no-lock concurrency guarantee depends on neither session copying or syncing state.
+15. The rotation provider is never written into the real `~/.codex/config.toml` on the interactive path. The only top-level key this project reconciles there is `cli_auth_credentials_store`.
+16. The keychain is never read or written. Reading a keychain item would raise the prompt the auth-store pin exists to eliminate; a `[profiles.*]` credential-store value is left as authored.
 
 * * *
 

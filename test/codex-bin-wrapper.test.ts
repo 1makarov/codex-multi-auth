@@ -308,6 +308,7 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 	writeFileSync(
 		modulePath,
 		[
+			'import { spawn } from "node:child_process";',
 			'import { appendFileSync, mkdirSync } from "node:fs";',
 			'import { dirname } from "node:path";',
 			"",
@@ -356,12 +357,43 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			"    appendMarker(`codex-home-env:${process.env.CODEX_HOME ?? ''}`);",
 			"    appendMarker(`real-home-env:${process.env.CODEX_MULTI_AUTH_REAL_CODEX_HOME ?? ''}`);",
 			"  }",
+			// Opt-in (#647): the real proxy owns a listening socket, so the helper stays
+			// alive until it is closed. This fake has no such handle and would otherwise
+			// let the helper exit on its own the moment its status timer is cleared —
+			// which would silently defeat a test about helpers that refuse to stop. Hold
+			// a ref'd handle so the helper's lifetime is governed by the signal path.
+			"  const closeHangs = (process.env.CODEX_MULTI_AUTH_TEST_PROXY_CLOSE_HANG ?? '').trim() === '1';",
+			"  if (closeHangs) {",
+			"    setInterval(() => {}, 1000);",
+			"  }",
+			// Opt-in (#647): leak a detached grandchild that inherits this helper's stdio.
+			// It keeps the write end of the launcher's pipes open after the helper is
+			// gone, so the launcher never sees `close` and must release the handles
+			// itself. This reproduces the stranded-wrapper failure on every platform,
+			// including Windows, where `kill()` is always a hard terminate.
+			"  const pipeHolderMs = readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_PIPE_HOLDER_MS');",
+			"  if (pipeHolderMs !== null) {",
+			"    const holder = spawn(process.execPath, ['-e', `setTimeout(() => {}, ${pipeHolderMs})`], {",
+			"      stdio: ['ignore', 'inherit', 'inherit'],",
+			"      detached: true,",
+			"    });",
+			"    holder.unref();",
+			"  }",
 			"  appendMarker((process.env.CODEX_MULTI_AUTH_TEST_PROXY_MARKER_PID ?? '').trim() === '1' ? `start:${baseUrl}:pid=${process.pid}` : `start:${baseUrl}`);",
 			"  return {",
 			"    host: '127.0.0.1',",
 			"    port: 4567,",
 			"    baseUrl,",
-			"    close: async () => appendMarker('close'),",
+			// Opt-in (#647): stall `close()` forever so the helper's SIGTERM handler
+			// never reaches `process.exit`. Paired with the ref'd handle installed
+			// above, this reproduces a helper that survives the graceful window and can
+			// only be stopped by force.
+			"    close: async () => {",
+			"      appendMarker('close');",
+			"      if (closeHangs) {",
+			"        await new Promise(() => {});",
+			"      }",
+			"    },",
 			"    getStatus: () => buildStatus(),",
 			"  };",
 			"}",
@@ -2894,6 +2926,223 @@ describe("codex bin wrapper", () => {
 			"start:http://127.0.0.1:4567\nclose\n",
 		);
 	});
+
+	// `resume`/`fork` are interactive TUI entry points, but they carry a forwarded
+	// subcommand, so they used to fall through to the shadow-home transport. The
+	// shadow mirror omits the runtime SQLite state, so the requested thread was
+	// missing from the shadow session index and the resumed TUI hung on a blank
+	// screen (#647). Both must now reach the canonical home like the bare TUI.
+	for (const command of ["resume", "fork"] as const) {
+		it(`uses the canonical Codex home for \`${command}\` runtime routing (#647)`, async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				'const fs = require("node:fs");',
+				'const path = require("node:path");',
+				"const args = process.argv.slice(2);",
+				'if (args[0] === "app-server") {',
+				'  console.log(`APP_SERVER_FORWARDED:${args.join(" ")}`);',
+				"  process.exit(0);",
+				"}",
+				"console.log(`RESUME_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				// The thread index only exists in the canonical home; the shadow mirror
+				// omits it, which is precisely what made resume hang.
+				'const statePath = path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite");',
+				"console.log(`RESUME_SEES_THREAD_INDEX:${fs.existsSync(statePath)}`);",
+				'console.log(`RESUME_COMMAND:${args[0]}`);',
+				'console.log(`RESUME_SESSION_ID:${args[1]}`);',
+				'console.log(`RESUME_HAS_BASE_URL_OVERRIDE:${args.some((arg) => arg.includes("model_providers.codex-multi-auth-runtime-proxy.base_url="))}`);',
+				"console.log(`RESUME_CLI_PATH_IS_SHIM:${(process.env.CODEX_CLI_PATH ?? \"\").includes(\"app-server-shims\")}`);",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			const sessionId = "019ddf47-2c01-7c73-9f81-ab0cd9c1d5b7";
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+			writeFileSync(
+				join(originalHome, "state_5.sqlite"),
+				"canonical-thread-index\n",
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, [command, sessionId], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				ORIGINAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				OPENAI_API_KEY: undefined,
+			});
+
+			const output = combinedOutput(result);
+			if (result.status !== 0) {
+				throw new Error(output);
+			}
+			expect(output).toContain("RESUME_HOME_IS_ORIGINAL:true");
+			expect(output).toContain("RESUME_SEES_THREAD_INDEX:true");
+			expect(output).toContain(`RESUME_COMMAND:${command}`);
+			expect(output).toContain(`RESUME_SESSION_ID:${sessionId}`);
+			// Rotation is still active: the proxy overrides ride along as `-c` args.
+			expect(output).toContain("RESUME_HAS_BASE_URL_OVERRIDE:true");
+			expect(output).toContain("RESUME_CLI_PATH_IS_SHIM:true");
+			// The canonical home is never rewritten on disk.
+			expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toBe(
+				'model_provider = "openai"\n',
+			);
+			await waitForFileText(markerPath, "start:http://127.0.0.1:4567\nclose\n");
+		});
+	}
+
+	// Guards the other half of the split: non-interactive request commands must keep
+	// using the isolated shadow home, so widening the interactive classification
+	// cannot silently move `exec`/`review` onto the canonical home.
+	for (const command of ["exec", "review"] as const) {
+		it(`keeps \`${command}\` on the shadow Codex home (#647)`, () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, [command, "do something"], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				ORIGINAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				OPENAI_API_KEY: undefined,
+			});
+
+			const output = combinedOutput(result);
+			if (result.status !== 0) {
+				throw new Error(output);
+			}
+			expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+		});
+	}
+
+	// The launcher only waits two seconds for the detached helper to stop, and it
+	// reads the helper over piped stdio. When those pipes stay open past the window
+	// the wrapper's event loop never drains and the shell prompt never comes back.
+	// Here a leaked grandchild holds the write end, so `close` never fires and the
+	// launcher must destroy and unref the handles itself (#647).
+	it("returns to the shell when the app helper's stdio outlives its shutdown window (#647)", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"const args = process.argv.slice(2);",
+			'if (args[0] === "app-server") {',
+			"  process.exit(0);",
+			"}",
+			// A nonzero Codex exit forces the launcher down the stop-the-helper path
+			// rather than the detach-on-clean-exit path.
+			"process.exit(3);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const pipeHolderMs = 25_000;
+		const startedAt = Date.now();
+		const result = runWrapper(fixtureRoot, [], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			CODEX_MULTI_AUTH_TEST_PROXY_PIPE_HOLDER_MS: String(pipeHolderMs),
+			OPENAI_API_KEY: undefined,
+		});
+		const elapsedMs = Date.now() - startedAt;
+
+		// The wrapper came back at all, and it did so on the 2s graceful window rather
+		// than waiting out the process still holding its pipes.
+		expect(result.status).toBe(3);
+		expect(elapsedMs).toBeLessThan(pipeHolderMs / 2);
+	});
+
+	// POSIX only: the launcher must escalate to SIGKILL when the helper ignores the
+	// graceful SIGTERM. On Windows `kill()` is always an unconditional terminate, so
+	// a helper cannot ignore it and this escalation cannot be exercised there.
+	it.skipIf(process.platform === "win32")(
+		"force-stops an app helper that ignores SIGTERM (#647)",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				"const args = process.argv.slice(2);",
+				'if (args[0] === "app-server") {',
+				"  process.exit(0);",
+				"}",
+				// A nonzero Codex exit forces the launcher down the stop-the-helper path
+				// rather than the detach-on-clean-exit path.
+				"process.exit(3);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const startedAt = Date.now();
+			const result = runWrapper(fixtureRoot, [], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER_PID: "1",
+				// The helper's SIGTERM handler awaits `close()`, which never resolves
+				// here, so only the force-kill fallback can stop it.
+				CODEX_MULTI_AUTH_TEST_PROXY_CLOSE_HANG: "1",
+				OPENAI_API_KEY: undefined,
+			});
+			const elapsedMs = Date.now() - startedAt;
+
+			// The wrapper returned at all: before the fix this call never came back.
+			expect(result.status).toBe(3);
+			expect(elapsedMs).toBeLessThan(30_000);
+
+			const pidMatch = readFileSync(markerPath, "utf8").match(
+				/^start:[^\n]*:pid=(\d+)$/m,
+			);
+			expect(pidMatch?.[1]).toBeTruthy();
+			const helperPid = Number(pidMatch?.[1]);
+
+			// SIGKILL is asynchronous; give the OS a moment to reap the helper.
+			for (let attempt = 0; attempt < 40 && isProcessAlive(helperPid); attempt += 1) {
+				await sleep(100);
+			}
+			expect(isProcessAlive(helperPid)).toBe(false);
+		},
+	);
 
 	// Canonical-home routing drops the per-session shadow copy, so two concurrent
 	// interactive sessions now share the real Codex home. That is how the stock

@@ -167,6 +167,7 @@ Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained acco
    | Branch | Predicate | Transport |
    | --- | --- | --- |
    | Interactive TUI | `isCodexInteractiveTuiCommand` — no forwarded subcommand at all | App runtime helper with `useCanonicalHome: true` and `detachOnExit: true`. Runs against the **canonical** `CODEX_HOME`; the provider is passed as ephemeral `-c model_providers.*` overrides. No shadow copy and no state sync-back. Nothing **provider- or transport-related** is written into `config.toml` on this path — the only top-level key the wrapper still reconciles there is `cli_auth_credentials_store`, which is transport-independent (see step 4 note). |
+   | Interactive `resume` / `fork` | `isCodexInteractiveResumeCommand` — forwarded command is `resume` or `fork` | Same transport and options as the interactive TUI above. These open a TUI against an existing thread, so they must see the canonical thread index. |
    | `codex app` | `isCodexAppCommand` — forwarded command is `app` | App runtime helper process with a shadow `CODEX_HOME`. |
    | Everything else | request-bearing forwarded command | Shadow `CODEX_HOME` created inline by the wrapper process. |
 
@@ -179,6 +180,10 @@ Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained acco
 10. On exit, shadow-home branches sync refreshed official state files back and remove the temporary directory. The canonical-home branch has nothing to sync — it read and wrote official state in place.
 
 Why the interactive branch is different: copying the Codex home into a shadow made the official CLI reindex its thread history and SQLite state on every TUI launch. Running interactive sessions against the canonical home keeps that state reusable.
+
+`resume` and `fork` belong to that same branch for a stronger reason. The shadow mirror deliberately omits the runtime SQLite state (`isRuntimeRotationShadowHomeOmittedEntry`), so a shadow home only ever holds a partial thread index rebuilt from the linked `sessions` directory. Resuming a thread that the shadow index does not contain left the TUI on a blank screen forever, while the same command worked under the official CLI and with the proxy disabled. Routing both commands to the canonical home is what makes the thread visible (#647).
+
+Helper shutdown is bounded rather than best-effort. `stopRuntimeRotationAppHelper` sends `SIGTERM`, waits out the graceful window, escalates to `SIGKILL` if the helper is still running, and then unconditionally destroys the helper's stdio streams and unrefs the child. That last step is the load-bearing one: the helper is spawned with piped stdio, so a helper that outlives the window — or any process that inherited those pipes — keeps the wrapper's event loop referenced and the shell prompt never returns. On Windows the signals are emulated as unconditional termination, so the stream teardown is the only part that reliably frees the wrapper there.
 
 Two interactive sessions can therefore run concurrently against the same home — the same as running the official CLI twice — and **no lock is taken over session state**: neither session copies or syncs it, so there is nothing to clobber. Regression coverage lives in `test/codex-bin-wrapper.test.ts`.
 

@@ -7,6 +7,22 @@ This repository's current stable release line is `2.x`.
 Current stable release notes live in `docs/releases/`.
 This top-level changelog preserves the foundational `0.x` milestones and points older iteration history to `docs/releases/legacy-pre-0.1-history.md`.
 
+## [2.8.1] - 2026-08-02
+
+A corrective release with no new features and no configuration changes. `mcodex resume` hung on a blank screen whenever runtime rotation was enabled, the wrapper could fail to return to the shell after an interrupted exit, and four high-severity dependency advisories are cleared.
+Closes [#647](https://github.com/ndycode/codex-multi-auth/issues/647). Landed as [#648](https://github.com/ndycode/codex-multi-auth/pull/648), [#649](https://github.com/ndycode/codex-multi-auth/pull/649), and [#650](https://github.com/ndycode/codex-multi-auth/pull/650). See [docs/releases/v2.8.1.md](docs/releases/v2.8.1.md) for full details.
+
+### Fixed
+
+- **`mcodex resume` and `mcodex fork` hung on a blank TUI with runtime rotation enabled.** Both are interactive TUI entry points, but they carry a forwarded subcommand, so the interactive classification added in 2.8.0 — which matched only an invocation with no subcommand — missed them and left them on the ephemeral shadow home. The shadow mirror deliberately omits the runtime SQLite state, so its session index only ever held a partial thread list rebuilt from the linked `sessions` directory and frequently did not contain the requested thread. Both commands now use the same canonical-home transport as the bare interactive TUI, so they see the real thread index, and account rotation stays enabled ([#647](https://github.com/ndycode/codex-multi-auth/issues/647), [#648](https://github.com/ndycode/codex-multi-auth/pull/648))
+- **The shell prompt did not always return after an interrupted or non-zero Codex exit.** The detached rotation helper runs with piped stdio; shutdown sent `SIGTERM`, stopped waiting after two seconds, and left the helper and its pipes referenced, which kept the wrapper's event loop alive indefinitely. Shutdown now escalates to `SIGKILL` past the graceful window and unconditionally destroys and unrefs the helper's streams — the part that actually frees the wrapper on Windows, where the signals are emulated as an unconditional terminate ([#648](https://github.com/ndycode/codex-multi-auth/pull/648))
+- **`--help` started a rotation proxy for every request command.** `exec`, `review`, `resume`, `fork`, and `app` now forward their help form straight to the official CLI with no proxy, no shadow home, and no helper, matching how `app-server --help` already behaved. This mattered most for `resume`/`fork`: once interactive, their helper detached on the clean exit help always produces and idled on after the wrapper had exited ([#648](https://github.com/ndycode/codex-multi-auth/pull/648))
+- **`npm run audit:ci` was failing, so the CI security gate could not pass.** `hono` 4.12.21 → 4.12.33 and `undici` 6.25.0 → 6.28.0 clear four high-severity advisories reaching the published runtime; `brace-expansion` and `postcss` are pinned through `overrides` for the dev graph. `undici` stays on `6.x` because `7.x` would raise the runtime floor to Node 20 ([#650](https://github.com/ndycode/codex-multi-auth/pull/650))
+
+### Changed
+
+- Regression coverage for both shutdown paths now bounds its own subprocess and carries a per-test timeout longer than that bound. `vitest.config.ts` sets no `testTimeout`, so these tests ran under the 5s default — shorter than the 12s bound they set for themselves, which made them flake as a non-root user on Linux and prevented the bound from ever reporting its diagnostic ([#649](https://github.com/ndycode/codex-multi-auth/pull/649))
+
 ## [2.8.0] - 2026-07-28
 
 Two fixes that change where the official Codex CLI keeps its state, plus a diagnostic that can now repair the first one instead of only reporting it. A minor rather than a patch release because behaviour changes: the wrapper now writes `cli_auth_credentials_store` into `~/.codex/config.toml` at first run and on wrapper startup, where before it only did so during an account switch, login, health check, or repair. Both opt-outs are documented.

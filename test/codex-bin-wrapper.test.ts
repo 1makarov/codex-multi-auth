@@ -645,6 +645,7 @@ function runWrapper(
 	fixtureRoot: string,
 	args: string[],
 	extraEnv: NodeJS.ProcessEnv = {},
+	options: { timeoutMs?: number } = {},
 ): SpawnSyncReturns<string> {
 	return spawnSync(
 		process.execPath,
@@ -652,8 +653,30 @@ function runWrapper(
 		{
 			encoding: "utf8",
 			env: buildWrapperEnv(extraEnv),
+			// Opt-in hard bound for the tests that deliberately stress the wrapper's
+			// shutdown path. `spawnSync` blocks the worker thread, so Vitest's
+			// `testTimeout` cannot interrupt it: without this, a shutdown regression
+			// hangs the whole run instead of failing an assertion. On timeout
+			// `result.error` is set, which those tests assert on.
+			...(options.timeoutMs === undefined
+				? {}
+				: { timeout: options.timeoutMs, killSignal: "SIGKILL" as const }),
 		},
 	);
+}
+
+// Generous next to the wrapper's 2s graceful-shutdown window, but far below the
+// time a stuck wrapper would otherwise block for.
+const WRAPPER_SHUTDOWN_TIMEOUT_MS = 12_000;
+
+function expectWrapperReturned(
+	result: SpawnSyncReturns<string>,
+	what: string,
+): void {
+	expect(
+		result.error,
+		`wrapper never returned within ${WRAPPER_SHUTDOWN_TIMEOUT_MS}ms: ${what}`,
+	).toBeUndefined();
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -3152,23 +3175,31 @@ describe("codex bin wrapper", () => {
 			"utf8",
 		);
 
+		// Comfortably longer than the bounded shutdown, and longer than the spawn
+		// timeout, so a regression trips the timeout rather than racing it.
 		const pipeHolderMs = 25_000;
 		const startedAt = Date.now();
-		const result = runWrapper(fixtureRoot, [], {
-			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
-			CODEX_HOME: originalHome,
-			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
-			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
-			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
-			CODEX_MULTI_AUTH_TEST_PROXY_PIPE_HOLDER_MS: String(pipeHolderMs),
-			OPENAI_API_KEY: undefined,
-		});
+		const result = runWrapper(
+			fixtureRoot,
+			[],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				CODEX_MULTI_AUTH_TEST_PROXY_PIPE_HOLDER_MS: String(pipeHolderMs),
+				OPENAI_API_KEY: undefined,
+			},
+			{ timeoutMs: WRAPPER_SHUTDOWN_TIMEOUT_MS },
+		);
 		const elapsedMs = Date.now() - startedAt;
 
 		// The wrapper came back at all, and it did so on the 2s graceful window rather
 		// than waiting out the process still holding its pipes.
+		expectWrapperReturned(result, "a leaked grandchild still holds its stdio");
 		expect(result.status).toBe(3);
-		expect(elapsedMs).toBeLessThan(pipeHolderMs / 2);
+		expect(elapsedMs).toBeLessThan(WRAPPER_SHUTDOWN_TIMEOUT_MS);
 	});
 
 	// POSIX only: the launcher must escalate to SIGKILL when the helper ignores the
@@ -3199,23 +3230,29 @@ describe("codex bin wrapper", () => {
 			);
 
 			const startedAt = Date.now();
-			const result = runWrapper(fixtureRoot, [], {
-				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
-				CODEX_HOME: originalHome,
-				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
-				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
-				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
-				CODEX_MULTI_AUTH_TEST_PROXY_MARKER_PID: "1",
-				// The helper's SIGTERM handler awaits `close()`, which never resolves
-				// here, so only the force-kill fallback can stop it.
-				CODEX_MULTI_AUTH_TEST_PROXY_CLOSE_HANG: "1",
-				OPENAI_API_KEY: undefined,
-			});
+			const result = runWrapper(
+				fixtureRoot,
+				[],
+				{
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+					CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+					CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+					CODEX_MULTI_AUTH_TEST_PROXY_MARKER_PID: "1",
+					// The helper's SIGTERM handler awaits `close()`, which never resolves
+					// here, so only the force-kill fallback can stop it.
+					CODEX_MULTI_AUTH_TEST_PROXY_CLOSE_HANG: "1",
+					OPENAI_API_KEY: undefined,
+				},
+				{ timeoutMs: WRAPPER_SHUTDOWN_TIMEOUT_MS },
+			);
 			const elapsedMs = Date.now() - startedAt;
 
 			// The wrapper returned at all: before the fix this call never came back.
+			expectWrapperReturned(result, "the helper ignored SIGTERM");
 			expect(result.status).toBe(3);
-			expect(elapsedMs).toBeLessThan(30_000);
+			expect(elapsedMs).toBeLessThan(WRAPPER_SHUTDOWN_TIMEOUT_MS);
 
 			const pidMatch = readFileSync(markerPath, "utf8").match(
 				/^start:[^\n]*:pid=(\d+)$/m,

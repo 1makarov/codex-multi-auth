@@ -3024,10 +3024,12 @@ describe("codex bin wrapper", () => {
 	}
 
 	// Printing help makes no model requests, so it must not pay for the rotation
-	// transport at all. This matters more since resume/fork became interactive: that
-	// branch detaches its helper on a clean exit, so a helper started for `--help`
-	// would outlive the wrapper and idle for its full timeout (#647).
-	for (const command of ["resume", "fork"] as const) {
+	// transport at all. This matters most for resume/fork now that they are
+	// interactive: that branch detaches its helper on a clean exit, so a helper
+	// started for `--help` would outlive the wrapper and idle for its full timeout.
+	// `exec`/`review` never stranded anything, but they did build a whole shadow
+	// home just to print help, so every request command is covered (#647).
+	for (const command of ["resume", "fork", "exec", "review"] as const) {
 		for (const helpFlag of ["--help", "-h"] as const) {
 			it(`forwards \`${command} ${helpFlag}\` without starting the rotation transport (#647)`, () => {
 				const fixtureRoot = createWrapperFixture();

@@ -669,6 +669,14 @@ function runWrapper(
 // time a stuck wrapper would otherwise block for.
 const WRAPPER_SHUTDOWN_TIMEOUT_MS = 12_000;
 
+// Vitest's default per-test timeout is 5s, which is *shorter* than the bound
+// above. Without an explicit per-test timeout, a stuck wrapper would be killed
+// by Vitest at 5s and reported as a bare "Test timed out" — the diagnostic the
+// spawn bound exists to produce would never be printed. The shutdown tests must
+// therefore outlast their own internal bounds: `spawnSync` (12s) plus the
+// process-exit polling below.
+const SHUTDOWN_TEST_TIMEOUT_MS = 30_000;
+
 function expectWrapperReturned(
 	result: SpawnSyncReturns<string>,
 	what: string,
@@ -3202,7 +3210,7 @@ describe("codex bin wrapper", () => {
 		expectWrapperReturned(result, "a leaked grandchild still holds its stdio");
 		expect(result.status).toBe(3);
 		expect(elapsedMs).toBeLessThan(WRAPPER_SHUTDOWN_TIMEOUT_MS);
-	});
+	}, SHUTDOWN_TEST_TIMEOUT_MS);
 
 	// POSIX only: the launcher must escalate to SIGKILL when the helper ignores the
 	// graceful SIGTERM. On Windows `kill()` is always an unconditional terminate, so
@@ -3268,6 +3276,7 @@ describe("codex bin wrapper", () => {
 			}
 			expect(isProcessAlive(helperPid)).toBe(false);
 		},
+		SHUTDOWN_TEST_TIMEOUT_MS,
 	);
 
 	// Canonical-home routing drops the per-session shadow copy, so two concurrent

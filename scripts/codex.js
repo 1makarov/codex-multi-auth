@@ -4439,6 +4439,10 @@ function shouldUseRuntimeRoutingForForwardedArgs(rawArgs) {
 	}
 
 	const requestCommands = new Set(["exec", "review", "resume", "fork", "app"]);
+	// Request commands whose `--help`/`-h` form is routed straight to the official
+	// CLI. Scoped to the commands that spawn a detached helper, since that is the
+	// transport where a wasted launch outlives the wrapper.
+	const HELP_ONLY_REQUEST_COMMANDS = new Set(["app", "resume", "fork"]);
 	const nonRequestCommands = new Set([
 		"help",
 		"completion",
@@ -4464,7 +4468,15 @@ function shouldUseRuntimeRoutingForForwardedArgs(rawArgs) {
 		);
 	}
 
-	if (command.command === "app" && hasHelpFlagAfterCommand(rawArgs, command.index)) {
+	// These are request commands, but printing their help makes no model requests.
+	// Short-circuit the whole transport so help never pays for a proxy, a shadow
+	// home, or a detached helper — the interactive branch detaches its helper on a
+	// clean exit, so `resume --help` would otherwise leave one running until its
+	// idle timeout (#647).
+	if (
+		HELP_ONLY_REQUEST_COMMANDS.has(command.command) &&
+		hasHelpFlagAfterCommand(rawArgs, command.index)
+	) {
 		return false;
 	}
 	if (requestCommands.has(command.command)) {

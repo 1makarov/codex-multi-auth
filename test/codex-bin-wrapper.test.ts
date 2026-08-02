@@ -3000,6 +3000,93 @@ describe("codex bin wrapper", () => {
 		});
 	}
 
+	// Printing help makes no model requests, so it must not pay for the rotation
+	// transport at all. This matters more since resume/fork became interactive: that
+	// branch detaches its helper on a clean exit, so a helper started for `--help`
+	// would outlive the wrapper and idle for its full timeout (#647).
+	for (const command of ["resume", "fork"] as const) {
+		for (const helpFlag of ["--help", "-h"] as const) {
+			it(`forwards \`${command} ${helpFlag}\` without starting the rotation transport (#647)`, () => {
+				const fixtureRoot = createWrapperFixture();
+				createRuntimeRotationProxyFixtureModule(fixtureRoot);
+				const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+					"#!/usr/bin/env node",
+					'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+					"console.log(`HELP_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+					"process.exit(0);",
+				]);
+				const originalHome = join(fixtureRoot, "codex-home");
+				const markerPath = join(fixtureRoot, "proxy-marker.txt");
+				mkdirSync(originalHome, { recursive: true });
+				writeFileSync(
+					join(originalHome, "config.toml"),
+					'model_provider = "openai"\n',
+					"utf8",
+				);
+
+				const result = runWrapper(fixtureRoot, [command, helpFlag], {
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+					CODEX_HOME: originalHome,
+					ORIGINAL_CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+					CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+					OPENAI_API_KEY: undefined,
+				});
+
+				const output = combinedOutput(result);
+				if (result.status !== 0) {
+					throw new Error(output);
+				}
+				// No proxy was ever started, on either transport: the marker is the
+				// fixture proxy's only side effect and it is written at startup.
+				expect(existsSync(markerPath)).toBe(false);
+				expect(output).toContain("HELP_HOME_IS_ORIGINAL:true");
+				// Help reaches Codex verbatim, with no injected provider overrides.
+				expect(output).toContain(`FORWARDED:${command} ${helpFlag}`);
+				expect(output).not.toContain("model_provider=");
+			});
+		}
+	}
+
+	// The help short-circuit keys off a help flag, not the command, so a real
+	// resume must still take the rotation transport.
+	it("still routes `resume` with a session id through rotation (#647)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"const args = process.argv.slice(2);",
+			'if (args[0] === "app-server") process.exit(0);',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(
+			fixtureRoot,
+			["resume", "019ddf47-2c01-7c73-9f81-ab0cd9c1d5b7"],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				OPENAI_API_KEY: undefined,
+			},
+		);
+
+		if (result.status !== 0) {
+			throw new Error(combinedOutput(result));
+		}
+		expect(existsSync(markerPath)).toBe(true);
+	});
+
 	// Guards the other half of the split: non-interactive request commands must keep
 	// using the isolated shadow home, so widening the interactive classification
 	// cannot silently move `exec`/`review` onto the canonical home.

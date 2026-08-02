@@ -4003,6 +4003,9 @@ function waitForRuntimeRotationAppHelperExit(helper, timeoutMs = 2_000) {
 			if (settled) return;
 			settled = true;
 			if (timer) clearTimeout(timer);
+			// Drop the listener when the timeout wins, so a helper that outlives the
+			// graceful window does not keep a live reference back into this process.
+			helper.off?.("close", finish);
 			resolve();
 		};
 		timer = setTimeout(finish, timeoutMs);
@@ -4010,16 +4013,49 @@ function waitForRuntimeRotationAppHelperExit(helper, timeoutMs = 2_000) {
 	});
 }
 
-function stopRuntimeRotationAppHelper(helper) {
-	if (!helper || helper.killed) {
-		return Promise.resolve();
-	}
+function hasRuntimeRotationAppHelperExited(helper) {
+	return helper.exitCode !== null || helper.signalCode !== null;
+}
+
+// Releases every handle the helper still holds in this process. The helper is
+// spawned with piped stdio, so those pipes keep the parent event loop alive on
+// their own — destroying and unref-ing them is what actually lets `mcodex` return
+// to the shell when the child ignores or outlives SIGTERM (#647).
+function releaseRuntimeRotationAppHelperResources(helper) {
+	helper.stdout?.destroy();
+	helper.stderr?.destroy();
 	try {
-		helper.kill("SIGTERM");
+		helper.unref();
 	} catch {
-		return Promise.resolve();
+		// Best-effort only.
 	}
-	return waitForRuntimeRotationAppHelperExit(helper);
+}
+
+async function stopRuntimeRotationAppHelper(helper) {
+	if (!helper) {
+		return;
+	}
+	if (hasRuntimeRotationAppHelperExited(helper)) {
+		releaseRuntimeRotationAppHelperResources(helper);
+		return;
+	}
+	if (!helper.killed) {
+		try {
+			helper.kill("SIGTERM");
+		} catch {
+			releaseRuntimeRotationAppHelperResources(helper);
+			return;
+		}
+	}
+	await waitForRuntimeRotationAppHelperExit(helper);
+	if (!hasRuntimeRotationAppHelperExited(helper)) {
+		try {
+			helper.kill("SIGKILL");
+		} catch {
+			// Best-effort force-stop once the graceful shutdown window has elapsed.
+		}
+	}
+	releaseRuntimeRotationAppHelperResources(helper);
 }
 
 function startRuntimeRotationAppHelper(baseContext, options = {}) {
@@ -4171,7 +4207,10 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	if (isCodexAppCommand(rawArgs)) {
 		return createRuntimeRotationAppHelperContext(baseContext, configTomlModule);
 	}
-	if (isCodexInteractiveTuiCommand(rawArgs)) {
+	if (
+		isCodexInteractiveTuiCommand(rawArgs) ||
+		isCodexInteractiveResumeCommand(rawArgs)
+	) {
 		return createRuntimeRotationAppHelperContext(baseContext, configTomlModule, {
 			detachOnExit: true,
 			useCanonicalHome: true,
@@ -4375,6 +4414,17 @@ function isCodexInteractiveTuiCommand(rawArgs) {
 	return findForwardedCommand(rawArgs) === null;
 }
 
+// `resume` and `fork` are interactive TUI entry points that happen to carry a
+// forwarded subcommand, so the bare-invocation predicate above misses them. They
+// must not take the shadow-home transport: the shadow mirror deliberately omits the
+// runtime SQLite state (`isRuntimeRotationShadowHomeOmittedEntry`), so the requested
+// thread is absent from the shadow session index and the resumed TUI hangs on a
+// blank screen (#647).
+function isCodexInteractiveResumeCommand(rawArgs) {
+	const command = findForwardedCommand(rawArgs)?.command;
+	return command === "resume" || command === "fork";
+}
+
 function shouldUseRuntimeRoutingForForwardedArgs(rawArgs) {
 	if (!Array.isArray(rawArgs) || rawArgs.length === 0) {
 		return true;
@@ -4414,7 +4464,17 @@ function shouldUseRuntimeRoutingForForwardedArgs(rawArgs) {
 		);
 	}
 
-	if (command.command === "app" && hasHelpFlagAfterCommand(rawArgs, command.index)) {
+	// Request commands still print their help without making a single model
+	// request, so the help form skips the transport entirely: no proxy, no shadow
+	// home, no detached helper. This matters most for the interactive commands,
+	// which detach their helper on a clean exit — help always exits clean, so
+	// `resume --help` would otherwise strand a helper until its idle timeout. It is
+	// keyed off the help flag rather than the command, so a real run still routes
+	// through rotation, and it matches how `app-server` help is handled above (#647).
+	if (
+		requestCommands.has(command.command) &&
+		hasHelpFlagAfterCommand(rawArgs, command.index)
+	) {
 		return false;
 	}
 	if (requestCommands.has(command.command)) {

@@ -74,6 +74,7 @@ For dashboard display values:
 3. If enabled, start a loopback Responses proxy with a per-process client token.
 4. Select a transport from the forwarded argv:
    - **No forwarded subcommand (interactive TUI)** — keep the canonical `CODEX_HOME` and pass `codex-multi-auth-runtime-proxy` as ephemeral `-c model_providers.*` overrides. Nothing is copied, no provider or transport config is written into `config.toml`, and the helper detaches on exit. The transport-independent `cli_auth_credentials_store` reconcile below still applies.
+   - **`resume` / `fork`** — the same canonical-home transport as the interactive TUI. These resume an existing thread, and the shadow home omits the runtime SQLite state, so the shadow transport could not see the requested thread (#647).
    - **`codex app`** — run the app runtime helper against a shadow `CODEX_HOME`.
    - **Any other request-bearing command** — create a temporary shadow `CODEX_HOME` and rewrite its `config.toml` to use `codex-multi-auth-runtime-proxy`.
 5. Forward official Codex with the selected home.

@@ -124,10 +124,21 @@ function formatCompactQuotaPart(
 		return null;
 	}
 	const left = quotaLeftPercentFromUsed(usedPercent);
+	// The reset validity is computed regardless of showReset: it also feeds the
+	// uninformative-window check below, so hiding stays consistent across the
+	// compact (no-reset) and check (with-reset) surfaces.
+	const reset = formatQuotaResetAt(resetAtMs, now);
+	// An unlabeled window ("quota" — upstream reported no duration) that sits at
+	// 100% left with no reset timestamp carries no actionable signal; since the
+	// 2026-07/08 upstream limit changes it renders as a permanent "quota 100%"
+	// on every account. Hide exactly that shape: the segment reappears as soon
+	// as the window reports a duration, any depletion, or a reset time.
+	if (label === "quota" && !reset && (left === undefined || left >= 100)) {
+		return null;
+	}
 	const part = `${label} ${left}%`;
 	if (!options.showReset) return part;
 	// A missing or malformed reset timestamp must never drop the percentage.
-	const reset = formatQuotaResetAt(resetAtMs, now);
 	return reset ? `${part}, resets ${reset}` : part;
 }
 

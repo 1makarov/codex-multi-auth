@@ -250,6 +250,59 @@ describe("compact quota reset timestamps", () => {
 		);
 	});
 
+	it("hides an unlabeled full quota window with no reset data", () => {
+		const unlabeledFull = {
+			status: "ok",
+			planType: "plus",
+			model: "gpt-5.3-codex",
+			primary: { usedPercent: 65, windowMinutes: 10080, resetAtMs: SAME_DAY },
+			secondary: {
+				usedPercent: 0,
+				windowMinutes: undefined,
+				resetAtMs: undefined,
+			},
+		} as unknown as CodexQuotaSnapshot;
+		expect(
+			formatCompactQuotaSnapshot(unlabeledFull, NOW, { showReset: true }),
+		).toBe(`7d 35%, resets ${formatQuotaResetAt(SAME_DAY, NOW)}`);
+		expect(formatCompactQuotaSnapshot(unlabeledFull, NOW)).toBe("7d 35%");
+	});
+
+	it("keeps an unlabeled window once it reports depletion or a reset", () => {
+		const depleted = {
+			status: "ok",
+			planType: "plus",
+			model: "gpt-5.3-codex",
+			primary: { usedPercent: 65, windowMinutes: 10080, resetAtMs: undefined },
+			secondary: {
+				usedPercent: 12,
+				windowMinutes: undefined,
+				resetAtMs: undefined,
+			},
+		} as unknown as CodexQuotaSnapshot;
+		expect(formatCompactQuotaSnapshot(depleted, NOW)).toBe("7d 35% | quota 88%");
+
+		const fullWithReset = {
+			status: "ok",
+			planType: "plus",
+			model: "gpt-5.3-codex",
+			primary: { usedPercent: 65, windowMinutes: 10080, resetAtMs: undefined },
+			secondary: {
+				usedPercent: 0,
+				windowMinutes: undefined,
+				resetAtMs: SAME_DAY,
+			},
+		} as unknown as CodexQuotaSnapshot;
+		expect(formatCompactQuotaSnapshot(fullWithReset, NOW)).toBe(
+			"7d 35% | quota 100%",
+		);
+		expect(
+			formatCompactQuotaSnapshot(fullWithReset, NOW, { showReset: true }),
+		).toBe(
+			`7d 35% | quota 100%, resets ${formatQuotaResetAt(SAME_DAY, NOW)}`,
+		);
+	});
+
 	it("formatQuotaSnapshotForDashboard is the check line and shows resets", () => {
 		const display = {
 			showQuotaDetails: true,

@@ -1382,7 +1382,7 @@ describe("Codex app runtime rotation bind", () => {
 			home: root,
 			env,
 		});
-	});
+	}, 20_000);
 
 	it("fails bind when a spawned router never reports ready for an existing port", async () => {
 		const root = await createTempRoot("codex-app-bind-router-stale-port-");

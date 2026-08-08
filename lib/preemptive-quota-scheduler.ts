@@ -1,3 +1,4 @@
+import { MAX_RATE_LIMIT_DELAY_MS } from "./constants.js";
 import { quotaLeftPercentFromUsed } from "./quota-readiness.js";
 
 export interface QuotaSchedulerWindow {
@@ -28,6 +29,33 @@ export interface QuotaSchedulerOptions {
 
 const DEFAULT_REMAINING_PERCENT_THRESHOLD = 5;
 const DEFAULT_MAX_DEFERRAL_MS = 2 * 60 * 60_000;
+const MAX_TRUSTED_RESET_AGE_MS = MAX_RATE_LIMIT_DELAY_MS;
+
+/**
+ * Return a reset wait only when the timestamp came from a recent, coherent snapshot.
+ * A future timestamp from an old or clock-invalid snapshot must not extend a
+ * preemptive cooldown beyond the configured fallback cap.
+ */
+function trustedResetWaitMs(
+	window: QuotaSchedulerWindow,
+	snapshot: QuotaSchedulerSnapshot,
+	now: number,
+): number {
+	const resetAtMs = window.resetAtMs;
+	const updatedAt = snapshot.updatedAt;
+	if (
+		typeof resetAtMs !== "number" ||
+		!Number.isFinite(resetAtMs) ||
+		resetAtMs <= now ||
+		typeof updatedAt !== "number" ||
+		!Number.isFinite(updatedAt) ||
+		updatedAt > now ||
+		now - updatedAt > MAX_TRUSTED_RESET_AGE_MS
+	) {
+		return 0;
+	}
+	return Math.min(resetAtMs - now, MAX_RATE_LIMIT_DELAY_MS);
+}
 
 /**
  * Clamp a number to the inclusive integer range [min, max] after flooring.
@@ -250,19 +278,6 @@ export class PreemptiveQuotaScheduler {
 		const snapshot = this.snapshots.get(key);
 		if (!snapshot) return { defer: false, waitMs: 0 };
 
-		const primaryWait =
-			typeof snapshot.primary.resetAtMs === "number" &&
-			Number.isFinite(snapshot.primary.resetAtMs) &&
-			snapshot.primary.resetAtMs > now
-				? snapshot.primary.resetAtMs - now
-				: 0;
-		const secondaryWait =
-			typeof snapshot.secondary.resetAtMs === "number" &&
-			Number.isFinite(snapshot.secondary.resetAtMs) &&
-			snapshot.secondary.resetAtMs > now
-				? snapshot.secondary.resetAtMs - now
-				: 0;
-
 		// For a 429 deferral, only count a window whose reset is genuinely a
 		// rate-limit / exhaustion window. A window carrying a healthy usedPercent
 		// (e.g. a weekly secondary at 30% from a prior 200 snapshot) is NOT the
@@ -302,14 +317,15 @@ export class PreemptiveQuotaScheduler {
 			Number.isFinite(snapshot.secondary.usedPercent) &&
 			snapshot.secondary.usedPercent >= 100 - this.secondaryRemainingPercentThreshold;
 		const nearExhaustedWait = Math.max(
-			primaryNearExhausted ? primaryWait : 0,
-			secondaryNearExhausted ? secondaryWait : 0,
+			primaryNearExhausted && snapshot.status !== 429
+				? trustedResetWaitMs(snapshot.primary, snapshot, now) || this.maxDeferralMs
+				: 0,
+			secondaryNearExhausted && snapshot.status !== 429
+				? trustedResetWaitMs(snapshot.secondary, snapshot, now) || this.maxDeferralMs
+				: 0,
 		);
 		if (nearExhaustedWait > 0) {
-			const bounded = Math.min(nearExhaustedWait, this.maxDeferralMs);
-			if (bounded > 0) {
-				return { defer: true, waitMs: bounded, reason: "quota-near-exhaustion" };
-			}
+			return { defer: true, waitMs: nearExhaustedWait, reason: "quota-near-exhaustion" };
 		}
 
 		return { defer: false, waitMs: 0 };

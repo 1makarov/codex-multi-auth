@@ -158,6 +158,10 @@ Upgrade note:
 | `preemptiveQuotaRemainingPercent7d` | `5` |
 | `preemptiveQuotaMaxDeferralMs` | `7200000` |
 
+`preemptiveQuotaMaxDeferralMs` is the fallback delay when a near-exhausted window has
+missing, invalid, or stale reset data. A trusted future reset may schedule through the
+reset time, subject to the scheduler's seven-day safety ceiling.
+
 ### Notifications
 
 | Key | Default |

@@ -276,7 +276,7 @@ export const BACKEND_NUMBER_OPTIONS: BackendNumberSettingOption[] = [
 	{
 		key: "preemptiveQuotaMaxDeferralMs",
 		label: "Max Preemptive Deferral",
-		description: "Maximum time allowed for quota-based delay.",
+		description: "Fallback time for quota delay when reset data is unavailable or stale.",
 		min: 1_000,
 		max: 24 * 60 * 60_000,
 		step: 60_000,

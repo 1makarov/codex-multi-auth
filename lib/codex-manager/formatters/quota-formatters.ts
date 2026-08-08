@@ -67,7 +67,8 @@ export function formatQuotaSnapshotForDashboard(
 	now = Date.now(),
 ): string {
 	if (!settings.showQuotaDetails) return "live session OK";
-	return `live session OK (${formatCompactQuotaSnapshot(snapshot, now, { showReset: true })})`;
+	const summary = formatCompactQuotaSnapshot(snapshot, now, { showReset: true });
+	return summary ? `live session OK (${summary})` : "live session OK";
 }
 
 export function quotaCacheEntryToSnapshot(
@@ -99,6 +100,23 @@ function formatCompactQuotaWindowLabel(
 	if (windowMinutes % 1440 === 0) return `${windowMinutes / 1440}d`;
 	if (windowMinutes % 60 === 0) return `${windowMinutes / 60}h`;
 	return `${windowMinutes}m`;
+}
+
+function isUninformativeFullQuotaWindow(
+	windowMinutes: number | undefined,
+	usedPercent: number | undefined,
+	resetAtMs: number | undefined,
+	now: number,
+): boolean {
+	if (formatCompactQuotaWindowLabel(windowMinutes) !== "quota") return false;
+	if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) {
+		return false;
+	}
+	const left = quotaLeftPercentFromUsed(usedPercent);
+	return (
+		!formatQuotaResetAt(resetAtMs, now) &&
+		(left === undefined || left >= 100)
+	);
 }
 
 /**
@@ -133,7 +151,7 @@ function formatCompactQuotaPart(
 	// 2026-07/08 upstream limit changes it renders as a permanent "quota 100%"
 	// on every account. Hide exactly that shape: the segment reappears as soon
 	// as the window reports a duration, any depletion, or a reset time.
-	if (label === "quota" && !reset && (left === undefined || left >= 100)) {
+	if (!reset && label === "quota" && (left === undefined || left >= 100)) {
 		return null;
 	}
 	const part = `${label} ${left}%`;
@@ -174,6 +192,22 @@ export function formatCompactQuotaSnapshot(
 	if (parts.length > 0) {
 		return parts.join(" | ");
 	}
+	if (
+		isUninformativeFullQuotaWindow(
+			snapshot.primary.windowMinutes,
+			snapshot.primary.usedPercent,
+			snapshot.primary.resetAtMs,
+			now,
+		) ||
+		isUninformativeFullQuotaWindow(
+			snapshot.secondary.windowMinutes,
+			snapshot.secondary.usedPercent,
+			snapshot.secondary.resetAtMs,
+			now,
+		)
+	) {
+		return "";
+	}
 	return formatQuotaSnapshotLine(snapshot);
 }
 
@@ -208,6 +242,22 @@ export function formatAccountQuotaSummary(
 	}
 	if (parts.length > 0) {
 		return parts.join(" | ");
+	}
+	if (
+		isUninformativeFullQuotaWindow(
+			entry.primary.windowMinutes,
+			entry.primary.usedPercent,
+			entry.primary.resetAtMs,
+			now,
+		) ||
+		isUninformativeFullQuotaWindow(
+			entry.secondary.windowMinutes,
+			entry.secondary.usedPercent,
+			entry.secondary.resetAtMs,
+			now,
+		)
+	) {
+		return "";
 	}
 	return formatQuotaSnapshotLine(quotaCacheEntryToSnapshot(entry));
 }

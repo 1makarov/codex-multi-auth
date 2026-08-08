@@ -67,7 +67,8 @@ export function formatQuotaSnapshotForDashboard(
 	now = Date.now(),
 ): string {
 	if (!settings.showQuotaDetails) return "live session OK";
-	return `live session OK (${formatCompactQuotaSnapshot(snapshot, now, { showReset: true })})`;
+	const summary = formatCompactQuotaSnapshot(snapshot, now, { showReset: true });
+	return summary ? `live session OK (${summary})` : "live session OK";
 }
 
 export function quotaCacheEntryToSnapshot(
@@ -101,6 +102,23 @@ function formatCompactQuotaWindowLabel(
 	return `${windowMinutes}m`;
 }
 
+function isUninformativeFullQuotaWindow(
+	windowMinutes: number | undefined,
+	usedPercent: number | undefined,
+	resetAtMs: number | undefined,
+	now: number,
+): boolean {
+	if (formatCompactQuotaWindowLabel(windowMinutes) !== "quota") return false;
+	if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) {
+		return false;
+	}
+	const left = quotaLeftPercentFromUsed(usedPercent);
+	return (
+		!formatQuotaResetAt(resetAtMs, now) &&
+		(left === undefined || left >= 100)
+	);
+}
+
 /**
  * Options shared by the compact quota formatters.
  *
@@ -124,10 +142,21 @@ function formatCompactQuotaPart(
 		return null;
 	}
 	const left = quotaLeftPercentFromUsed(usedPercent);
+	// The reset validity is computed regardless of showReset: it also feeds the
+	// uninformative-window check below, so hiding stays consistent across the
+	// compact (no-reset) and check (with-reset) surfaces.
+	const reset = formatQuotaResetAt(resetAtMs, now);
+	// An unlabeled window ("quota" — upstream reported no duration) that sits at
+	// 100% left with no reset timestamp carries no actionable signal; since the
+	// 2026-07/08 upstream limit changes it renders as a permanent "quota 100%"
+	// on every account. Hide exactly that shape: the segment reappears as soon
+	// as the window reports a duration, any depletion, or a reset time.
+	if (!reset && label === "quota" && (left === undefined || left >= 100)) {
+		return null;
+	}
 	const part = `${label} ${left}%`;
 	if (!options.showReset) return part;
 	// A missing or malformed reset timestamp must never drop the percentage.
-	const reset = formatQuotaResetAt(resetAtMs, now);
 	return reset ? `${part}, resets ${reset}` : part;
 }
 
@@ -163,6 +192,22 @@ export function formatCompactQuotaSnapshot(
 	if (parts.length > 0) {
 		return parts.join(" | ");
 	}
+	if (
+		isUninformativeFullQuotaWindow(
+			snapshot.primary.windowMinutes,
+			snapshot.primary.usedPercent,
+			snapshot.primary.resetAtMs,
+			now,
+		) ||
+		isUninformativeFullQuotaWindow(
+			snapshot.secondary.windowMinutes,
+			snapshot.secondary.usedPercent,
+			snapshot.secondary.resetAtMs,
+			now,
+		)
+	) {
+		return "";
+	}
 	return formatQuotaSnapshotLine(snapshot);
 }
 
@@ -197,6 +242,22 @@ export function formatAccountQuotaSummary(
 	}
 	if (parts.length > 0) {
 		return parts.join(" | ");
+	}
+	if (
+		isUninformativeFullQuotaWindow(
+			entry.primary.windowMinutes,
+			entry.primary.usedPercent,
+			entry.primary.resetAtMs,
+			now,
+		) ||
+		isUninformativeFullQuotaWindow(
+			entry.secondary.windowMinutes,
+			entry.secondary.usedPercent,
+			entry.secondary.resetAtMs,
+			now,
+		)
+	) {
+		return "";
 	}
 	return formatQuotaSnapshotLine(quotaCacheEntryToSnapshot(entry));
 }

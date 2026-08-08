@@ -250,6 +250,69 @@ describe("compact quota reset timestamps", () => {
 		);
 	});
 
+	it("hides an unlabeled full quota window with no reset data", () => {
+		const unlabeledFull = {
+			status: 200,
+			planType: "plus",
+			model: "gpt-5.3-codex",
+			primary: { usedPercent: 65, windowMinutes: 10080, resetAtMs: SAME_DAY },
+			secondary: { usedPercent: 0 },
+		} satisfies CodexQuotaSnapshot;
+		expect(
+			formatCompactQuotaSnapshot(unlabeledFull, NOW, { showReset: true }),
+		).toBe(`7d 35%, resets ${formatQuotaResetAt(SAME_DAY, NOW)}`);
+		expect(formatCompactQuotaSnapshot(unlabeledFull, NOW)).toBe("7d 35%");
+	});
+
+	it("keeps an unlabeled window once it reports depletion or a reset", () => {
+		const depleted = {
+			status: 200,
+			planType: "plus",
+			model: "gpt-5.3-codex",
+			primary: { usedPercent: 65, windowMinutes: 10080 },
+			secondary: { usedPercent: 12 },
+		} satisfies CodexQuotaSnapshot;
+		expect(formatCompactQuotaSnapshot(depleted, NOW)).toBe("7d 35% | quota 88%");
+
+		const fullWithReset = {
+			status: 200,
+			planType: "plus",
+			model: "gpt-5.3-codex",
+			primary: { usedPercent: 65, windowMinutes: 10080 },
+			secondary: { usedPercent: 0, resetAtMs: SAME_DAY },
+		} satisfies CodexQuotaSnapshot;
+		expect(formatCompactQuotaSnapshot(fullWithReset, NOW)).toBe(
+			"7d 35% | quota 100%",
+		);
+		expect(
+			formatCompactQuotaSnapshot(fullWithReset, NOW, { showReset: true }),
+		).toBe(
+			`7d 35% | quota 100%, resets ${formatQuotaResetAt(SAME_DAY, NOW)}`,
+		);
+	});
+
+	it("does not restore quota text when both windows are uninformative", () => {
+		const allHidden = {
+			status: 200,
+			planType: "plus",
+			model: "gpt-5.3-codex",
+			primary: { usedPercent: 0 },
+			secondary: { usedPercent: 0 },
+		} satisfies CodexQuotaSnapshot;
+
+		expect(formatCompactQuotaSnapshot(allHidden, NOW)).toBe("");
+		expect(
+			formatCompactQuotaSnapshot(allHidden, NOW, { showReset: true }),
+		).toBe("");
+		expect(
+			formatQuotaSnapshotForDashboard(
+				allHidden,
+				{ showQuotaDetails: true } as DashboardDisplaySettings,
+				NOW,
+			),
+		).toBe("live session OK");
+	});
+
 	it("formatQuotaSnapshotForDashboard is the check line and shows resets", () => {
 		const display = {
 			showQuotaDetails: true,

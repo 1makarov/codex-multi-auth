@@ -4,7 +4,12 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getConfigDir, getProjectStorageKey } from "../lib/storage/paths.js";
-import { setStoragePathState } from "../lib/storage/path-state.js";
+import {
+	getStoragePathState,
+	runWithStoragePathState,
+	setStoragePathDirectState,
+	setStoragePathState,
+} from "../lib/storage/path-state.js";
 import { getIntentionalResetMarkerPath } from "../lib/storage/backup-paths.js";
 import { getRuntimeAccountIdentityKey } from "../lib/storage/identity.js";
 import { removeWithRetry } from "./helpers/remove-with-retry.js";
@@ -41,6 +46,43 @@ import {
 describe("storage", () => {
 	const _origCODEX_HOME = process.env.CODEX_HOME;
 	const _origCODEX_MULTI_AUTH_DIR = process.env.CODEX_MULTI_AUTH_DIR;
+
+	it("keeps a direct path override ahead of a stale async context", async () => {
+		const staleState = {
+			currentStoragePath: "stale-storage.json",
+			currentLegacyProjectStoragePath: null,
+			currentLegacyWorktreeStoragePath: null,
+			currentProjectRoot: null,
+		};
+		const directState = {
+			currentStoragePath: "direct-storage.json",
+			currentLegacyProjectStoragePath: null,
+			currentLegacyWorktreeStoragePath: null,
+			currentProjectRoot: null,
+		};
+		let release!: () => void;
+		const gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+
+		try {
+			const staleRead = runWithStoragePathState(staleState, async () => {
+				await gate;
+				return getStoragePathState();
+			});
+			await Promise.resolve();
+			setStoragePathDirectState(directState);
+			release();
+			await expect(staleRead).resolves.toEqual(directState);
+		} finally {
+			setStoragePathState({
+				currentStoragePath: null,
+				currentLegacyProjectStoragePath: null,
+				currentLegacyWorktreeStoragePath: null,
+				currentProjectRoot: null,
+			});
+		}
+	});
 
 	beforeEach(() => {
 		delete process.env.CODEX_HOME;
@@ -2559,6 +2601,27 @@ describe("storage", () => {
 			const result = normalizeAccountStorage(data);
 			expect(result?.accounts).toHaveLength(1);
 		});
+
+		it.each([0, -1, Number.NaN, Number.POSITIVE_INFINITY])(
+			"removes malformed auth invalidation fields for timestamp %s",
+			(timestamp) => {
+				const result = normalizeAccountStorage({
+					version: 3,
+					accounts: [
+						{
+							refreshToken: "t1",
+							authInvalidatedAt: timestamp,
+							authInvalidationErrorCode: "oauth_token_revoked",
+						},
+					],
+				});
+
+				expect(result?.accounts[0]).not.toHaveProperty("authInvalidatedAt");
+				expect(result?.accounts[0]).not.toHaveProperty(
+					"authInvalidationErrorCode",
+				);
+			},
+		);
 
 		it("remaps activeKey when deduplication changes indices", () => {
 			const now = Date.now();

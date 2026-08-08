@@ -40,20 +40,23 @@ function trustedResetWaitMs(
 	window: QuotaSchedulerWindow,
 	snapshot: QuotaSchedulerSnapshot,
 	now: number,
-): number {
+): number | null {
 	const resetAtMs = window.resetAtMs;
 	const updatedAt = snapshot.updatedAt;
 	if (
 		typeof resetAtMs !== "number" ||
 		!Number.isFinite(resetAtMs) ||
-		resetAtMs <= now ||
 		typeof updatedAt !== "number" ||
 		!Number.isFinite(updatedAt) ||
 		updatedAt > now ||
 		now - updatedAt > MAX_TRUSTED_RESET_AGE_MS
 	) {
-		return 0;
+		return null;
 	}
+	// An explicit reset that has already passed is healthy again. Do not turn
+	// an expired primary window into another fallback deferral merely because a
+	// secondary window keeps the aggregate snapshot alive.
+	if (resetAtMs <= now) return 0;
 	return Math.min(resetAtMs - now, MAX_RATE_LIMIT_DELAY_MS);
 }
 
@@ -316,12 +319,16 @@ export class PreemptiveQuotaScheduler {
 			typeof snapshot.secondary.usedPercent === "number" &&
 			Number.isFinite(snapshot.secondary.usedPercent) &&
 			snapshot.secondary.usedPercent >= 100 - this.secondaryRemainingPercentThreshold;
+		const getNearExhaustedWait = (window: QuotaSchedulerWindow): number => {
+			const trustedWait = trustedResetWaitMs(window, snapshot, now);
+			return trustedWait === null ? this.maxDeferralMs : trustedWait;
+		};
 		const nearExhaustedWait = Math.max(
 			primaryNearExhausted && snapshot.status !== 429
-				? trustedResetWaitMs(snapshot.primary, snapshot, now) || this.maxDeferralMs
+				? getNearExhaustedWait(snapshot.primary)
 				: 0,
 			secondaryNearExhausted && snapshot.status !== 429
-				? trustedResetWaitMs(snapshot.secondary, snapshot, now) || this.maxDeferralMs
+				? getNearExhaustedWait(snapshot.secondary)
 				: 0,
 		);
 		if (nearExhaustedWait > 0) {

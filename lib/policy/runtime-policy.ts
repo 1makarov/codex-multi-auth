@@ -39,6 +39,7 @@ export interface RuntimePolicyDecision {
 	reasons: string[];
 	projectKey: string | null;
 	blockedAccountIndexes: Set<number>;
+	blockedAccountReasons?: Record<number, string>;
 	scoreBoostByAccount: Record<number, number>;
 	budgetEvaluations: BudgetGuardEvaluation[];
 }
@@ -147,6 +148,7 @@ export async function evaluateRuntimePolicy(input: {
 	const now = input.now ?? Date.now();
 	const reasons: string[] = [];
 	const blockedAccountIndexes = new Set<number>();
+	const blockedAccountReasons: Record<number, string> = {};
 	const scoreBoostByAccount: Record<number, number> = {};
 	const profile = input.state.project.profile;
 
@@ -189,9 +191,13 @@ export async function evaluateRuntimePolicy(input: {
 		let boost = 0;
 		if (accountPolicy?.paused) {
 			blockedAccountIndexes.add(account.index);
+			blockedAccountReasons[account.index] = "policy: paused";
 		}
 		if (accountPolicy?.drained) {
 			blockedAccountIndexes.add(account.index);
+			blockedAccountReasons[account.index] = accountPolicy.paused
+				? "policy: paused, drained"
+				: "policy: drained";
 		}
 		if (accountPolicy) {
 			boost += (accountPolicy.weight - 1) * 2;
@@ -228,6 +234,7 @@ export async function evaluateRuntimePolicy(input: {
 		);
 		if (capabilitySnapshot && capabilitySnapshot.unsupported > 0) {
 			blockedAccountIndexes.add(account.index);
+			blockedAccountReasons[account.index] = "policy: unsupported model";
 		}
 		scoreBoostByAccount[account.index] = boost;
 	}
@@ -241,6 +248,7 @@ export async function evaluateRuntimePolicy(input: {
 		reasons,
 		projectKey: input.state.project.projectKey,
 		blockedAccountIndexes,
+		blockedAccountReasons,
 		scoreBoostByAccount,
 		budgetEvaluations,
 	};

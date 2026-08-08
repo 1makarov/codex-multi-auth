@@ -1,13 +1,17 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { withFileOperationRetry } from "../fs-retry.js";
 import { getCodexMultiAuthDir } from "../runtime-paths.js";
+import {
+	APP_RUNTIME_HELPER_OWNER_FILE,
+	APP_RUNTIME_HELPER_STATUS_FILE,
+} from "../runtime-constants.js";
 import {
 	configHasRuntimeRotationProvider,
 	restoreConfigTomlFromRuntimeRotationProvider,
@@ -18,6 +22,12 @@ import {
 const APP_BIND_DIR_NAME = "app-bind";
 const APP_BIND_STATE_FILE = "runtime-rotation-app-bind.json";
 const APP_BIND_BACKUP_FILE = "codex-config-backup.json";
+const RUNTIME_ROTATION_APP_HELPER_ARG =
+	"--codex-multi-auth-runtime-app-helper";
+const PROCESS_IDENTITY_PROBE_TIMEOUT_MS = 2_000;
+const WINDOWS_PROCESS_IDENTITY_PROBE_TIMEOUT_MS = 5_000;
+const PROCESS_START_TIME_TOLERANCE_MS = 5_000;
+const WINDOWS_TASKKILL_TIMEOUT_MS = 5_000;
 const APP_BIND_STATUS_FILE = "runtime-rotation-app-bind-status.json";
 const WINDOWS_STARTUP_FILE = "Codex Multi Auth Runtime Router.cmd";
 const MACOS_LAUNCH_AGENT_ID = "com.ndycode.codex-multi-auth.runtime-router";
@@ -61,6 +71,8 @@ export interface AppBindState {
 	nodePath: string;
 	routerScriptPath: string;
 	clientApiKey: string;
+	/** Per-bind nonce passed to the router command line for PID ownership checks. */
+	identityToken?: string;
 	startupPath: string | null;
 	launchAgentPath: string | null;
 	boundConfigHash: string;
@@ -70,6 +82,13 @@ export interface AppBindState {
 export interface AppBindRouterStatus {
 	state: string | null;
 	pid: number | null;
+	startedAt?: number | null;
+	/** Internal path of the status file used to verify the owning command line. */
+	statusPath?: string | null;
+	/** Full router script path persisted by newer router processes. */
+	routerScriptPath?: string | null;
+	/** Per-process nonce echoed by the router command line. */
+	identityToken?: string | null;
 	baseUrl: string | null;
 	totalRequests: number | null;
 	lastAccountIndex: number | null;
@@ -100,6 +119,13 @@ export interface AppBindResult {
 	message: string;
 }
 
+export type ProcessIdentityVerifier = (
+	pid: number,
+	startedAt: number,
+	platform: NodeJS.Platform,
+	identityToken?: string,
+) => boolean | Promise<boolean>;
+
 export interface AppBindOptions {
 	env?: NodeJS.ProcessEnv;
 	platform?: NodeJS.Platform;
@@ -111,6 +137,36 @@ export interface AppBindOptions {
 	spawnDetached?: boolean;
 	routerReadyTimeoutMs?: number;
 	log?: (message: string) => void;
+	/** Test/integration seam for deterministic ownership verification. */
+	verifyProcessIdentity?: ProcessIdentityVerifier;
+}
+
+export interface DetachedProcessStopOptions {
+	gracefulTimeoutMs?: number;
+	pollIntervalMs?: number;
+	isAlive?: (pid: number) => boolean;
+	kill?: (pid: number, signal: NodeJS.Signals) => void;
+	runWindowsTaskkill?: (pid: number) => Promise<boolean | void>;
+	log?: (message: string) => void;
+	/** Expected per-process nonce when verifying a persisted PID. */
+	identityToken?: string;
+	verifyProcessIdentity?: ProcessIdentityVerifier;
+}
+
+export interface RuntimeRotationAppHelperStatus {
+	state: string | null;
+	kind: string | null;
+	pid: number | null;
+	startedAt: number | null;
+	/** Full wrapper script path persisted by newer helper processes. */
+	scriptPath?: string | null;
+	/** Per-process nonce echoed by the helper command line. */
+	identityToken?: string | null;
+}
+
+interface RuntimeRotationAppHelperOwner {
+	kind: string;
+	identityToken: string;
 }
 
 // Per-key mutex. `tail` resolves only after `current` resolves, so each
@@ -264,6 +320,7 @@ function readAppBindStateRecord(record: Record<string, unknown>): AppBindState |
 	const nodePath = readString(record, "nodePath");
 	const routerScriptPath = readString(record, "routerScriptPath");
 	const clientApiKey = readString(record, "clientApiKey");
+	const identityToken = readString(record, "identityToken");
 	const boundConfigHash = readString(record, "boundConfigHash");
 	const updatedAt = readNumber(record, "updatedAt");
 	const platformValue = readString(record, "platform");
@@ -298,6 +355,7 @@ function readAppBindStateRecord(record: Record<string, unknown>): AppBindState |
 		nodePath,
 		routerScriptPath,
 		clientApiKey,
+		identityToken: identityToken ?? undefined,
 		startupPath: readString(record, "startupPath"),
 		launchAgentPath: readString(record, "launchAgentPath"),
 		boundConfigHash,
@@ -341,6 +399,10 @@ async function readRouterStatus(path: string): Promise<AppBindRouterStatus | nul
 	return {
 		state: readString(record, "state"),
 		pid: readNumber(record, "pid"),
+		startedAt: readNumber(record, "startedAt"),
+		statusPath: path,
+		routerScriptPath: readString(record, "routerScriptPath"),
+		identityToken: readString(record, "identityToken"),
 		baseUrl: readString(record, "baseUrl"),
 		totalRequests: readNumber(record, "totalRequests"),
 		lastAccountIndex: readNumber(record, "lastAccountIndex"),
@@ -353,7 +415,7 @@ async function readRouterStatus(path: string): Promise<AppBindRouterStatus | nul
 }
 
 function isProcessAlive(pid: number | null): boolean {
-	if (!pid) return false;
+	if (!pid || !Number.isInteger(pid) || pid < 1) return false;
 	try {
 		process.kill(pid, 0);
 		return true;
@@ -453,7 +515,7 @@ function createWindowsStartupCommand(state: AppBindState): string {
 	const logPath = escapeWindowsBatchPath(state.logPath);
 	return [
 		"@echo off",
-		`"${nodePath}" "${routerScriptPath}" --port ${state.port} --status "${statusPath}" --state "${statePath}" --log "${logPath}" --max-log-bytes ${APP_ROUTER_MAX_LOG_BYTES} >> "${logPath}" 2>&1`,
+		`"${nodePath}" "${routerScriptPath}" --port ${state.port} --status "${statusPath}" --identity-token "${state.identityToken ?? ""}" --state "${statePath}" --log "${logPath}" --max-log-bytes ${APP_ROUTER_MAX_LOG_BYTES} >> "${logPath}" 2>&1`,
 		"",
 	].join("\r\n");
 }
@@ -473,6 +535,8 @@ function createMacLaunchAgentPlist(state: AppBindState): string {
 		String(state.port),
 		"--status",
 		state.statusPath,
+		"--identity-token",
+		state.identityToken ?? "",
 		"--state",
 		state.statePath,
 		"--log",
@@ -517,7 +581,9 @@ async function writeAppBindStartup(state: AppBindState): Promise<void> {
 	}
 }
 
-async function removeAppBindStartup(state: AppBindState): Promise<void> {
+async function removeAppBindStartup(
+	state: Pick<AppBindState, "startupPath" | "launchAgentPath">,
+): Promise<void> {
 	const candidates = [state.startupPath, state.launchAgentPath].filter(
 		(path): path is string => typeof path === "string" && path.length > 0,
 	);
@@ -542,6 +608,8 @@ function spawnRouter(state: AppBindState): void {
 				String(state.port),
 				"--status",
 				state.statusPath,
+				"--identity-token",
+				state.identityToken ?? "",
 				"--state",
 				state.statePath,
 				"--log",
@@ -596,17 +664,651 @@ async function waitForRouterStatus(
 	throw new Error(`Codex app runtime router did not report ready${suffix}`);
 }
 
-async function stopRouter(router: AppBindRouterStatus | null): Promise<void> {
-	if (!router?.pid || !isProcessAlive(router.pid)) return;
+export async function stopRuntimeRotationRouterProcess(
+	router: Pick<
+		AppBindRouterStatus,
+		| "state"
+		| "pid"
+		| "startedAt"
+		| "updatedAt"
+		| "statusPath"
+		| "routerScriptPath"
+		| "identityToken"
+	> | null,
+	platform: NodeJS.Platform,
+	routerScriptPath: string,
+	options: DetachedProcessStopOptions = {},
+): Promise<boolean> {
+	if (router?.state !== "running" || router.pid === null) {
+		return false;
+	}
+	if (
+		router.routerScriptPath &&
+		normalizeProcessIdentityPath(router.routerScriptPath, platform) !==
+			normalizeProcessIdentityPath(routerScriptPath, platform)
+	) {
+		return false;
+	}
+	const startedAt =
+		typeof router.startedAt === "number" &&
+		Number.isFinite(router.startedAt) &&
+		router.startedAt > 0
+			? router.startedAt
+			: null;
+	const updatedAt =
+		typeof router.updatedAt === "number" &&
+		Number.isFinite(router.updatedAt) &&
+		router.updatedAt > 0
+			? router.updatedAt
+			: null;
+	const identityTimestamp = startedAt ?? updatedAt;
+	if (identityTimestamp === null) return false;
+	const expectedIdentityToken = options.identityToken;
+	if (router.identityToken && !expectedIdentityToken) {
+		// A tokenized status record must be paired with the trusted token from
+		// bind state. The status file alone is mutable by any replacement process.
+		return false;
+	}
+	const verifyProcessIdentity = options.verifyProcessIdentity;
+	let verified: boolean;
+	if (verifyProcessIdentity) {
+		verified = expectedIdentityToken
+			? await verifyProcessIdentity(
+					router.pid,
+				identityTimestamp,
+				platform,
+				expectedIdentityToken,
+			)
+			: await verifyProcessIdentity(router.pid, identityTimestamp, platform);
+	} else if (startedAt !== null) {
+		verified = await verifyRuntimeProcessIdentity(
+			router.pid,
+			startedAt,
+			platform,
+			routerScriptPath,
+			router.statusPath,
+			options.log,
+			expectedIdentityToken,
+		);
+	} else {
+		verified = await verifyLegacyRuntimeProcessIdentity(
+			router.pid,
+			updatedAt as number,
+			platform,
+			routerScriptPath,
+			router.statusPath,
+			options.log,
+			expectedIdentityToken,
+		);
+	}
+	if (!verified) {
+		return false;
+	}
+	return stopDetachedProcess(router.pid, platform, options);
+}
+
+async function stopRouter(
+	router: AppBindRouterStatus | null,
+	platform: NodeJS.Platform,
+	routerScriptPath: string,
+	options: DetachedProcessStopOptions = {},
+): Promise<boolean> {
+	return stopRuntimeRotationRouterProcess(router, platform, routerScriptPath, options);
+}
+
+async function runWindowsTaskkill(pid: number): Promise<boolean> {
+	return new Promise<boolean>((resolve) => {
+		let settled = false;
+		let child: ReturnType<typeof spawn> | null = null;
+		let timeout: ReturnType<typeof setTimeout> | null = null;
+		const finish = (succeeded: boolean) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			resolve(succeeded);
+		};
+		try {
+			child = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
+				stdio: "ignore",
+				windowsHide: true,
+			});
+			timeout = setTimeout(() => {
+				try {
+					child?.kill();
+				} catch {
+					// The taskkill child may already have exited at the timeout boundary.
+				}
+				finish(false);
+			}, WINDOWS_TASKKILL_TIMEOUT_MS);
+			child.once("error", () => finish(false));
+			child.once("close", (code) => finish(code === 0));
+		} catch {
+			finish(false);
+		}
+	});
+}
+
+interface ProcessIdentitySnapshot {
+	startedAt: number | null;
+	commandLine: string;
+}
+
+async function runProcessIdentityProbe(
+	command: string,
+	args: string[],
+	options: { timeoutMs?: number; log?: (message: string) => void } = {},
+): Promise<string | null> {
+	return new Promise((resolve) => {
+		let output = "";
+		let settled = false;
+		let child: ReturnType<typeof spawn> | null = null;
+		const timeoutMs =
+			typeof options.timeoutMs === "number" &&
+			Number.isFinite(options.timeoutMs) &&
+			options.timeoutMs > 0
+				? options.timeoutMs
+				: PROCESS_IDENTITY_PROBE_TIMEOUT_MS;
+		const finish = (value: string | null) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timeout);
+			resolve(value);
+		};
+		const timeout = setTimeout(() => {
+			options.log?.(`Process identity probe timed out while running ${command}`);
+			try {
+				child?.kill();
+			} catch {
+				// The probe may have exited at the timeout boundary.
+			}
+			finish(null);
+		}, timeoutMs);
+		try {
+			child = spawn(command, args, {
+				stdio: ["ignore", "pipe", "ignore"],
+				windowsHide: true,
+			});
+			child.stdout?.setEncoding("utf8");
+			child.stdout?.on("data", (chunk: string) => {
+				output += chunk;
+			});
+			child.once("error", (error) => {
+				options.log?.(
+					`Process identity probe ${command} was unavailable: ${error instanceof Error ? error.message : String(error)}`,
+				);
+				finish(null);
+			});
+			child.once("close", (code) => {
+				if (code !== 0) {
+					options.log?.(
+						`Process identity probe ${command} exited with status ${code ?? "unknown"}`,
+					);
+				}
+				finish(code === 0 ? output : null);
+			});
+		} catch (error) {
+			options.log?.(
+				`Process identity probe ${command} was unavailable: ${error instanceof Error ? error.message : String(error)}`,
+			);
+			finish(null);
+		}
+	});
+}
+
+async function readProcessIdentity(
+	pid: number,
+	platform: NodeJS.Platform,
+	log?: (message: string) => void,
+): Promise<ProcessIdentitySnapshot | null> {
+	if (platform === "win32") {
+		const script = [
+			`$process = Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}'`,
+			"if ($null -ne $process) {",
+			"[Console]::WriteLine($process.CreationDate.ToUniversalTime().ToString('o'))",
+			"[Console]::WriteLine($process.CommandLine)",
+			"}",
+		].join("; ");
+		const output = await runProcessIdentityProbe(
+			"powershell.exe",
+			["-NoProfile", "-NonInteractive", "-Command", script],
+			{ timeoutMs: WINDOWS_PROCESS_IDENTITY_PROBE_TIMEOUT_MS, log },
+		);
+		if (!output) {
+			log?.(`Process identity probe returned no Windows record for PID ${pid}`);
+			return null;
+		}
+		const [startedAtRaw, ...commandLines] = output.trim().split(/\r?\n/);
+		const startedAt = startedAtRaw ? Date.parse(startedAtRaw.trim()) : NaN;
+		const commandLine = commandLines.join(" ").trim();
+		if (!Number.isFinite(startedAt) || commandLine.length === 0) {
+			log?.(`Process identity probe returned an invalid Windows record for PID ${pid}`);
+		}
+		return {
+			startedAt: Number.isFinite(startedAt) ? startedAt : null,
+			commandLine,
+		};
+	}
+
+	const [startedAtRaw, commandLineRaw] = await Promise.all([
+		runProcessIdentityProbe(
+			"ps",
+			["-p", String(pid), "-o", "lstart="],
+			{ log },
+		),
+		runProcessIdentityProbe(
+			"ps",
+			["-p", String(pid), "-o", "command="],
+			{ log },
+		),
+	]);
+	if (!startedAtRaw || !commandLineRaw) {
+		log?.(`Process identity probe returned no POSIX record for PID ${pid}`);
+		return null;
+	}
+	const startedAt = parsePosixProcessStartTime(startedAtRaw);
+	if (startedAt === null) {
+		log?.(`Process identity probe returned an invalid POSIX start time for PID ${pid}`);
+	}
+	return {
+		startedAt,
+		commandLine: commandLineRaw.trim(),
+	};
+}
+
+const POSIX_LSTART_MONTHS = new Map([
+	["Jan", 0],
+	["Feb", 1],
+	["Mar", 2],
+	["Apr", 3],
+	["May", 4],
+	["Jun", 5],
+	["Jul", 6],
+	["Aug", 7],
+	["Sep", 8],
+	["Oct", 9],
+	["Nov", 10],
+	["Dec", 11],
+]);
+
+/** Parse the documented local-time format emitted by `ps -o lstart=`. */
+export function parsePosixProcessStartTime(value: string): number | null {
+	const match =
+		/^\s*[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})\s+(\d{4})\s*$/.exec(
+			value,
+		);
+	if (!match) return null;
+	const month = POSIX_LSTART_MONTHS.get(match[1] ?? "");
+	const day = Number(match[2]);
+	const hour = Number(match[3]);
+	const minute = Number(match[4]);
+	const second = Number(match[5]);
+	const year = Number(match[6]);
+	if (
+		month === undefined ||
+		!Number.isInteger(day) ||
+		!Number.isInteger(hour) ||
+		!Number.isInteger(minute) ||
+		!Number.isInteger(second) ||
+		!Number.isInteger(year) ||
+		day < 1 ||
+		day > 31 ||
+		hour > 23 ||
+		minute > 59 ||
+		second > 59
+	) {
+		return null;
+	}
+	const date = new Date(year, month, day, hour, minute, second, 0);
+	if (
+		!Number.isFinite(date.getTime()) ||
+		date.getFullYear() !== year ||
+		date.getMonth() !== month ||
+		date.getDate() !== day ||
+		date.getHours() !== hour ||
+		date.getMinutes() !== minute ||
+		date.getSeconds() !== second
+	) {
+		return null;
+	}
+	return date.getTime();
+}
+
+function normalizeProcessIdentityPath(value: string, platform: NodeJS.Platform): string {
+	const normalized = value.trim().replace(/["']/g, "").replace(/\\/g, "/");
+	return platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function commandLineContainsProcessPath(
+	commandLine: string,
+	path: string,
+	platform: NodeJS.Platform,
+): boolean {
+	const normalizedPath = normalizeProcessIdentityPath(path, platform);
+	if (normalizedPath.length === 0) return false;
+	const normalizedCommandLine = normalizeProcessIdentityPath(commandLine, platform);
+	let offset = normalizedCommandLine.indexOf(normalizedPath);
+	while (offset >= 0) {
+		const before = normalizedCommandLine[offset - 1] ?? "";
+		const after =
+			normalizedCommandLine[offset + normalizedPath.length] ?? "";
+		if ((before === "" || /\s/.test(before)) && (after === "" || /\s/.test(after))) {
+			return true;
+		}
+		offset = normalizedCommandLine.indexOf(normalizedPath, offset + 1);
+	}
+	return false;
+}
+
+async function verifyRuntimeProcessIdentity(
+	pid: number,
+	startedAt: number,
+	platform: NodeJS.Platform,
+	expectedScriptPath: string,
+	expectedStatusPath?: string | null,
+	log?: (message: string) => void,
+	expectedIdentityToken?: string,
+): Promise<boolean> {
+	const identity = await readProcessIdentity(pid, platform, log);
+	if (!identity || identity.startedAt === null) return false;
+	if (
+		!commandLineContainsProcessPath(
+			identity.commandLine,
+			expectedScriptPath,
+			platform,
+		) ||
+		(expectedStatusPath !== undefined &&
+			expectedStatusPath !== null &&
+			!commandLineContainsProcessPath(
+				identity.commandLine,
+				expectedStatusPath,
+				platform,
+			))
+	) {
+		return false;
+	}
+	if (
+		expectedIdentityToken &&
+		!commandLineContainsProcessPath(
+			identity.commandLine,
+			expectedIdentityToken,
+			platform,
+		)
+	) {
+		log?.("Process identity probe rejected a mismatched ownership token");
+		return false;
+	}
+	return Math.abs(identity.startedAt - startedAt) <= PROCESS_START_TIME_TOLERANCE_MS;
+}
+
+async function verifyLegacyRuntimeProcessIdentity(
+	pid: number,
+	lastObservedAt: number,
+	platform: NodeJS.Platform,
+	expectedScriptPath: string,
+	expectedStatusPath?: string | null,
+	log?: (message: string) => void,
+	expectedIdentityToken?: string,
+): Promise<boolean> {
+	if (lastObservedAt > Date.now() + PROCESS_START_TIME_TOLERANCE_MS) {
+		return false;
+	}
+	const identity = await readProcessIdentity(pid, platform, log);
+	if (!identity || identity.startedAt === null) return false;
+	if (
+		!commandLineContainsProcessPath(
+			identity.commandLine,
+			expectedScriptPath,
+			platform,
+		) ||
+		(expectedStatusPath !== undefined &&
+			expectedStatusPath !== null &&
+			!commandLineContainsProcessPath(
+				identity.commandLine,
+				expectedStatusPath,
+				platform,
+			))
+	) {
+		return false;
+	}
+	if (
+		expectedIdentityToken &&
+		!commandLineContainsProcessPath(
+			identity.commandLine,
+			expectedIdentityToken,
+			platform,
+		)
+	) {
+		log?.("Process identity probe rejected a mismatched ownership token");
+		return false;
+	}
+	// Legacy router status did not persist its own start time. A status update
+	// is still written after the router process starts, so a process with a
+	// later creation time indicates a stale/reused PID and must not be signalled.
+	return identity.startedAt <= lastObservedAt + PROCESS_START_TIME_TOLERANCE_MS;
+}
+
+function isIgnorableProcessSignalError(error: unknown): boolean {
+	const code =
+		error && typeof error === "object" && "code" in error
+			? error.code
+			: undefined;
+	return code === "ESRCH" || code === "EPERM";
+}
+
+function reportProcessStopError(
+	options: DetachedProcessStopOptions,
+	operation: string,
+	error: unknown,
+): void {
+	options.log?.(
+		`Failed to ${operation}: ${error instanceof Error ? error.message : String(error)}`,
+	);
+}
+
+function resolveStopTimeout(value: number | undefined, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0
+		? Math.floor(value)
+		: fallback;
+}
+
+async function waitForDetachedProcessExit(
+	pid: number,
+	options: DetachedProcessStopOptions,
+): Promise<boolean> {
+	const isAlive = options.isAlive ?? isProcessAlive;
+	const timeoutMs = resolveStopTimeout(options.gracefulTimeoutMs, 2_000);
+	const pollIntervalMs = Math.max(
+		1,
+		resolveStopTimeout(options.pollIntervalMs, 100),
+	);
+	const deadline = Date.now() + timeoutMs;
+	while (isAlive(pid)) {
+		if (Date.now() >= deadline) return false;
+		await new Promise((resolve) =>
+			setTimeout(
+				resolve,
+				Math.min(pollIntervalMs, Math.max(1, deadline - Date.now())),
+			),
+		);
+	}
+	return true;
+}
+
+export async function stopDetachedProcess(
+	pid: number | null,
+	platform: NodeJS.Platform,
+	options: DetachedProcessStopOptions = {},
+): Promise<boolean> {
+	if (!pid || !Number.isInteger(pid) || pid < 1) return false;
+	const isAlive = options.isAlive ?? isProcessAlive;
+	const kill =
+		options.kill ??
+		((target: number, signal: NodeJS.Signals) => {
+			process.kill(target, signal);
+		});
+	const taskkill = options.runWindowsTaskkill ?? runWindowsTaskkill;
+	if (!isAlive(pid)) return true;
+
+	if (platform === "win32") {
+		// Node's SIGTERM emulation can let a target exit before the tree-kill
+		// fallback runs. Kill the exact PID tree directly so detached descendants
+		// cannot survive a graceful wait and so no unrelated process is touched.
+		try {
+			const result = await taskkill(pid);
+			if (result !== false || !isAlive(pid)) return true;
+			reportProcessStopError(
+				options,
+				"terminate the Windows process tree",
+				new Error("taskkill reported failure while the process is still alive"),
+			);
+			return false;
+		} catch (error) {
+			if (!isAlive(pid)) return true;
+			reportProcessStopError(options, "terminate the Windows process tree", error);
+			return false;
+		}
+	}
+
 	try {
-		process.kill(router.pid, "SIGTERM");
+		kill(pid, "SIGTERM");
+	} catch (error) {
+		// ESRCH means the process exited between the liveness probe and signal;
+		// EPERM means it is not ours or cannot be signalled. Do not escalate an
+		// unexpected signal error or silently claim that cleanup succeeded.
+		if (isIgnorableProcessSignalError(error)) return !isAlive(pid);
+		reportProcessStopError(options, "send SIGTERM", error);
+		return false;
+	}
+
+	if (await waitForDetachedProcessExit(pid, options)) return true;
+
+	// A detached POSIX helper/router may ignore SIGTERM. Escalate once after the
+	// bounded graceful window; a second bounded wait prevents unbind from racing
+	// the process while it is still unwinding.
+	try {
+		kill(pid, "SIGKILL");
+	} catch (error) {
+		if (isIgnorableProcessSignalError(error)) return !isAlive(pid);
+		reportProcessStopError(options, "send SIGKILL", error);
+		return false;
+	}
+	return waitForDetachedProcessExit(pid, {
+		...options,
+		gracefulTimeoutMs: Math.min(
+			resolveStopTimeout(options.gracefulTimeoutMs, 2_000),
+			500,
+		),
+	});
+}
+
+async function readRuntimeHelperStatus(
+	path: string,
+): Promise<
+	| { kind: "missing" | "malformed" | "unreadable"; status: null }
+	| { kind: "valid"; status: RuntimeRotationAppHelperStatus }
+> {
+	let raw: string;
+	try {
+		raw = await readFile(path, "utf8");
+	} catch (error) {
+		const code =
+			error && typeof error === "object" && "code" in error
+				? error.code
+				: undefined;
+		return {
+			kind: code === "ENOENT" ? "missing" : "unreadable",
+			status: null,
+		};
+	}
+	const record = parseJsonRecord(raw);
+	if (!record) return { kind: "malformed", status: null };
+	const pid = record ? readNumber(record, "pid") : null;
+	const startedAt = record ? readNumber(record, "startedAt") : null;
+	return {
+		kind: "valid",
+		status: {
+			state: readString(record, "state"),
+			kind: readString(record, "kind"),
+			pid: pid !== null && Number.isInteger(pid) && pid > 0 ? pid : null,
+			startedAt:
+				startedAt !== null && Number.isFinite(startedAt) && startedAt > 0
+					? startedAt
+					: null,
+			scriptPath: readString(record, "scriptPath"),
+			identityToken: readString(record, "identityToken"),
+		},
+	};
+}
+
+async function readRuntimeHelperOwner(
+	path: string,
+): Promise<RuntimeRotationAppHelperOwner | null> {
+	try {
+		const record = parseJsonRecord(await readFile(path, "utf8"));
+		const kind = record ? readString(record, "kind") : null;
+		const identityToken = record ? readString(record, "identityToken") : null;
+		return kind === "codex-app-runtime-rotation-helper-owner" && identityToken
+			? { kind, identityToken }
+			: null;
 	} catch {
-		return;
+		return null;
 	}
-	for (let attempt = 0; attempt < 20; attempt += 1) {
-		if (!isProcessAlive(router.pid)) return;
-		await new Promise((resolve) => setTimeout(resolve, 100));
+}
+
+function resolveRuntimeHelperOwnerPath(
+	baseDir: string,
+	pid: number | null,
+): string | null {
+	if (pid === null || !Number.isInteger(pid) || pid < 1) return null;
+	return join(
+		baseDir,
+		APP_RUNTIME_HELPER_OWNER_FILE.replace(/\.json$/i, `.${pid}.json`),
+	);
+}
+
+export async function stopRuntimeRotationAppHelperProcess(
+	helper: RuntimeRotationAppHelperStatus,
+	options: DetachedProcessStopOptions & { platform?: NodeJS.Platform } = {},
+): Promise<boolean> {
+	if (
+		helper.kind !== "codex-app-runtime-rotation-helper" ||
+		helper.state !== "running" ||
+		helper.pid === null ||
+		helper.startedAt === null
+	) {
+		return false;
 	}
+	const platform = options.platform ?? process.platform;
+	const expectedIdentityToken = options.identityToken;
+	if (helper.identityToken && !expectedIdentityToken) {
+		// Do not trust a token that was read from the same mutable status file
+		// whose PID is about to be signalled.
+		return false;
+	}
+	const verifyProcessIdentity =
+		options.verifyProcessIdentity ??
+		((pid, startedAt, processPlatform) =>
+			verifyRuntimeProcessIdentity(
+				pid,
+				startedAt,
+				processPlatform,
+				RUNTIME_ROTATION_APP_HELPER_ARG,
+				helper.scriptPath,
+				options.log,
+				expectedIdentityToken,
+			));
+	const verified = expectedIdentityToken
+		? await verifyProcessIdentity(
+				helper.pid,
+			helper.startedAt,
+			platform,
+			expectedIdentityToken,
+		)
+		: await verifyProcessIdentity(helper.pid, helper.startedAt, platform);
+	if (!verified) {
+		return false;
+	}
+	return stopDetachedProcess(helper.pid, platform, options);
 }
 
 async function readConfigIfExists(configPath: string): Promise<{ existed: boolean; content: string }> {
@@ -686,6 +1388,7 @@ async function bindCodexAppRuntimeRotationLocked(
 		nodePath: options.nodePath ?? process.execPath,
 		routerScriptPath: paths.routerScriptPath,
 		clientApiKey,
+		identityToken: existingState?.identityToken ?? randomBytes(24).toString("hex"),
 		startupPath: paths.startupPath,
 		launchAgentPath: paths.launchAgentPath,
 		boundConfigHash: sha256(boundConfig),
@@ -731,7 +1434,13 @@ async function bindCodexAppRuntimeRotationLocked(
 		if (startedRouter) {
 			// Best-effort stop of the router we just spawned
 			const orphan = await readRouterStatus(state.statusPath).catch(() => null);
-			await stopRouter(orphan).catch(() => undefined);
+			await stopRouter(orphan, platform, state.routerScriptPath, {
+				log: options.log,
+				identityToken: state.identityToken,
+				verifyProcessIdentity: options.verifyProcessIdentity,
+			}).catch(
+				() => undefined,
+			);
 		}
 		throw new Error(
 			"Codex app bind could not resolve a runtime router port; refusing to write config.toml with port=0.",
@@ -773,15 +1482,94 @@ async function unbindCodexAppRuntimeRotationLocked(
 ): Promise<AppBindResult> {
 	const state = await readAppBindState(paths.statePath);
 	const router = await readRouterStatus(paths.statusPath);
-	if (state) {
-		await stopRouter(router);
-		if (router?.pid && isProcessAlive(router.pid)) {
-			options.log?.(
-				`Warning: runtime router (pid ${router.pid}) did not stop; continuing cleanup`,
-			);
-		}
-		await removeAppBindStartup(state);
+	const platform = options.platform ?? process.platform;
+	const routerStopped = await stopRouter(
+		router,
+		platform,
+		state?.routerScriptPath ?? paths.routerScriptPath,
+		{
+			log: options.log,
+			identityToken: state?.identityToken,
+			verifyProcessIdentity: options.verifyProcessIdentity,
+		},
+	);
+	if (router?.pid && (!routerStopped || isProcessAlive(router.pid))) {
+		options.log?.(
+			`Warning: runtime router (pid ${router.pid}) did not stop; continuing cleanup`,
+		);
 	}
+
+	const helperStatusPath = join(
+		dirname(paths.bindDir),
+		APP_RUNTIME_HELPER_STATUS_FILE,
+	);
+	const helperRead = await readRuntimeHelperStatus(helperStatusPath);
+	let removeHelperStatus = false;
+	let removeHelperOwner = false;
+	let helperOwnerPath: string | null = null;
+	if (helperRead.kind === "valid") {
+		const helper = helperRead.status;
+		if (helper.kind === "codex-app-runtime-rotation-helper") {
+			helperOwnerPath = resolveRuntimeHelperOwnerPath(
+				dirname(paths.bindDir),
+				helper.pid,
+			);
+			const helperOwner = helperOwnerPath
+				? await readRuntimeHelperOwner(helperOwnerPath)
+				: null;
+			const helperOwnershipMatches =
+				!helper.identityToken ||
+				(helperOwner !== null &&
+					helper.identityToken === helperOwner.identityToken);
+			if (helper.state === "running") {
+				if (helper.pid === null) {
+					options.log?.(
+						"Warning: runtime app helper status has no valid PID; preserving status",
+					);
+				} else {
+					const wasAlive = isProcessAlive(helper.pid);
+					if (!wasAlive) {
+						removeHelperStatus = true;
+						removeHelperOwner =
+							helperOwnershipMatches && helperOwnerPath !== null;
+					} else if (!helperOwnershipMatches) {
+						options.log?.(
+							"Warning: runtime app helper ownership metadata does not match; preserving status",
+						);
+					} else {
+						const stopped = await stopRuntimeRotationAppHelperProcess(helper, {
+							platform,
+							log: options.log,
+							identityToken: helper.identityToken
+								? helperOwner?.identityToken
+								: undefined,
+							verifyProcessIdentity: options.verifyProcessIdentity,
+						});
+						const stillAlive = isProcessAlive(helper.pid);
+						removeHelperStatus = stopped && !stillAlive;
+						removeHelperOwner =
+							removeHelperStatus && helperOwnerPath !== null;
+						if (!removeHelperStatus) {
+							options.log?.(
+								`Warning: runtime app helper (pid ${helper.pid}) did not stop; preserving status`,
+							);
+						}
+					}
+				}
+			} else {
+				// A non-running, owned record is removable only when its PID is
+				// absent or no longer alive. This avoids deleting a status file
+				// while a helper is still serving despite a stale state value.
+				removeHelperStatus =
+					helper.pid === null || !isProcessAlive(helper.pid);
+				removeHelperOwner =
+					removeHelperStatus &&
+					helperOwnershipMatches &&
+					helperOwnerPath !== null;
+			}
+		}
+	}
+	await removeAppBindStartup(state ?? paths);
 
 	const backup = await readAppBindBackup(paths.backupPath);
 	let selfHealed = false;
@@ -824,16 +1612,27 @@ async function unbindCodexAppRuntimeRotationLocked(
 		}
 	}
 
-	for (const candidate of [
+	const cleanupCandidates = [
 		paths.statePath,
 		paths.backupPath,
 		paths.statusPath,
-	]) {
+		state?.logPath ?? paths.logPath,
+		...(removeHelperStatus ? [helperStatusPath] : []),
+		...(removeHelperOwner && helperOwnerPath ? [helperOwnerPath] : []),
+	];
+	for (const candidate of cleanupCandidates) {
 		try {
 			await unlinkIfExists(candidate);
 		} catch {
 			// Best-effort cleanup.
 		}
+	}
+	try {
+		await withFileOperationRetry(() =>
+			rm(paths.bindDir, { force: true, recursive: true }),
+		);
+	} catch {
+		// The bind directory may still contain unrelated or locked files.
 	}
 
 	const status = await getAppBindStatus(options);

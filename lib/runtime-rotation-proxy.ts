@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { Socket } from "node:net";
 import {
@@ -20,6 +20,10 @@ import {
 	getTokenInvalidationCooldownMs,
 	getTokenRefreshSkewMs,
 	getPidOffsetEnabled,
+	getPreemptiveQuotaEnabled,
+	getPreemptiveQuotaMaxDeferralMs,
+	getPreemptiveQuotaRemainingPercent5h,
+	getPreemptiveQuotaRemainingPercent7d,
 	getRoutingMutexMode,
 	getSchedulingStrategy,
 	loadPluginConfig,
@@ -45,13 +49,17 @@ import {
 	type RuntimePolicyDecision,
 } from "./policy/runtime-policy.js";
 import { isWorkspaceDisabledError } from "./request/fetch-helpers.js";
+import {
+	PreemptiveQuotaScheduler,
+	readQuotaSchedulerSnapshot,
+} from "./preemptive-quota-scheduler.js";
 import { createLogger, maskString, runWithCorrelationId } from "./logger.js";
 import { CodexValidationError } from "./errors.js";
+import { normalizeEmailKey } from "./storage/identity.js";
 import {
 	buildPinnedUnavailableErrorBody,
 	buildTokenInvalidationBody,
 	extractErrorCodeFromBody,
-	getQuotaNearExhaustionWaitMs,
 	isTokenInvalidationError,
 	normalizeExhaustionStatus,
 	parseRetryAfterBodyMs,
@@ -158,6 +166,36 @@ function toUrlHost(host: string): string {
 // level-gated and carry the per-request correlation id set in handleRequest.
 const proxyLog = createLogger("runtime-proxy");
 const DEFAULT_QUOTA_REMAINING_THRESHOLD = 10;
+
+/** @internal Stable identity key for in-memory quota snapshots across reloads. */
+export function buildQuotaScheduleKey(
+	account: Pick<ManagedAccount, "accountId" | "email" | "refreshToken"> & {
+		/** Stable per-record discriminator retained across token/account-id updates. */
+		addedAt?: number;
+		recordId?: string;
+	},
+	family: ModelFamily,
+	model?: string | null,
+): string {
+	const emailKey = normalizeEmailKey(account.email);
+	const accountId = account.accountId?.trim();
+	const refreshToken = account.refreshToken?.trim() ?? "";
+	const recordId = account.recordId?.trim();
+	const recordDiscriminator =
+		typeof account.addedAt === "number" &&
+		Number.isFinite(account.addedAt) &&
+		account.addedAt > 0
+			? `:added:${Math.floor(account.addedAt)}`
+			: "";
+	const accountIdentity = recordId
+		? `record:${recordId}`
+		: emailKey
+		? `email:${emailKey}${recordDiscriminator}`
+		: accountId
+			? `id:${accountId}${recordDiscriminator}`
+			: `refresh:${createHash("sha256").update(refreshToken).digest("hex")}${recordDiscriminator}`;
+	return `account:${accountIdentity}:${model ?? family}`;
+}
 
 const DEFAULT_MAX_RUNTIME_ACCOUNT_ATTEMPTS = 4;
 
@@ -701,6 +739,16 @@ export async function startRuntimeRotationProxy(
 		options.maxRequestBodyBytes ?? MAX_REQUEST_BODY_BYTES;
 	const quotaRemainingPercentThreshold =
 		options.quotaRemainingPercentThreshold ?? DEFAULT_QUOTA_REMAINING_THRESHOLD;
+	const preemptiveQuotaScheduler = new PreemptiveQuotaScheduler({
+		enabled: getPreemptiveQuotaEnabled(pluginConfig),
+		remainingPercentThresholdPrimary:
+			options.quotaRemainingPercentThreshold ??
+			getPreemptiveQuotaRemainingPercent5h(pluginConfig),
+		remainingPercentThresholdSecondary:
+			options.quotaRemainingPercentThreshold ??
+			getPreemptiveQuotaRemainingPercent7d(pluginConfig),
+		maxDeferralMs: getPreemptiveQuotaMaxDeferralMs(pluginConfig),
+	});
 	const sessionAffinityStore = getSessionAffinity(pluginConfig)
 		? new SessionAffinityStore({
 				ttlMs: getSessionAffinityTtlMs(pluginConfig),
@@ -731,6 +779,7 @@ export async function startRuntimeRotationProxy(
 		maxRuntimeAccountAttempts,
 		maxRequestBodyBytes,
 		quotaRemainingPercentThreshold,
+		preemptiveQuotaScheduler,
 		sessionAffinityStore,
 		lastObservedAffinityGeneration,
 		forcedAccountIndex,
@@ -1053,6 +1102,33 @@ async function handleRequestInner(
 				break;
 			}
 			attemptedIndexes.add(selected.index);
+			const quotaScheduleKey = buildQuotaScheduleKey(
+				selected,
+				context.family,
+				context.model,
+			);
+			const preemptiveDeferral = state.preemptiveQuotaScheduler.getDeferral(
+				quotaScheduleKey,
+				state.now(),
+			);
+			if (preemptiveDeferral.defer && preemptiveDeferral.waitMs > 0) {
+				accountSkipReasons.set(
+					selected.index,
+					preemptiveDeferral.reason ?? "quota-near-exhaustion",
+				);
+				exhaustionReason = "rate-limit";
+				accountManager.markRateLimitedWithReason(
+					selected,
+					preemptiveDeferral.waitMs,
+					context.family,
+					"quota",
+					context.model,
+				);
+				accountManager.recordRateLimit(selected, context.family, context.model);
+				accountManager.saveToDiskDebounced();
+				state.status.rotations += 1;
+				continue;
+			}
 
 			if (!accountManager.consumeToken(selected, context.family, context.model)) {
 				accountSkipReasons.set(selected.index, "token-exhausted");
@@ -1165,6 +1241,14 @@ async function handleRequestInner(
 				state.status.rotations += 1;
 				continue;
 			}
+			const quotaSnapshot = readQuotaSchedulerSnapshot(
+				upstream.headers,
+				upstream.status,
+				state.now(),
+			);
+			if (quotaSnapshot) {
+				state.preemptiveQuotaScheduler.update(quotaScheduleKey, quotaSnapshot);
+			}
 
 			if (upstream.status === HTTP_STATUS.TOO_MANY_REQUESTS) {
 				const bodyText = await readErrorBody(upstream, state.streamStallTimeoutMs);
@@ -1172,6 +1256,11 @@ async function handleRequestInner(
 					parseRetryAfterHeaderMs(upstream.headers, state.now()) ??
 					parseRetryAfterBodyMs(bodyText, state.now()) ??
 					60_000;
+				state.preemptiveQuotaScheduler.markRateLimited(
+					quotaScheduleKey,
+					retryAfterMs,
+					state.now(),
+				);
 				// A 429 is the upstream quota signal for the attempted account, so
 				// keep the consumed runtime token drained.
 				accountManager.recordRateLimit(refreshed.account, context.family, context.model);
@@ -1298,13 +1387,20 @@ async function handleRequestInner(
 					// account's token from the same IP triggers OpenAI's anti-abuse
 					// detection and invalidates them in sequence. Return the 401 directly
 					// rather than rotating so the client can prompt for re-login.
+					accountManager.markAuthInvalidated(
+						refreshed.account,
+						extractErrorCodeFromBody(bodyText) ?? "token_invalidated",
+					);
 					applyMonotonicAuthCooldown(
 						accountManager,
 						refreshed.account,
 						state.tokenInvalidationCooldownMs,
 					);
 					state.sessionAffinityStore?.forgetSession(context.sessionKey);
-					accountManager.saveToDiskDebounced();
+					// The invalidation marker must be durable before returning the 401.
+					// A delayed save would allow a proxy restart to reload and route the
+					// revoked account again.
+					await accountManager.saveToDisk();
 					// Emit the same machine-readable shape as the refresh-failure path
 					// (code: "token_invalidated") instead of forwarding the raw upstream
 					// body, so the client contract is consistent across both vectors.
@@ -1387,11 +1483,13 @@ async function handleRequestInner(
 			// the forecast keeps reporting this working account as unavailable.
 			// No-op when no reason is recorded, so the hot path stays write-free.
 			recordRuntimeAccountRecovery(refreshed.account.index);
-			const nearExhaustionWaitMs = getQuotaNearExhaustionWaitMs(
-				upstream.headers,
-				state.quotaRemainingPercentThreshold,
+			const quotaDeferral = state.preemptiveQuotaScheduler.getDeferral(
+				quotaScheduleKey,
 				state.now(),
 			);
+			const nearExhaustionWaitMs = quotaDeferral.defer
+				? quotaDeferral.waitMs
+				: 0;
 			if (nearExhaustionWaitMs > 0) {
 				accountManager.markRateLimitedWithReason(
 					refreshed.account,

@@ -25,7 +25,10 @@ import {
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { RUNTIME_ROTATION_PROXY_PROVIDER_ID } from "../lib/runtime-constants.js";
+import {
+	APP_RUNTIME_HELPER_OWNER_FILE,
+	RUNTIME_ROTATION_PROXY_PROVIDER_ID,
+} from "../lib/runtime-constants.js";
 import { sleep } from "../lib/utils.js";
 import { resolveRealCodexBin } from "../scripts/codex-bin-resolver.js";
 
@@ -493,11 +496,10 @@ function createPathDiscoveredNativeCodexFixture(rootDir: string): {
 			"utf8",
 		);
 		const nativeExePath = join(binDir, "codex.exe");
-		try {
-			linkSync(process.execPath, nativeExePath);
-		} catch {
-			copyFileSync(process.execPath, nativeExePath);
-		}
+		// A hard link to the test runner's node.exe cannot be removed on Windows
+		// while this process is still running. Use an independent image so the
+		// fixture teardown exercises the resolver without leaking a locked file.
+		copyFileSync(process.execPath, nativeExePath);
 		return {
 			binDir,
 			args: [scriptPath, "--version"],
@@ -2403,7 +2405,7 @@ describe("codex bin wrapper", () => {
 		expect(existsSync(markerPath)).toBe(false);
 	});
 
-	it("starts an automatic runtime rotation helper for codex app launches", async () => {
+	it("starts an automatic helper and retries transient app-server shim file operations", async () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
@@ -2475,6 +2477,9 @@ describe("codex bin wrapper", () => {
 			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
 			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "1000",
 			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			CODEX_MULTI_AUTH_TEST_FORCE_APP_SERVER_SHIM_COPY: "1",
+			CODEX_MULTI_AUTH_TEST_APP_SERVER_SHIM_FILE_CLEANUP_BUSY_FAILURES: "2",
+			CODEX_MULTI_AUTH_TEST_APP_SERVER_SHIM_COPY_BUSY_FAILURES: "2",
 			CODEX_MULTI_AUTH_TEST_PROXY_LAST_ACCOUNT_INDEX: "1",
 			CODEX_MULTI_AUTH_TEST_PROXY_LAST_ACCOUNT_LABEL:
 				"Account 2 (second@example.com, id:second)",
@@ -2559,6 +2564,124 @@ describe("codex bin wrapper", () => {
 			expect(existsSync(cliPathMatch[1])).toBe(false);
 		}
 	});
+
+	it("keeps concurrent app-helper owner metadata isolated by helper PID", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"setTimeout(() => process.exit(0), 2000);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const children = [1, 2].map(() =>
+			spawn(
+				process.execPath,
+				[join(fixtureRoot, "scripts", "codex.js"), "app", "."],
+				{
+					env: buildWrapperEnv({
+						CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+						CODEX_HOME: originalHome,
+						CODEX_MULTI_AUTH_DIR: multiAuthDir,
+						CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+						CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+					}),
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			),
+		);
+		for (const child of children) {
+			child.stdout?.resume();
+			child.stderr?.resume();
+		}
+
+		const waitForClose = (child: (typeof children)[number]) => {
+			if (child.exitCode !== null || child.signalCode !== null) {
+				return Promise.resolve();
+			}
+			return new Promise<void>((resolve) => {
+				const timer = setTimeout(resolve, 2_000);
+				child.once("close", () => {
+					clearTimeout(timer);
+					resolve();
+				});
+			});
+		};
+
+		let ownerFiles: string[] = [];
+		try {
+			const ownerFilePrefix = APP_RUNTIME_HELPER_OWNER_FILE.replace(
+				/\.json$/i,
+				"",
+			);
+			const ownerFilePattern = new RegExp(
+				`^${ownerFilePrefix}\\.(\\d+)\\.json$`,
+			);
+			const deadline = Date.now() + 5_000;
+			while (Date.now() < deadline) {
+				ownerFiles = existsSync(multiAuthDir)
+					? readdirSync(multiAuthDir).filter((name) =>
+							ownerFilePattern.test(name),
+						)
+					: [];
+				if (ownerFiles.length >= 2) break;
+				await sleep(25);
+			}
+
+			expect(ownerFiles).toHaveLength(2);
+			const ownerRecords = ownerFiles.map((name) =>
+				JSON.parse(readFileSync(join(multiAuthDir, name), "utf8")),
+			) as Array<{
+				identityToken: string;
+				launcherPid: number;
+			}>;
+			expect(new Set(ownerRecords.map((owner) => owner.identityToken)).size).toBe(
+				2,
+			);
+			expect(new Set(ownerRecords.map((owner) => owner.launcherPid)).size).toBe(2);
+			expect(
+				existsSync(join(multiAuthDir, APP_RUNTIME_HELPER_OWNER_FILE)),
+			).toBe(false);
+		} finally {
+			for (const child of children) {
+				try {
+					child.kill("SIGTERM");
+				} catch {
+					// The wrapper may already have exited after a failed launch.
+				}
+			}
+			await Promise.all(children.map(waitForClose));
+
+			const helperPids = new Set<number>();
+			for (const name of ownerFiles) {
+				const match = /\.(\d+)\.json$/i.exec(name);
+				if (match?.[1]) helperPids.add(Number(match[1]));
+			}
+			for (const pid of helperPids) {
+				try {
+					process.kill(pid, "SIGTERM");
+				} catch {
+					// The helper may have stopped with its launcher.
+				}
+			}
+			await sleep(500);
+			for (const pid of helperPids) {
+				if (!isProcessAlive(pid)) continue;
+				try {
+					process.kill(pid, "SIGKILL");
+				} catch {
+					// Best-effort cleanup for the detached fixture.
+				}
+			}
+		}
+	}, 15_000);
 
 	it("sweeps stale app-server shim directories when a helper starts", async () => {
 		const fixtureRoot = createWrapperFixture();

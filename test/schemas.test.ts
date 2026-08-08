@@ -205,6 +205,20 @@ describe("AccountMetadataV3Schema", () => {
 		expect(result.success).toBe(true);
 	});
 
+	it.each([
+		["zero", 0],
+		["negative", -1],
+		["NaN", Number.NaN],
+		["infinity", Number.POSITIVE_INFINITY],
+	] as const)("rejects %s auth invalidation timestamps", (_label, timestamp) => {
+		const result = AccountMetadataV3Schema.safeParse({
+			...validAccount,
+			authInvalidatedAt: timestamp,
+			authInvalidationErrorCode: "oauth_token_revoked",
+		});
+		expect(result.success).toBe(false);
+	});
+
 	it("rejects empty refreshToken", () => {
 		const result = AccountMetadataV3Schema.safeParse({
 			...validAccount,

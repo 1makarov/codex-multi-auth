@@ -22,6 +22,8 @@ export interface RateLimitStateV3 {
 }
 
 export interface AccountMetadataV3 {
+	/** Stable per-record identity used for runtime quota state. */
+	recordId?: string;
 	accountId?: string;
 	accountIdSource?: AccountIdSource;
 	accountLabel?: string;
@@ -44,6 +46,10 @@ export interface AccountMetadataV3 {
 	rateLimitResetTimes?: RateLimitStateV3;
 	coolingDownUntil?: number;
 	cooldownReason?: CooldownReason;
+	/** Timestamp of the last explicit upstream OAuth-token invalidation. */
+	authInvalidatedAt?: number;
+	/** Stable provider/client error code associated with the invalidation. */
+	authInvalidationErrorCode?: string;
 	workspaces?: Workspace[];
 	currentWorkspaceIndex?: number;
 }

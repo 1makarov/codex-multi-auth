@@ -8,6 +8,7 @@ import {
 import { runCodexMultiAuthCli } from "../lib/codex-manager.js";
 import type { AccountStorageV3, StorageHealthSummary } from "../lib/storage.js";
 import type { RuntimeObservabilitySnapshot } from "../lib/runtime/runtime-observability.js";
+import { AUTH_INVALIDATION_MARKER } from "../lib/accounts.js";
 
 function createStorage(): AccountStorageV3 {
 	return {
@@ -206,6 +207,27 @@ describe("runStatusCommand", () => {
 			expect.stringContaining(
 				"2. Account 2 (two@example.com) [disabled, rate-limited]",
 			),
+		);
+	});
+
+	it("surfaces the persisted token invalidation marker", async () => {
+		const deps = createStatusDeps({
+			loadAccounts: vi.fn(async () => ({
+				...createStorage(),
+				accounts: [
+					{
+						...createStorage().accounts[0],
+						authInvalidatedAt: 1_000,
+						authInvalidationErrorCode: "token_invalidated",
+					},
+				],
+			})),
+		});
+
+		await runStatusCommand(deps);
+
+		expect(deps.logInfo).toHaveBeenCalledWith(
+			expect.stringContaining(AUTH_INVALIDATION_MARKER),
 		);
 	});
 

@@ -108,6 +108,7 @@ import {
 import { getNamedBackupsEntry } from "./storage/named-backups-entry.js";
 import {
 	getStoragePathState,
+	setStoragePathDirectState,
 	setStoragePathState,
 } from "./storage/path-state.js";
 import {
@@ -606,7 +607,7 @@ export function setStoragePath(projectPath: string | null): void {
 }
 
 export function setStoragePathDirect(path: string | null): void {
-	setStoragePathState({
+	setStoragePathDirectState({
 		currentStoragePath: path,
 		currentLegacyProjectStoragePath: null,
 		currentLegacyWorktreeStoragePath: null,
@@ -1204,12 +1205,27 @@ export function normalizeAccountStorage(
 	// transforms — most importantly the scalar `rateLimitResetTime` -> map
 	// `rateLimitResetTimes` conversion — so a rate-limited V1 account would be
 	// treated as immediately available on upgrade and burst 429s (stress audit M3).
-	const validAccounts = baseStorage.accounts.filter(
-		(account): account is AccountMetadataV3 =>
-			isRecord(account) &&
-			typeof account.refreshToken === "string" &&
-			!!account.refreshToken.trim(),
-	);
+	const validAccounts = baseStorage.accounts
+		.filter(
+			(account): account is AccountMetadataV3 =>
+				isRecord(account) &&
+				typeof account.refreshToken === "string" &&
+				!!account.refreshToken.trim(),
+		)
+		.map((account) => {
+			const invalidationTimestamp = account.authInvalidatedAt;
+			if (
+				typeof invalidationTimestamp === "number" &&
+				Number.isFinite(invalidationTimestamp) &&
+				invalidationTimestamp > 0
+			) {
+				return account;
+			}
+			const normalized = { ...account };
+			delete normalized.authInvalidatedAt;
+			delete normalized.authInvalidationErrorCode;
+			return normalized;
+		});
 
 	const deduplicatedAccounts = deduplicateAccounts(validAccounts);
 

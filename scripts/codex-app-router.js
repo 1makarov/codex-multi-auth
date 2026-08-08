@@ -36,6 +36,7 @@ function parseArgs(argv) {
 		host: "127.0.0.1",
 		port: 0,
 		statusPath: "",
+		identityToken: "",
 		statePath: "",
 		logPath: "",
 		maxLogBytes: DEFAULT_MAX_LOG_BYTES,
@@ -55,6 +56,11 @@ function parseArgs(argv) {
 		}
 		if (arg === "--status") {
 			result.statusPath = next;
+			index += 1;
+			continue;
+		}
+		if (arg === "--identity-token") {
+			result.identityToken = next;
 			index += 1;
 			continue;
 		}
@@ -133,7 +139,16 @@ function writeStatus(statusPath, payload) {
 	}
 }
 
-function createStatusPayload({ state, proxyServer, error, stateRecord }) {
+function createStatusPayload({
+	state,
+	proxyServer,
+	error,
+	stateRecord,
+	startedAt,
+	statusPath,
+	routerScriptPath,
+	identityToken,
+}) {
 	const proxyStatus =
 		typeof proxyServer?.getStatus === "function" ? proxyServer.getStatus() : {};
 	const lastAccountIndex = proxyStatus.lastAccountIndex ?? null;
@@ -149,6 +164,15 @@ function createStatusPayload({ state, proxyServer, error, stateRecord }) {
 		kind: "codex-app-runtime-rotation-router",
 		state,
 		pid: process.pid,
+		startedAt,
+		statusPath: statusPath || readTrimmedString(stateRecord, "statusPath") || null,
+		identityToken:
+			identityToken || readTrimmedString(stateRecord, "identityToken") || null,
+		routerScriptPath:
+			routerScriptPath ||
+			readTrimmedString(stateRecord, "routerScriptPath") ||
+			process.argv[1] ||
+			null,
 		updatedAt: Date.now(),
 		baseUrl: proxyServer?.baseUrl ?? stateRecord?.baseUrl ?? null,
 		totalRequests: proxyStatus.totalRequests ?? 0,
@@ -232,6 +256,7 @@ function installLogBounds(maxBytes, logPath) {
 }
 
 async function main() {
+	const routerStartedAt = Date.now();
 	const args = parseArgs(process.argv.slice(2));
 	installLogBounds(args.maxLogBytes, args.logPath).unref?.();
 	const stateRecord = readState(args.statePath);
@@ -241,7 +266,16 @@ async function main() {
 		);
 		writeStatus(
 			args.statusPath,
-			createStatusPayload({ state: "error", proxyServer: null, error, stateRecord: null }),
+			createStatusPayload({
+				state: "error",
+				proxyServer: null,
+				error,
+				stateRecord: null,
+				startedAt: routerStartedAt,
+				statusPath: args.statusPath,
+				routerScriptPath: process.argv[1],
+				identityToken: args.identityToken,
+			}),
 		);
 		throw error;
 	}
@@ -272,7 +306,17 @@ async function main() {
 	const writeCurrentStatus = (state, error) => {
 		writeStatus(
 			args.statusPath || stateRecord?.statusPath || "",
-			createStatusPayload({ state, proxyServer, error, stateRecord }),
+			createStatusPayload({
+				state,
+				proxyServer,
+				error,
+				stateRecord,
+				startedAt: routerStartedAt,
+				statusPath: args.statusPath || stateRecord?.statusPath || "",
+				routerScriptPath: stateRecord?.routerScriptPath || process.argv[1],
+				identityToken:
+					args.identityToken || stateRecord?.identityToken || "",
+			}),
 		);
 	};
 

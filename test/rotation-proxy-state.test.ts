@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AccountManager } from "../lib/accounts.js";
+import { PreemptiveQuotaScheduler } from "../lib/preemptive-quota-scheduler.js";
 import type { RotationProxyStateInit } from "../lib/runtime/rotation-proxy-state.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 
@@ -63,6 +64,7 @@ function stateInit(): RotationProxyStateInit {
 		maxRuntimeAccountAttempts: 3,
 		maxRequestBodyBytes: 1024,
 		quotaRemainingPercentThreshold: 0,
+		preemptiveQuotaScheduler: new PreemptiveQuotaScheduler(),
 		sessionAffinityStore: null,
 		lastObservedAffinityGeneration: 0,
 		forcedAccountIndex: null,

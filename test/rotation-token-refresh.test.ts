@@ -38,7 +38,10 @@ const FAMILY = "gpt-5-codex" as const;
 const SKEW_MS = 30_000;
 const INVALIDATION_COOLDOWN_MS = 300_000;
 
-function storageWith(expiresAt: number): AccountStorageV3 {
+function storageWith(
+	expiresAt: number,
+	accountOverrides: Partial<AccountStorageV3["accounts"][number]> = {},
+): AccountStorageV3 {
 	return {
 		version: 3,
 		activeIndex: 0,
@@ -53,6 +56,7 @@ function storageWith(expiresAt: number): AccountStorageV3 {
 				addedAt: NOW - 60_000,
 				lastUsed: NOW - 60_000,
 				enabled: true,
+				...accountOverrides,
 			},
 		],
 	};
@@ -64,8 +68,14 @@ const STALE_EXPIRES = NOW + 10_000;
 
 const openManagers: AccountManager[] = [];
 
-function managerWith(expiresAt: number): AccountManager {
-	const accountManager = new AccountManager(undefined, storageWith(expiresAt));
+function managerWith(
+	expiresAt: number,
+	accountOverrides: Partial<AccountStorageV3["accounts"][number]> = {},
+): AccountManager {
+	const accountManager = new AccountManager(
+		undefined,
+		storageWith(expiresAt, accountOverrides),
+	);
 	openManagers.push(accountManager);
 	return accountManager;
 }
@@ -245,6 +255,51 @@ describe("ensureFreshAccessToken", () => {
 		expect(coolingDownUntil).toBeGreaterThan(
 			NOW + INVALIDATION_COOLDOWN_MS - 10_000,
 		);
+		expect(accountManager.getAccountByIndex(0)).toMatchObject({
+			authInvalidatedAt: expect.any(Number),
+			authInvalidationErrorCode: "token_invalidated",
+		});
+		expect(
+			accountManager.isAccountAvailableForFamily(0, FAMILY, "gpt-5-codex"),
+		).toBe(false);
+	});
+
+	it("persists the invalidation marker until a successful refresh clears it", async () => {
+		let persisted: AccountStorageV3 | undefined;
+		withAccountStorageTransactionMock.mockImplementation(async (handler) =>
+			handler(null, async (nextStorage: AccountStorageV3) => {
+				persisted = structuredClone(nextStorage);
+			}),
+		);
+		const accountManager = managerWith(STALE_EXPIRES);
+		queuedRefreshMock.mockResolvedValue({
+			type: "failed",
+			reason: "http_error",
+			statusCode: 401,
+			message: "OAuth token has been invalidated",
+		});
+
+		await ensureFreshAccessToken(refreshParams(accountManager));
+		await accountManager.flushPendingSave();
+
+		expect(persisted?.accounts[0]).toMatchObject({
+			authInvalidatedAt: expect.any(Number),
+			authInvalidationErrorCode: "token_invalidated",
+		});
+
+		queuedRefreshMock.mockResolvedValue({
+			type: "success",
+			access: "access-recovered",
+			refresh: "refresh-recovered",
+			expires: NOW + 7_200_000,
+		});
+		const refreshed = await ensureFreshAccessToken(refreshParams(accountManager));
+
+		expect(refreshed).toMatchObject({ ok: true, accessToken: "access-recovered" });
+		expect(accountManager.getAccountByIndex(0)?.authInvalidatedAt).toBeUndefined();
+		expect(
+			accountManager.getAccountByIndex(0)?.authInvalidationErrorCode,
+		).toBeUndefined();
 	});
 
 	it("never lets a later generic failure truncate an invalidation cooldown", async () => {

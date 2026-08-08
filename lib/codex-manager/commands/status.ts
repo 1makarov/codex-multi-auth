@@ -1,4 +1,5 @@
 import {
+	AUTH_INVALIDATION_MARKER,
 	formatAccountLabel,
 	formatCooldown,
 	formatWaitTime,
@@ -87,6 +88,12 @@ function buildAccountMarkers(
 	const markers: string[] = [];
 	markers.push(...resolveAccountCurrentMarkers(index, activeIndex, runtimeCurrent));
 	if (account.enabled === false) markers.push("disabled");
+	if (
+		typeof account.authInvalidatedAt === "number" &&
+		Number.isFinite(account.authInvalidatedAt)
+	) {
+		markers.push(AUTH_INVALIDATION_MARKER);
+	}
 	if (formatRateLimitEntry(account, now, "codex")) markers.push("rate-limited");
 	const quotaEntry = findQuotaCacheEntryForAccount(quotaCache, account, allAccounts);
 	if (quotaEntry?.status === 429 && !markers.some(isRateLimitedMarker)) {

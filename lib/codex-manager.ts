@@ -1,4 +1,6 @@
 import {
+	AUTH_INVALIDATION_MARKER,
+	AccountManager,
 	extractAccountEmail,
 	extractAccountId,
 	formatAccountLabel,
@@ -61,6 +63,11 @@ import {
 	getTokenTracker,
 	selectHybridAccountTraced,
 } from "./rotation.js";
+import {
+	evaluateRuntimePolicy,
+	loadRuntimePolicyState,
+} from "./policy/runtime-policy.js";
+import { CURRENT_CODEX_MODEL } from "./request/helpers/model-map.js";
 import {
 	runDoctor as runRepairDoctor,
 	type RepairCommandDeps,
@@ -387,40 +394,79 @@ export async function autoSyncActiveAccountToCodex(): Promise<boolean> {
 		...(syncIdToken ? { idToken: syncIdToken } : {}),
 	});
 }
-function buildSelectAccountTraced(): (
+/** @internal Exposed for diagnostics regression tests; not part of the CLI API. */
+export function buildSelectAccountTraced(): (
 	storage: AccountStorageV3,
-) => ReturnType<typeof selectHybridAccountTraced> {
-	return (storage: AccountStorageV3) => {
+) => Promise<ReturnType<typeof selectHybridAccountTraced>> {
+	return async (storage: AccountStorageV3) => {
 		const now = Date.now();
 		const healthTracker = getHealthTracker();
 		const tokenTracker = getTokenTracker();
+		const runtimeAccountManager = new AccountManager(undefined, storage);
+		const runtimeAccountsByIndex = new Map(
+			runtimeAccountManager
+				.getAccountsSnapshot()
+				.map((account) => [account.index, account] as const),
+		);
 		const accountsWithMetrics: AccountWithMetrics[] = storage.accounts.map(
 			(account, index) => {
-				const enabled = account?.enabled !== false;
-				const rateLimits = account?.rateLimitResetTimes ?? {};
-				let rateLimited = false;
-				for (const value of Object.values(rateLimits)) {
-					if (typeof value === "number" && value > now) {
-						rateLimited = true;
-						break;
-					}
-				}
-				const coolingDown =
-					typeof account?.coolingDownUntil === "number" &&
-					account.coolingDownUntil > now;
-				const isAvailable = enabled && !rateLimited && !coolingDown;
+				const runtimeAccount = runtimeAccountsByIndex.get(index);
+				const runtimeSkipReason = runtimeAccount
+					? runtimeAccountManager.getManagedAccountRuntimeSkipReason(
+							runtimeAccount,
+							"codex",
+							CURRENT_CODEX_MODEL,
+						)
+					: "missing";
 				return {
 					index,
 					trackerKey: account?.accountId ?? index,
-					isAvailable,
+					isAvailable: runtimeSkipReason === null,
+					unavailableReason: runtimeSkipReason ?? undefined,
 					lastUsed: account?.lastUsed ?? 0,
 				};
 			},
 		);
+		const policyState = await loadRuntimePolicyState();
+		const policy = await evaluateRuntimePolicy({
+			state: policyState,
+			accounts: storage.accounts.map((account, index) => ({
+				index,
+				accountId: account.accountId,
+				email: account.email,
+			})),
+			model: CURRENT_CODEX_MODEL,
+			now,
+		});
+		const blockedAccountIndexes = new Set(policy.blockedAccountIndexes);
+		const blockedReasonByAccount = {
+			...(policy.blockedAccountReasons ?? {}),
+		};
+		if (!policy.allowed) {
+			for (const { index } of accountsWithMetrics) {
+				blockedAccountIndexes.add(index);
+				blockedReasonByAccount[index] =
+					policy.errorCode ?? "policy-blocked";
+			}
+		}
+		for (const [index, account] of storage.accounts.entries()) {
+			if (
+				typeof account.authInvalidatedAt === "number" &&
+				Number.isFinite(account.authInvalidatedAt)
+			) {
+				blockedAccountIndexes.add(index);
+				blockedReasonByAccount[index] = AUTH_INVALIDATION_MARKER;
+			}
+		}
 		return selectHybridAccountTraced({
 			accounts: accountsWithMetrics,
 			healthTracker,
 			tokenTracker,
+			options: {
+				blockedAccountIndexes,
+				blockedReasonByAccount,
+				scoreBoostByAccount: policy.scoreBoostByAccount,
+			},
 		});
 	};
 }

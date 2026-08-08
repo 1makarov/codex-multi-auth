@@ -158,6 +158,8 @@ export function chooseAccount(params: {
 			...(policy?.scoreBoostByAccount ?? {}),
 			...(stickyBoostByAccount ?? {}),
 		},
+		blockedAccountIndexes: policy?.blockedAccountIndexes,
+		blockedReasonByAccount: policy?.blockedAccountReasons,
 		// accounts-05: carry the PID-offset distribution into the default-on proxy
 		// path too (index.ts already does). Without it, parallel proxy processes can
 		// stampede the same account instead of spreading across the pool.

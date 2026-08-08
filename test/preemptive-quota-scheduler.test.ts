@@ -257,6 +257,40 @@ describe("preemptive quota scheduler", () => {
 		});
 	});
 
+	it("falls back to the configured cap for a future-dated snapshot", () => {
+		const maxDeferralMs = 30 * 60_000;
+		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs });
+		const now = 1_000_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: { usedPercent: 100, resetAtMs: now + 60 * 60_000 },
+			secondary: {},
+			updatedAt: now + 1,
+		});
+
+		expect(scheduler.getDeferral("acc:model", now)).toEqual({
+			defer: true,
+			waitMs: maxDeferralMs,
+			reason: "quota-near-exhaustion",
+		});
+	});
+
+	it("does not re-defer an exhausted window after its reset has passed", () => {
+		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs: 30 * 60_000 });
+		const now = 1_000_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: { usedPercent: 100, resetAtMs: now - 1_000 },
+			secondary: { usedPercent: 20, resetAtMs: now + 7 * 24 * 60 * 60_000 },
+			updatedAt: now - 500,
+		});
+
+		expect(scheduler.getDeferral("acc:model", now)).toEqual({
+			defer: false,
+			waitMs: 0,
+		});
+	});
+
 	it("prunes expired snapshots", () => {
 		const scheduler = new PreemptiveQuotaScheduler();
 		scheduler.update("a", {

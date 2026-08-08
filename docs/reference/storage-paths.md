@@ -40,6 +40,7 @@ Override root:
 | Local bridge client tokens | `~/.codex/multi-auth/local-client-tokens.json` |
 | Cross-process refresh leases | `~/.codex/multi-auth/refresh-leases/` |
 | Runtime app helper status | `~/.codex/multi-auth/runtime-rotation-app-helper.json` |
+| Runtime app helper owner metadata | `~/.codex/multi-auth/runtime-rotation-app-helper-owner.<pid>.json` |
 | Persistent app bind directory | `~/.codex/multi-auth/app-bind/` |
 | Named pool backups | `~/.codex/multi-auth/backups/` |
 | Per-project account pools | `~/.codex/multi-auth/projects/<project-key>/openai-codex-accounts.json` |

@@ -80,6 +80,8 @@ const APP_SERVER_CONFIG_ARGS_ENV =
 	"CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON";
 const APP_RUNTIME_HELPER_STATUS_FILE =
 	RUNTIME_CONSTANTS.APP_RUNTIME_HELPER_STATUS_FILE;
+const APP_RUNTIME_HELPER_OWNER_FILE =
+	RUNTIME_CONSTANTS.APP_RUNTIME_HELPER_OWNER_FILE;
 const DEFAULT_APP_RUNTIME_HELPER_IDLE_MS = 12 * 60 * 60 * 1000;
 const DEFAULT_APP_RUNTIME_HELPER_DETACH_GRACE_MS = 5_000;
 const APP_RUNTIME_HELPER_LAUNCH_TIMEOUT_MS = 15_000;
@@ -110,6 +112,17 @@ let shadowHomeSyncLockOwnerWriteFailuresRemaining = Number.parseInt(
 	process.env.CODEX_MULTI_AUTH_TEST_SHADOW_LOCK_OWNER_WRITE_FAILURES ?? "0",
 	10,
 );
+let appServerShimFileCleanupBusyFailuresRemaining =
+	Number.parseInt(
+		process.env.CODEX_MULTI_AUTH_TEST_APP_SERVER_SHIM_FILE_CLEANUP_BUSY_FAILURES ??
+			"0",
+		10,
+	) || 0;
+let appServerShimCopyBusyFailuresRemaining =
+	Number.parseInt(
+		process.env.CODEX_MULTI_AUTH_TEST_APP_SERVER_SHIM_COPY_BUSY_FAILURES ?? "0",
+		10,
+	) || 0;
 const shadowHomeCleanupRetryMarkerDir =
 	(process.env.CODEX_MULTI_AUTH_TEST_SHADOW_RETRY_MARKER_DIR ?? "").trim();
 let warnedInvalidRuntimeRotationProxyEnv = false;
@@ -122,6 +135,7 @@ async function loadRuntimeConstants() {
 	const fallback = {
 		RUNTIME_ROTATION_PROXY_PROVIDER_ID: `${APP_SERVER_ACCOUNT_DISPLAY_NAME}-runtime-proxy`,
 		APP_RUNTIME_HELPER_STATUS_FILE: "runtime-rotation-app-helper.json",
+		APP_RUNTIME_HELPER_OWNER_FILE: "runtime-rotation-app-helper-owner.json",
 	};
 	try {
 		const mod = await import("../dist/lib/runtime-constants.js");
@@ -134,6 +148,10 @@ async function loadRuntimeConstants() {
 				typeof mod.APP_RUNTIME_HELPER_STATUS_FILE === "string"
 					? mod.APP_RUNTIME_HELPER_STATUS_FILE
 					: fallback.APP_RUNTIME_HELPER_STATUS_FILE,
+			APP_RUNTIME_HELPER_OWNER_FILE:
+				typeof mod.APP_RUNTIME_HELPER_OWNER_FILE === "string"
+					? mod.APP_RUNTIME_HELPER_OWNER_FILE
+					: fallback.APP_RUNTIME_HELPER_OWNER_FILE,
 		};
 	} catch {
 		// Keep wrapper startup resilient when dist has not been built yet.
@@ -169,6 +187,39 @@ function removeDirectoryWithRetry(targetPath) {
 			sleepSync(SHADOW_HOME_CLEANUP_BACKOFF_MS[attempt]);
 		}
 	}
+}
+
+function withSynchronousFileOperationRetry(operation) {
+	for (
+		let attempt = 0;
+		attempt <= SHADOW_HOME_CLEANUP_BACKOFF_MS.length;
+		attempt += 1
+	) {
+		try {
+			return operation();
+		} catch (error) {
+			if (
+				!isRetryableShadowHomeCleanupError(error) ||
+				attempt === SHADOW_HOME_CLEANUP_BACKOFF_MS.length
+			) {
+				throw error;
+			}
+			sleepSync(SHADOW_HOME_CLEANUP_BACKOFF_MS[attempt]);
+		}
+	}
+}
+
+function maybeThrowSimulatedAppServerShimFileError(kind) {
+	const remaining =
+		kind === "copy"
+			? appServerShimCopyBusyFailuresRemaining
+			: appServerShimFileCleanupBusyFailuresRemaining;
+	if (remaining <= 0) return;
+	if (kind === "copy") appServerShimCopyBusyFailuresRemaining -= 1;
+	else appServerShimFileCleanupBusyFailuresRemaining -= 1;
+	const error = new Error(`simulated app-server shim ${kind} EBUSY`);
+	error.code = "EBUSY";
+	throw error;
 }
 
 /**
@@ -3653,14 +3704,35 @@ function installRuntimeRotationAppServerCliShim(forwardedEnv, configArgs = []) {
 	const preloadPath = join(shimDir, "codex-multi-auth-app-server-preload.mjs");
 	try {
 		try {
-			rmSync(executablePath, { force: true });
+			withSynchronousFileOperationRetry(() => {
+				maybeThrowSimulatedAppServerShimFileError("cleanup");
+				rmSync(executablePath, { force: true });
+			});
 		} catch {
-			// Best-effort stale shim cleanup only.
+			// Best-effort stale shim cleanup only; the copy below will report a
+			// persistent failure without leaving a partially-created helper.
 		}
-		try {
-			linkSync(process.execPath, executablePath);
-		} catch {
-			copyFileSync(process.execPath, executablePath);
+		if (
+			process.platform === "win32" ||
+			(process.env.CODEX_MULTI_AUTH_TEST_FORCE_APP_SERVER_SHIM_COPY ?? "") === "1"
+		) {
+			// A Windows hard link to the running node.exe remains locked by the
+			// helper process itself, which prevents the shim directory from being
+			// removed during graceful helper shutdown. Use an independent image so
+			// the helper can clean up its app-server shim before exiting.
+			withSynchronousFileOperationRetry(() => {
+				maybeThrowSimulatedAppServerShimFileError("copy");
+				copyFileSync(process.execPath, executablePath);
+			});
+		} else {
+			try {
+				linkSync(process.execPath, executablePath);
+			} catch {
+				withSynchronousFileOperationRetry(() => {
+					maybeThrowSimulatedAppServerShimFileError("copy");
+					copyFileSync(process.execPath, executablePath);
+				});
+			}
 		}
 		if (process.platform !== "win32") {
 			chmodSync(executablePath, 0o755);
@@ -3702,6 +3774,19 @@ function resolveRuntimeRotationAppHelperStatusPath(env = process.env) {
 	const multiAuthDir =
 		resolveOriginalMultiAuthDir(env) ?? join(resolveCodexHomeDir(env), "multi-auth");
 	return join(multiAuthDir, APP_RUNTIME_HELPER_STATUS_FILE);
+}
+
+function resolveRuntimeRotationAppHelperOwnerPath(env = process.env, helperPid) {
+	const multiAuthDir =
+		resolveOriginalMultiAuthDir(env) ?? join(resolveCodexHomeDir(env), "multi-auth");
+	const ownerFileName =
+		typeof helperPid === "number" && Number.isInteger(helperPid) && helperPid > 0
+			? APP_RUNTIME_HELPER_OWNER_FILE.replace(
+					/\.json$/i,
+					`.${helperPid}.json`,
+				)
+			: APP_RUNTIME_HELPER_OWNER_FILE;
+	return join(multiAuthDir, ownerFileName);
 }
 
 function writeOwnerOnlyJsonFileAtomicSync(targetPath, payload) {
@@ -3816,9 +3901,38 @@ function writeRuntimeRotationAppHelperStatus(payload, env = process.env) {
 	}
 }
 
+function writeRuntimeRotationAppHelperOwner(
+	identityToken,
+	helperPid,
+	env = process.env,
+) {
+	if (
+		typeof helperPid !== "number" ||
+		!Number.isInteger(helperPid) ||
+		helperPid < 1
+	) {
+		return;
+	}
+	try {
+		writeOwnerOnlyJsonFileAtomicSync(
+			resolveRuntimeRotationAppHelperOwnerPath(env, helperPid),
+			{
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper-owner",
+				identityToken,
+				launcherPid: process.pid,
+				createdAt: Date.now(),
+			},
+		);
+	} catch {
+		// Best-effort metadata; an unavailable owner file must never stop the helper.
+	}
+}
+
 function createRuntimeRotationAppHelperStatus({
 	proxyServer,
 	startedAt,
+	identityToken,
 	idleTimeoutMs,
 	lastActivityAt,
 	state,
@@ -3838,6 +3952,8 @@ function createRuntimeRotationAppHelperStatus({
 		kind: "codex-app-runtime-rotation-helper",
 		state,
 		pid: process.pid,
+		scriptPath: process.argv[1] ?? null,
+		identityToken: identityToken || null,
 		startedAt,
 		updatedAt: Date.now(),
 		baseUrl: proxyServer?.baseUrl ?? null,
@@ -3855,7 +3971,7 @@ function createRuntimeRotationAppHelperStatus({
 	};
 }
 
-async function runRuntimeRotationAppHelper() {
+async function runRuntimeRotationAppHelper(identityToken = "") {
 	let proxyServer = null;
 	let runtimeContext = null;
 	let appServerShimDir = null;
@@ -3872,6 +3988,7 @@ async function runRuntimeRotationAppHelper() {
 			createRuntimeRotationAppHelperStatus({
 				proxyServer,
 				startedAt,
+				identityToken,
 				idleTimeoutMs,
 				lastActivityAt,
 				state,
@@ -4066,25 +4183,32 @@ function startRuntimeRotationAppHelper(baseContext, options = {}) {
 		let stdoutBuffer = "";
 		let stderrBuffer = "";
 		let settled = false;
+		const identityToken = randomBytes(24).toString("hex");
+		const helperEnv = {
+			...baseContext.env,
+			CODEX_MULTI_AUTH_DIR: resolveRuntimeRotationOriginalMultiAuthDir(
+				realCodexHome,
+				baseContext.env,
+			),
+			[APP_RUNTIME_HELPER_OWNER_PID_ENV]: String(process.pid),
+			[APP_RUNTIME_HELPER_REAL_CODEX_HOME_ENV]: realCodexHome,
+			[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV]:
+				options.useCanonicalHome === true ? "1" : "0",
+		};
 		const helper = spawn(
 			process.execPath,
-			[fileURLToPath(import.meta.url), INTERNAL_RUNTIME_ROTATION_APP_HELPER_ARG],
+			[
+				fileURLToPath(import.meta.url),
+				INTERNAL_RUNTIME_ROTATION_APP_HELPER_ARG,
+				identityToken,
+			],
 			{
-				env: {
-					...baseContext.env,
-					CODEX_MULTI_AUTH_DIR: resolveRuntimeRotationOriginalMultiAuthDir(
-						realCodexHome,
-						baseContext.env,
-					),
-					[APP_RUNTIME_HELPER_OWNER_PID_ENV]: String(process.pid),
-					[APP_RUNTIME_HELPER_REAL_CODEX_HOME_ENV]: realCodexHome,
-					[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV]:
-						options.useCanonicalHome === true ? "1" : "0",
-				},
+				env: helperEnv,
 				stdio: ["ignore", "pipe", "pipe"],
 				detached: true,
 			},
 		);
+		writeRuntimeRotationAppHelperOwner(identityToken, helper.pid, helperEnv);
 		let timeout = null;
 		const finish = (result) => {
 			if (settled) return;
@@ -4150,6 +4274,11 @@ async function createRuntimeRotationAppHelperContext(
 		options,
 	);
 	const helperEnv = message.env ?? {};
+	const helperShimDir =
+		typeof helperEnv.CODEX_CLI_PATH === "string" &&
+		helperEnv.CODEX_CLI_PATH.length > 0
+			? helperEnv.CODEX_CLI_PATH
+			: null;
 	const helperArgs = Array.isArray(message.args)
 		? message.args.filter((arg) => typeof arg === "string")
 		: [];
@@ -4163,7 +4292,22 @@ async function createRuntimeRotationAppHelperContext(
 			helper.unref();
 			return;
 		}
-		await stopRuntimeRotationAppHelper(helper);
+		try {
+			await stopRuntimeRotationAppHelper(helper);
+		} finally {
+			// The helper normally removes its app-server shim before exiting. On
+			// Windows, a descendant may still hold the copied codex.exe briefly
+			// after the helper closes, so retry the parent-owned cleanup once the
+			// helper shutdown path has completed as well.
+			if (helperShimDir) {
+				try {
+					removeDirectoryWithRetry(helperShimDir);
+				} catch {
+					// Best-effort cleanup; stale helper directories are swept on the
+					// next runtime app launch.
+				}
+			}
+		}
 	};
 
 	return {
@@ -5166,7 +5310,7 @@ async function main() {
 
 	const rawArgs = process.argv.slice(2);
 	if (rawArgs[0] === INTERNAL_RUNTIME_ROTATION_APP_HELPER_ARG) {
-		return runRuntimeRotationAppHelper();
+		return runRuntimeRotationAppHelper(rawArgs[1] ?? "");
 	}
 
 	const normalizedArgs = normalizeAuthAlias(rawArgs);

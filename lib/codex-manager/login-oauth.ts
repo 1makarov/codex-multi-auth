@@ -262,6 +262,7 @@ export async function runOAuthFlow(
 	signInMode: Extract<OAuthSignInMode, "browser" | "manual">,
 ): Promise<TokenResult> {
 	const { pkce, state, url } = await createAuthorizationFlow({ forceNewLogin });
+	const displayUrl = redactOAuthUrlForLog(url);
 	let code: string | null = null;
 	let oauthServer: Awaited<ReturnType<typeof startLocalOAuthServer>> | null =
 		null;
@@ -289,13 +290,6 @@ export async function runOAuthFlow(
 			}
 		}
 
-		// Display the OAuth URL with sensitive query parameters (state,
-		// code, code_challenge, code_verifier) redacted so they do not leak
-		// into shell history, screen captures, CI transcripts, or clipboard
-		// managers. The full URL is still handed to the browser opener and
-		// the clipboard so sign-in continues to work end-to-end.
-		const displayUrl = redactOAuthUrlForLog(url);
-
 		if (signInMode === "browser") {
 			const opened = openBrowserUrl(url);
 			if (opened) {
@@ -312,10 +306,23 @@ export async function runOAuthFlow(
 						copied ? "success" : "warning",
 					),
 				);
+				if (!copied) {
+					// The redacted line is safe for normal logs, but it cannot complete
+					// an incognito/manual handoff. If clipboard access also failed,
+					// provide the exact URL as the final recovery path.
+					console.log(
+						`${stylePromptText(UI_COPY.oauth.goTo, "accent")} ${url}`,
+					);
+				}
 			}
 		} else {
+			// Manual/incognito sign-in depends on the exact authorization URL. In
+			// particular, replacing `state` with a redaction marker causes the
+			// provider to return that marker and the callback's CSRF validation must
+			// (correctly) reject it. State validation remains strict below; this
+			// output simply preserves the value minted for this login attempt.
 			console.log(
-				`${stylePromptText(UI_COPY.oauth.goTo, "accent")} ${displayUrl}`,
+				`${stylePromptText(UI_COPY.oauth.goTo, "accent")} ${url}`,
 			);
 			const copied = copyTextToClipboard(url);
 			console.log(

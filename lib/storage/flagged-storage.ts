@@ -82,8 +82,24 @@ export function normalizeFlaggedStorage(
 		const cooldownReason = isCooldownReason(rawAccount.cooldownReason)
 			? rawAccount.cooldownReason
 			: undefined;
+		const authInvalidatedAt =
+			typeof rawAccount.authInvalidatedAt === "number" &&
+			Number.isFinite(rawAccount.authInvalidatedAt) &&
+			rawAccount.authInvalidatedAt > 0
+				? rawAccount.authInvalidatedAt
+				: undefined;
+		const authInvalidationErrorCode =
+			authInvalidatedAt !== undefined &&
+			typeof rawAccount.authInvalidationErrorCode === "string" &&
+			rawAccount.authInvalidationErrorCode.trim().length > 0
+				? rawAccount.authInvalidationErrorCode.trim()
+				: undefined;
 
 		const normalized: FlaggedAccountMetadataV1 = {
+			recordId:
+				typeof rawAccount.recordId === "string" && rawAccount.recordId.trim()
+					? rawAccount.recordId.trim()
+					: undefined,
 			refreshToken,
 			addedAt:
 				typeof rawAccount.addedAt === "number" ? rawAccount.addedAt : flaggedAt,
@@ -121,6 +137,8 @@ export function normalizeFlaggedStorage(
 					? rawAccount.coolingDownUntil
 					: undefined,
 			cooldownReason,
+			authInvalidatedAt,
+			authInvalidationErrorCode,
 			workspaces: Array.isArray(rawAccount.workspaces)
 				? (rawAccount.workspaces as FlaggedAccountMetadataV1["workspaces"])
 				: undefined,

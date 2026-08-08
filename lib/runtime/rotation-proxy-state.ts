@@ -1,4 +1,5 @@
 import { AccountManager } from "../accounts.js";
+import type { PreemptiveQuotaScheduler } from "../preemptive-quota-scheduler.js";
 import {
 	recordRuntimeReload,
 	recordRuntimeReset,
@@ -32,6 +33,7 @@ export interface RotationProxyStateInit {
 	maxRuntimeAccountAttempts: number;
 	maxRequestBodyBytes: number;
 	quotaRemainingPercentThreshold: number;
+	preemptiveQuotaScheduler: PreemptiveQuotaScheduler;
 	sessionAffinityStore: SessionAffinityStore | null;
 	lastObservedAffinityGeneration: number;
 	/**

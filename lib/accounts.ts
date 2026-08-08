@@ -1,4 +1,5 @@
 import type { Auth } from "@codex-ai/sdk";
+import { createHash } from "node:crypto";
 import { saveAccountsWithRetry } from "./storage/save-retry.js";
 import { createLogger } from "./logger.js";
 import {
@@ -107,6 +108,36 @@ function getAccountCircuitKey(account: ManagedAccount): string {
 			getAccountIdentityKey(account) ?? `circuit:${nextRuntimeCircuitKeyId++}`;
 	}
 	return account.circuitKeyId;
+}
+
+function deriveAccountRecordId(
+	account: {
+		accountId?: string;
+		email?: string;
+		refreshToken: string;
+		addedAt: number;
+	},
+): string {
+	const seed = [
+		account.addedAt,
+		account.accountId?.trim() ?? "",
+		account.email?.trim().toLowerCase() ?? "",
+		account.refreshToken.trim(),
+	].join("\u0000");
+	return `record:${createHash("sha256").update(seed).digest("hex")}`;
+}
+
+function resolveAccountRecordId(
+	account: {
+		recordId?: string;
+		accountId?: string;
+		email?: string;
+		refreshToken: string;
+		addedAt: number;
+	},
+): string {
+	const stored = account.recordId?.trim();
+	return stored || deriveAccountRecordId(account);
 }
 
 export function getRuntimeTrackerKey(account: ManagedAccount): string | number {
@@ -239,8 +270,12 @@ function isRetryableAuthPersistenceError(error: unknown): boolean {
 // re-exported here to preserve the historical import surface.
 export type { Workspace } from "./storage/public-types.js";
 
+/** Stable operator-facing marker for an explicitly invalidated OAuth token. */
+export const AUTH_INVALIDATION_MARKER = "token-invalid — re-login needed";
+
 export interface ManagedAccount {
 	index: number;
+	recordId?: string;
 	_runtimeTrackerKey?: string | number;
 	circuitKeyId?: string;
 	accountId?: string;
@@ -264,6 +299,8 @@ export interface ManagedAccount {
 	rateLimitResetTimes: RateLimitStateV3;
 	coolingDownUntil?: number;
 	cooldownReason?: CooldownReason;
+	authInvalidatedAt?: number;
+	authInvalidationErrorCode?: string;
 	consecutiveAuthFailures?: number;
 	workspaces?: Workspace[];
 	currentWorkspaceIndex?: number;
@@ -488,6 +525,9 @@ export class AccountManager {
 
 					return {
 						index,
+						recordId: resolveAccountRecordId(
+							{ ...account, refreshToken },
+						),
 						accountId: matchesFallback
 							? (fallbackAccountId ?? account.accountId)
 							: account.accountId,
@@ -512,6 +552,8 @@ export class AccountManager {
 						rateLimitResetTimes: account.rateLimitResetTimes ?? {},
 						coolingDownUntil: account.coolingDownUntil,
 						cooldownReason: account.cooldownReason,
+						authInvalidatedAt: account.authInvalidatedAt,
+						authInvalidationErrorCode: account.authInvalidationErrorCode,
 						workspaces: account.workspaces,
 						currentWorkspaceIndex: account.currentWorkspaceIndex,
 					};
@@ -525,6 +567,14 @@ export class AccountManager {
 				const now = nowMs();
 				this.accounts.push({
 					index: this.accounts.length,
+					recordId: deriveAccountRecordId(
+						{
+							accountId: fallbackAccountId,
+							email: fallbackAccountEmail,
+							refreshToken: authFallback.refresh,
+							addedAt: now,
+						},
+					),
 					accountId: fallbackAccountId,
 					accountIdSource: fallbackAccountId ? "token" : undefined,
 					email: fallbackAccountEmail,
@@ -559,6 +609,14 @@ export class AccountManager {
 			this.accounts = [
 				{
 					index: 0,
+					recordId: deriveAccountRecordId(
+						{
+							accountId: fallbackAccountId,
+							email: fallbackAccountEmail,
+							refreshToken: authFallback.refresh,
+							addedAt: now,
+						},
+					),
 					accountId: fallbackAccountId,
 					accountIdSource: fallbackAccountId ? "token" : undefined,
 					email: fallbackAccountEmail,
@@ -640,6 +698,7 @@ export class AccountManager {
 		clearExpiredRateLimits(account);
 		return (
 			!isRateLimitedForFamily(account, family, model) &&
+			!this.isAccountAuthInvalidated(account) &&
 			!this.isAccountCoolingDown(account) &&
 			this.isCircuitAvailable(account)
 		);
@@ -652,8 +711,23 @@ export class AccountManager {
 	): string | null {
 		const account = this.getAccountByIndex(index);
 		if (!account) return "missing";
+		return this.getManagedAccountRuntimeSkipReason(account, family, model);
+	}
+
+	/**
+	 * Evaluate a managed-account snapshot with the same runtime gates used by
+	 * production selection. This is public for read-only diagnostics that build
+	 * their own trace rows from storage and therefore cannot safely resolve an
+	 * account by its compacted array position.
+	 */
+	getManagedAccountRuntimeSkipReason(
+		account: ManagedAccount,
+		family: ModelFamily,
+		model?: string | null,
+	): string | null {
 		if (account.enabled === false) return "disabled";
 		if (!this.hasEnabledWorkspaces(account)) return "workspace-disabled";
+		if (this.isAccountAuthInvalidated(account)) return AUTH_INVALIDATION_MARKER;
 		clearExpiredRateLimits(account);
 		if (isRateLimitedForFamily(account, family, model)) return "rate-limited";
 		if (this.isAccountCoolingDown(account)) {
@@ -770,6 +844,7 @@ export class AccountManager {
 			clearExpiredRateLimits(account);
 			if (
 				isRateLimitedForFamily(account, family, model) ||
+				this.isAccountAuthInvalidated(account) ||
 				this.isAccountCoolingDown(account) ||
 				!this.isCircuitAvailable(account)
 			) {
@@ -804,6 +879,7 @@ export class AccountManager {
 			clearExpiredRateLimits(account);
 			if (
 				isRateLimitedForFamily(account, family, model) ||
+				this.isAccountAuthInvalidated(account) ||
 				this.isAccountCoolingDown(account) ||
 				!this.isCircuitAvailable(account)
 			) {
@@ -861,6 +937,7 @@ export class AccountManager {
 			clearExpiredRateLimits(account);
 			return (
 				!isRateLimitedForFamily(account, family, model) &&
+				!this.isAccountAuthInvalidated(account) &&
 				!this.isAccountCoolingDown(account) &&
 				this.isCircuitAvailable(account)
 			);
@@ -917,6 +994,7 @@ export class AccountManager {
 				clearExpiredRateLimits(account);
 				const isAvailable =
 					!isRateLimitedForFamily(account, family, model) &&
+					!this.isAccountAuthInvalidated(account) &&
 					!this.isAccountCoolingDown(account) &&
 					this.isCircuitAvailable(account);
 				return {
@@ -1226,6 +1304,28 @@ export class AccountManager {
 		account.consecutiveAuthFailures = 0;
 	}
 
+	markAuthInvalidated(
+		account: ManagedAccount,
+		errorCode = "token_invalidated",
+		invalidatedAt = nowMs(),
+	): void {
+		account.authInvalidatedAt = invalidatedAt;
+		account.authInvalidationErrorCode = errorCode;
+	}
+
+	clearAuthInvalidation(account: ManagedAccount): void {
+		delete account.authInvalidatedAt;
+		delete account.authInvalidationErrorCode;
+	}
+
+	isAccountAuthInvalidated(account: ManagedAccount): boolean {
+		return (
+			typeof account.authInvalidatedAt === "number" &&
+			Number.isFinite(account.authInvalidatedAt) &&
+			account.authInvalidatedAt > 0
+		);
+	}
+
 	getAccountByIdentity(
 		candidate: AccountIdentityCandidate,
 		auth?: OAuthAuthDetails,
@@ -1257,6 +1357,7 @@ export class AccountManager {
 		account.refreshToken = auth.refresh;
 		account.access = auth.access;
 		account.expires = auth.expires;
+		this.clearAuthInvalidation(account);
 		const tokenAccountId = extractAccountId(auth.access)?.trim() || undefined;
 		if (
 			tokenAccountId &&
@@ -1315,6 +1416,24 @@ export class AccountManager {
 				account.accessToken = disk.accessToken;
 				account.expiresAt = disk.expiresAt;
 			}
+			const diskInvalidatedAt = disk.authInvalidatedAt;
+			const diskHasValidInvalidation =
+				typeof diskInvalidatedAt === "number" &&
+				Number.isFinite(diskInvalidatedAt) &&
+				diskInvalidatedAt > 0;
+			const accountHasValidInvalidation =
+				typeof account.authInvalidatedAt === "number" &&
+				Number.isFinite(account.authInvalidatedAt) &&
+				account.authInvalidatedAt > 0;
+			if (diskHasValidInvalidation && !accountHasValidInvalidation) {
+				// Ordinary saves must not erase an invalidation written by another
+				// AccountManager. Successful refresh persistence explicitly deletes
+				// this marker in commitRefreshedAuth; this reconciliation path does not.
+				account.authInvalidatedAt = diskInvalidatedAt;
+				if (disk.authInvalidationErrorCode) {
+					account.authInvalidationErrorCode = disk.authInvalidationErrorCode;
+				}
+			}
 		}
 		return snapshot;
 	}
@@ -1364,27 +1483,38 @@ export class AccountManager {
 
 		const snapshot: AccountStorageV3 = {
 			version: 3,
-			accounts: this.accounts.map((account) => ({
-				accountId: account.accountId,
-				accountIdSource: account.accountIdSource,
-				accountLabel: account.accountLabel,
-				email: account.email,
-				refreshToken: account.refreshToken,
-				accessToken: account.access,
-				expiresAt: account.expires,
-				enabled: account.enabled === false ? false : undefined,
-				addedAt: account.addedAt,
-				lastUsed: account.lastUsed,
-				lastSwitchReason: account.lastSwitchReason,
-				rateLimitResetTimes:
-					Object.keys(account.rateLimitResetTimes).length > 0
-						? account.rateLimitResetTimes
+			accounts: this.accounts.map((account) => {
+				const hasValidAuthInvalidation =
+					this.isAccountAuthInvalidated(account);
+				return {
+					recordId: account.recordId,
+					accountId: account.accountId,
+					accountIdSource: account.accountIdSource,
+					accountLabel: account.accountLabel,
+					email: account.email,
+					refreshToken: account.refreshToken,
+					accessToken: account.access,
+					expiresAt: account.expires,
+					enabled: account.enabled === false ? false : undefined,
+					addedAt: account.addedAt,
+					lastUsed: account.lastUsed,
+					lastSwitchReason: account.lastSwitchReason,
+					rateLimitResetTimes:
+						Object.keys(account.rateLimitResetTimes).length > 0
+							? account.rateLimitResetTimes
+							: undefined,
+					coolingDownUntil: account.coolingDownUntil,
+					cooldownReason: account.cooldownReason,
+					authInvalidatedAt: hasValidAuthInvalidation
+						? account.authInvalidatedAt
 						: undefined,
-				coolingDownUntil: account.coolingDownUntil,
-				cooldownReason: account.cooldownReason,
-				workspaces: account.workspaces,
-				currentWorkspaceIndex: account.currentWorkspaceIndex,
-			})),
+					authInvalidationErrorCode: hasValidAuthInvalidation
+						? account.authInvalidationErrorCode
+						: undefined,
+					workspaces: account.workspaces,
+					currentWorkspaceIndex: account.currentWorkspaceIndex,
+				};
+			}),
 			activeIndex,
 			activeIndexByFamily,
 		};
@@ -1447,6 +1577,8 @@ export class AccountManager {
 					storedAccount.email = nextEmail;
 				}
 				storedAccount.enabled = undefined;
+				delete storedAccount.authInvalidatedAt;
+				delete storedAccount.authInvalidationErrorCode;
 				delete storedAccount.coolingDownUntil;
 				delete storedAccount.cooldownReason;
 
@@ -1463,6 +1595,9 @@ export class AccountManager {
 						coolingDownUntil: liveAccount.coolingDownUntil,
 						cooldownReason: liveAccount.cooldownReason,
 						consecutiveAuthFailures: liveAccount.consecutiveAuthFailures,
+						authInvalidatedAt: liveAccount.authInvalidatedAt,
+						authInvalidationErrorCode:
+							liveAccount.authInvalidationErrorCode,
 					};
 
 					this.updateFromAuth(liveAccount, auth);
@@ -1483,6 +1618,20 @@ export class AccountManager {
 						liveAccount.enabled = previousLiveAccountState.enabled;
 						liveAccount.consecutiveAuthFailures =
 							previousLiveAccountState.consecutiveAuthFailures;
+						if (previousLiveAccountState.authInvalidatedAt === undefined) {
+							delete liveAccount.authInvalidatedAt;
+						} else {
+							liveAccount.authInvalidatedAt =
+								previousLiveAccountState.authInvalidatedAt;
+						}
+						if (
+							previousLiveAccountState.authInvalidationErrorCode === undefined
+						) {
+							delete liveAccount.authInvalidationErrorCode;
+						} else {
+							liveAccount.authInvalidationErrorCode =
+								previousLiveAccountState.authInvalidationErrorCode;
+						}
 						if (previousLiveAccountState.coolingDownUntil === undefined) {
 							delete liveAccount.coolingDownUntil;
 						} else {
@@ -1531,7 +1680,8 @@ export class AccountManager {
 	getMinWaitTimeForFamily(family: ModelFamily, model?: string | null): number {
 		const now = nowMs();
 		const enabledAccounts = this.accounts.filter(
-			(account) => account.enabled !== false,
+			(account) =>
+				account.enabled !== false && !this.isAccountAuthInvalidated(account),
 		);
 		const available = enabledAccounts.filter((account) => {
 			clearExpiredRateLimits(account);

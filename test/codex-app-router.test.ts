@@ -132,6 +132,7 @@ describe("codex app router daemon", () => {
 				(status) => status.state === "running",
 			);
 			expect(running.kind).toBe("codex-app-runtime-rotation-router");
+			expect(running.startedAt).toBeTypeOf("number");
 			expect(running.baseUrl).toBe("http://127.0.0.1:4567");
 			expect(running.lastAccountLabel).toBe("Account 2");
 			expect(running).not.toHaveProperty("clientApiKey");

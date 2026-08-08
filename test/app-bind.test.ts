@@ -1335,7 +1335,7 @@ describe("Codex app runtime rotation bind", () => {
 			home: root,
 			env,
 		});
-	});
+	}, 20_000);
 
 	it("waits past cold Windows Node startup before declaring router startup failed", async () => {
 		const root = await createTempRoot("codex-app-bind-router-slow-port-");

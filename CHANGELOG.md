@@ -7,6 +7,24 @@ This repository's current stable release line is `2.x`.
 Current stable release notes live in `docs/releases/`.
 This top-level changelog preserves the foundational `0.x` milestones and points older iteration history to `docs/releases/legacy-pre-0.1-history.md`.
 
+## [2.8.2] - 2026-08-09
+
+A corrective account-management and runtime reliability release. It fixes manual/incognito OAuth handoffs, uninstall cleanup, selection diagnostics, durable token-invalid state, and preemptive quota scheduling. No user configuration migration is required. Landed as [#658](https://github.com/ndycode/codex-multi-auth/pull/658), closing [#652](https://github.com/ndycode/codex-multi-auth/issues/652), [#653](https://github.com/ndycode/codex-multi-auth/issues/653), [#654](https://github.com/ndycode/codex-multi-auth/issues/654), [#655](https://github.com/ndycode/codex-multi-auth/issues/655), and [#656](https://github.com/ndycode/codex-multi-auth/issues/656). See [docs/releases/v2.8.2.md](docs/releases/v2.8.2.md) for full details.
+
+### Fixed
+
+- **Manual/incognito OAuth login could reject a pasted callback.** The manual handoff now presents the complete authorization URL and keeps browser, clipboard, and terminal fallback paths tied to the exact URL and login attempt ([#652](https://github.com/ndycode/codex-multi-auth/issues/652), [#658](https://github.com/ndycode/codex-multi-auth/pull/658))
+- **Uninstall could leave commands, caches, or runtime helper artifacts behind.** The uninstall and npm lifecycle guidance now distinguishes the current unscoped package from the legacy `@ndycode/codex-multi-auth` name, cleans current and legacy caches, and removes bind/helper artifacts with retry-safe cleanup ([#653](https://github.com/ndycode/codex-multi-auth/issues/653), [#658](https://github.com/ndycode/codex-multi-auth/pull/658))
+- **`why-selected` could report an account that production routing would block.** Live selection now waits for the same runtime availability gates, account-policy blocks, and score boosts used by the rotation path, so paused, drained, invalidated, and otherwise unavailable accounts are explained consistently ([#654](https://github.com/ndycode/codex-multi-auth/issues/654), [#658](https://github.com/ndycode/codex-multi-auth/pull/658))
+- **Upstream OAuth token invalidation was invisible until account removal.** Invalidations now persist an error marker, appear in account status/check/forecast/probe and selection diagnostics, and exclude the account from routing until a successful refresh or login clears the marker ([#655](https://github.com/ndycode/codex-multi-auth/issues/655), [#658](https://github.com/ndycode/codex-multi-auth/pull/658))
+- **Preemptive quota scheduling retried accounts whose long quota window was known to be exhausted.** Trusted future reset timestamps now drive deferral for weekly and monthly windows; missing, stale, or invalid reset data retains the bounded fallback behavior ([#656](https://github.com/ndycode/codex-multi-auth/issues/656), [#658](https://github.com/ndycode/codex-multi-auth/pull/658))
+
+### Changed
+
+- Stable account record identities keep quota snapshots attached to the same account across reloads, reordering, refresh-token changes, and case/whitespace normalization, without merging distinct same-email records ([#658](https://github.com/ndycode/codex-multi-auth/pull/658))
+- Runtime helper and packaged-app router shutdown now carries tokenized process ownership checks and safer Windows executable handling. Direct storage-path overrides also take precedence over stale asynchronous path contexts ([#658](https://github.com/ndycode/codex-multi-auth/pull/658))
+- Regression coverage now includes the affected OAuth, uninstall, storage, selection, token-refresh, quota, runtime-router, and Windows startup paths. The two cold/instrumented Windows startup cases use an explicit 20-second test budget so their subprocess diagnostics can report reliably.
+
 ## [2.8.1] - 2026-08-02
 
 A corrective release with no new features and no configuration changes. `mcodex resume` hung on a blank screen whenever runtime rotation was enabled, the wrapper could fail to return to the shell after an interrupted exit, and four high-severity dependency advisories are cleared.

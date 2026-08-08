@@ -2,7 +2,7 @@
 
 This directory contains the test suite for the OpenAI Codex OAuth plugin.
 
-**Stats**: 5292 tests across 336 test files with 80%+ coverage threshold (2.8.1; 6 tests and 2 files skipped by default).
+**Stats**: 5356 tests across 337 test files with 80%+ coverage threshold (2.8.2; 4 tests and 1 file skipped by default).
 
 ## Test Structure
 

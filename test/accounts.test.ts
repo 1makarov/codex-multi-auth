@@ -32,6 +32,7 @@ import {
 	getStoragePathState,
 	setStoragePathState,
 } from "../lib/storage/path-state.js";
+import type { AccountStorageV3 } from "../lib/storage.js";
 import type { OAuthAuthDetails } from "../lib/types.js";
 import { MODEL_FAMILIES } from "../lib/prompts/codex.js";
 
@@ -1624,6 +1625,51 @@ describe("AccountManager", () => {
 	});
 
 	describe("auth failure tracking", () => {
+		it.each([
+			["zero", 0],
+			["negative", -1],
+			["NaN", Number.NaN],
+			["infinity", Number.POSITIVE_INFINITY],
+		] as const)("does not treat %s as an auth invalidation", (_label, timestamp) => {
+			const now = Date.now();
+			const manager = new AccountManager(undefined, {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						authInvalidatedAt: timestamp,
+					},
+				],
+			});
+			const account = manager.getCurrentAccount();
+			if (!account) throw new Error("account missing");
+
+			expect(manager.isAccountAuthInvalidated(account)).toBe(false);
+		});
+
+		it("treats a positive finite timestamp as an auth invalidation", () => {
+			const now = Date.now();
+			const manager = new AccountManager(undefined, {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						authInvalidatedAt: now,
+					},
+				],
+			});
+			const account = manager.getCurrentAccount();
+			if (!account) throw new Error("account missing");
+
+			expect(manager.isAccountAuthInvalidated(account)).toBe(true);
+		});
+
 		it("increments consecutive auth failures", () => {
 			const now = Date.now();
 			const stored = {
@@ -2423,7 +2469,7 @@ describe("AccountManager", () => {
 		});
 	});
 
-	describe("saveToDisk", () => {
+		describe("saveToDisk", () => {
 		it("saves accounts with all fields", async () => {
 			const { saveAccounts } = await import("../lib/storage.js");
 			const mockSaveAccounts = vi.mocked(saveAccounts);
@@ -2456,6 +2502,76 @@ describe("AccountManager", () => {
 			expect(savedData?.version).toBe(3);
 			expect(savedData?.accounts[0]?.email).toBe("test@example.com");
 			expect(savedData?.accounts[0]?.rateLimitResetTimes).toBeDefined();
+		});
+
+		it("omits malformed auth invalidation markers from routine saves", async () => {
+			const { saveAccounts } = await import("../lib/storage.js");
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const now = Date.now();
+			const manager = new AccountManager(undefined, {
+				version: 3 as const,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "token-1",
+						addedAt: now,
+						lastUsed: now,
+						authInvalidatedAt: 0,
+						authInvalidationErrorCode: "oauth_token_revoked",
+					},
+				],
+			});
+
+			await manager.saveToDisk();
+
+			const savedAccount = mockSaveAccounts.mock.calls[0]?.[0]?.accounts[0];
+			expect(savedAccount?.authInvalidatedAt).toBeUndefined();
+			expect(savedAccount?.authInvalidationErrorCode).toBeUndefined();
+		});
+
+		it("preserves an invalidation written by another manager before a stale routine save", async () => {
+			const { saveAccounts, withAccountStorageTransaction } = await import(
+				"../lib/storage.js"
+			);
+			const mockSaveAccounts = vi.mocked(saveAccounts);
+			const mockWithAccountStorageTransaction = vi.mocked(
+				withAccountStorageTransaction,
+			);
+			let disk: AccountStorageV3 | null = null;
+			mockWithAccountStorageTransaction.mockImplementation(async (handler) => {
+				const persist = async (storage: AccountStorageV3) => {
+					disk = structuredClone(storage);
+					await mockSaveAccounts(storage);
+				};
+				return handler(disk ? structuredClone(disk) : null, persist);
+			});
+
+			const now = Date.now();
+			const initialStorage: AccountStorageV3 = {
+				version: 3,
+				activeIndex: 0,
+				accounts: [
+					{
+						refreshToken: "shared-refresh-token",
+						email: "shared@example.com",
+						addedAt: now,
+						lastUsed: now,
+					},
+				],
+			};
+			const managerA = new AccountManager(undefined, structuredClone(initialStorage));
+			const managerB = new AccountManager(undefined, structuredClone(initialStorage));
+
+			const accountA = managerA.getAccountByIndex(0);
+			if (!accountA) throw new Error("manager A account missing");
+			managerA.markAuthInvalidated(accountA, "oauth_token_revoked", now + 1);
+			await managerA.saveToDisk();
+			await managerB.saveToDisk();
+
+			expect(disk?.accounts[0]).toMatchObject({
+				authInvalidatedAt: now + 1,
+				authInvalidationErrorCode: "oauth_token_revoked",
+		});
 		});
 	});
 

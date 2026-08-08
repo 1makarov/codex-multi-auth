@@ -161,6 +161,7 @@ const WorkspaceSchema = z.object({
  * Account metadata V3 - current storage format.
  */
 export const AccountMetadataV3Schema = z.object({
+	recordId: z.string().min(1).optional(),
 	accountId: z.string().optional(),
 	accountIdSource: AccountIdSourceSchema.optional(),
 	accountLabel: z.string().optional(),
@@ -175,6 +176,8 @@ export const AccountMetadataV3Schema = z.object({
 	rateLimitResetTimes: RateLimitStateV3Schema.optional(),
 	coolingDownUntil: z.number().optional(),
 	cooldownReason: CooldownReasonSchema.optional(),
+	authInvalidatedAt: z.number().finite().positive().optional(),
+	authInvalidationErrorCode: z.string().min(1).optional(),
 	// Multi-workspace support (#491): without these here, the strict z.object
 	// strips workspace tracking on every load, so login-captured workspaces
 	// silently vanish after one read/write round-trip.

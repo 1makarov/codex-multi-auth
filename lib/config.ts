@@ -1818,7 +1818,9 @@ export function getPreemptiveQuotaRemainingPercent7d(
 }
 
 /**
- * Get the configured maximum deferral time (in milliseconds) for preemptive quota checks.
+ * Get the configured fallback deferral time (in milliseconds) for preemptive quota checks.
+ * Trusted future quota resets may extend a deferral beyond this fallback, up to the
+ * scheduler's seven-day safety ceiling.
  *
  * Reads an environment override or the plugin configuration and enforces a minimum of 1000 ms.
  *

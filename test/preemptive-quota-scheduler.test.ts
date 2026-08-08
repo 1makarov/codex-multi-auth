@@ -174,6 +174,123 @@ describe("preemptive quota scheduler", () => {
 		expect(decision.waitMs).toBe(100_000);
 	});
 
+	it("uses a trusted future reset for an exhausted long quota window", () => {
+		const scheduler = new PreemptiveQuotaScheduler();
+		const now = 1_000_000;
+		const resetWaitMs = 72 * 60 * 60_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: { usedPercent: 20, resetAtMs: now + 5 * 60 * 60_000 },
+			secondary: { usedPercent: 100, resetAtMs: now + resetWaitMs },
+			updatedAt: now,
+		});
+
+		const decision = scheduler.getDeferral("acc:model", now + 1_000);
+
+		expect(decision).toEqual({
+			defer: true,
+			waitMs: resetWaitMs - 1_000,
+			reason: "quota-near-exhaustion",
+		});
+	});
+
+	it("caps trusted monthly-scale reset data at the seven-day safety ceiling", () => {
+		const scheduler = new PreemptiveQuotaScheduler();
+		const now = 1_000_000;
+		const sevenDaysMs = 7 * 24 * 60 * 60_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: {},
+			secondary: {
+				usedPercent: 100,
+				resetAtMs: now + 30 * 24 * 60 * 60_000,
+			},
+			updatedAt: now,
+		});
+
+		const decision = scheduler.getDeferral("acc:model", now + 1_000);
+
+		expect(decision.waitMs).toBe(sevenDaysMs);
+	});
+
+	it.each([
+		["missing", undefined],
+		["invalid", Number.NaN],
+	] as const)("falls back to the configured cap for %s reset data", (_label, resetAtMs) => {
+		const maxDeferralMs = 30 * 60_000;
+		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs });
+		const now = 1_000_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: { usedPercent: 100, resetAtMs },
+			secondary: {},
+			updatedAt: now,
+		});
+
+		const decision = scheduler.getDeferral("acc:model", now + 1_000);
+
+		expect(decision).toEqual({
+			defer: true,
+			waitMs: maxDeferralMs,
+			reason: "quota-near-exhaustion",
+		});
+	});
+
+	it("falls back to the configured cap for stale reset data", () => {
+		const maxDeferralMs = 30 * 60_000;
+		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs });
+		const now = 1_000_000;
+		const sevenDaysMs = 7 * 24 * 60 * 60_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: { usedPercent: 100, resetAtMs: now + 72 * 60 * 60_000 },
+			secondary: {},
+			updatedAt: now - sevenDaysMs - 1,
+		});
+
+		const decision = scheduler.getDeferral("acc:model", now + 1_000);
+
+		expect(decision).toEqual({
+			defer: true,
+			waitMs: maxDeferralMs,
+			reason: "quota-near-exhaustion",
+		});
+	});
+
+	it("falls back to the configured cap for a future-dated snapshot", () => {
+		const maxDeferralMs = 30 * 60_000;
+		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs });
+		const now = 1_000_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: { usedPercent: 100, resetAtMs: now + 60 * 60_000 },
+			secondary: {},
+			updatedAt: now + 1,
+		});
+
+		expect(scheduler.getDeferral("acc:model", now)).toEqual({
+			defer: true,
+			waitMs: maxDeferralMs,
+			reason: "quota-near-exhaustion",
+		});
+	});
+
+	it("does not re-defer an exhausted window after its reset has passed", () => {
+		const scheduler = new PreemptiveQuotaScheduler({ maxDeferralMs: 30 * 60_000 });
+		const now = 1_000_000;
+		scheduler.update("acc:model", {
+			status: 200,
+			primary: { usedPercent: 100, resetAtMs: now - 1_000 },
+			secondary: { usedPercent: 20, resetAtMs: now + 7 * 24 * 60 * 60_000 },
+			updatedAt: now - 500,
+		});
+
+		expect(scheduler.getDeferral("acc:model", now)).toEqual({
+			defer: false,
+			waitMs: 0,
+		});
+	});
+
 	it("prunes expired snapshots", () => {
 		const scheduler = new PreemptiveQuotaScheduler();
 		scheduler.update("a", {

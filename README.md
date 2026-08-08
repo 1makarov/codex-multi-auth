@@ -258,6 +258,7 @@ For remote or headless shells, prefer `codex-multi-auth login --device-auth`.
 | Budget guards | `~/.codex/multi-auth/budget-guards.json` |
 | Local client tokens | `~/.codex/multi-auth/local-client-tokens.json` |
 | Runtime app helper status | `~/.codex/multi-auth/runtime-rotation-app-helper.json` |
+| Runtime app helper owner metadata | `~/.codex/multi-auth/runtime-rotation-app-helper-owner.<pid>.json` |
 | Persistent app bind state/logs | `~/.codex/multi-auth/app-bind/` |
 | Logs | `~/.codex/multi-auth/logs/codex-plugin/` |
 | Per-project accounts | `~/.codex/multi-auth/projects/<project-key>/openai-codex-accounts.json` |

@@ -6,10 +6,12 @@ import { HTTP_STATUS, OPENAI_HEADERS } from "../lib/constants.js";
 import {
 	startRuntimeRotationProxy,
 	buildTokenInvalidationBody,
+	buildQuotaScheduleKey,
 	chooseAccount,
 	normalizeForcedAccountIndex,
 	type RuntimeRotationProxyServer,
 } from "../lib/runtime-rotation-proxy.js";
+import { PreemptiveQuotaScheduler } from "../lib/preemptive-quota-scheduler.js";
 import { SessionAffinityStore } from "../lib/session-affinity.js";
 import { clearCircuitBreakers } from "../lib/circuit-breaker.js";
 import {
@@ -1412,6 +1414,193 @@ describe("runtime rotation proxy", () => {
 		).toBeTypeOf("number");
 	});
 
+	it("uses the preemptive scheduler fallback when exhaustion has no reset header", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now));
+		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) =>
+			textEventStream(`data: attempt-${attempt}\n\n`, {
+				"x-codex-primary-used-percent": attempt === 1 ? "100" : "10",
+			}),
+		);
+		const proxy = await startProxy({ accountManager, fetchImpl });
+
+		await (await postResponses(proxy, { model: "gpt-5-codex", stream: true })).text();
+		await (await postResponses(proxy, { model: "gpt-5-codex", stream: true })).text();
+
+		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual([
+			"acc_1",
+			"acc_2",
+		]);
+		expect(
+			(accountManager.getAccountByIndex(0)?.rateLimitResetTimes["gpt-5-codex"] ?? 0) -
+				Date.now(),
+		).toBeGreaterThan(60 * 60 * 1_000);
+	});
+
+	it("keeps quota snapshots attached to account identity across index changes", () => {
+		const scheduler = new PreemptiveQuotaScheduler();
+		const now = Date.now();
+		const originalAccount = {
+			accountId: "stable-account",
+			email: "stable@example.com",
+			refreshToken: "refresh-stable",
+		};
+		const reorderedAccount = { ...originalAccount };
+		const replacementAccount = {
+			accountId: "different-account",
+			email: "different@example.com",
+			refreshToken: "refresh-different",
+		};
+		const originalKey = buildQuotaScheduleKey(
+			originalAccount,
+			"codex",
+			"gpt-5-codex",
+		);
+		scheduler.update(originalKey, {
+			status: 200,
+			primary: { usedPercent: 100, resetAtMs: now + 60 * 60_000 },
+			secondary: {},
+			updatedAt: now,
+		});
+
+		expect(
+			buildQuotaScheduleKey(reorderedAccount, "codex", "gpt-5-codex"),
+		).toBe(originalKey);
+		expect(
+			scheduler.getDeferral(
+				buildQuotaScheduleKey(reorderedAccount, "codex", "gpt-5-codex"),
+				now,
+			),
+		).toMatchObject({ defer: true, reason: "quota-near-exhaustion" });
+		expect(
+			scheduler.getDeferral(
+				buildQuotaScheduleKey(replacementAccount, "codex", "gpt-5-codex"),
+				now,
+			),
+		).toEqual({ defer: false, waitMs: 0 });
+	});
+
+	it("keeps quota identity stable when an account gains an account id", () => {
+		const beforeRefresh = {
+			email: "  User@Example.com ",
+			refreshToken: "refresh-before",
+		};
+		const afterRefresh = {
+			email: "user@example.com",
+			accountId: "account-id-after-refresh",
+			refreshToken: "refresh-after",
+		};
+
+		expect(
+			buildQuotaScheduleKey(beforeRefresh, "codex", "gpt-5-codex"),
+		).toBe(buildQuotaScheduleKey(afterRefresh, "codex", "gpt-5-codex"));
+	});
+
+	it("does not merge quota identity for distinct emails sharing an account id", () => {
+		const first = {
+			email: "first@example.com",
+			accountId: "shared-account-id",
+			refreshToken: "refresh-first",
+		};
+		const second = {
+			email: "second@example.com",
+			accountId: "shared-account-id",
+			refreshToken: "refresh-second",
+		};
+
+		expect(buildQuotaScheduleKey(first, "codex", "gpt-5-codex")).not.toBe(
+			buildQuotaScheduleKey(second, "codex", "gpt-5-codex"),
+		);
+	});
+
+	it("does not merge quota identity for distinct accounts sharing a normalized email", () => {
+		const first = {
+			email: "Shared@example.com",
+			accountId: "account-one",
+			refreshToken: "refresh-one",
+			addedAt: 1_000,
+			recordId: "record-one",
+		};
+		const second = {
+			email: " shared@example.com ",
+			accountId: "account-two",
+			refreshToken: "refresh-two",
+			addedAt: 1_000,
+			recordId: "record-two",
+		};
+		const firstKey = buildQuotaScheduleKey(first, "codex", "gpt-5-codex");
+		const secondKey = buildQuotaScheduleKey(second, "codex", "gpt-5-codex");
+		const scheduler = new PreemptiveQuotaScheduler();
+
+		scheduler.update(firstKey, {
+			status: 200,
+			primary: { usedPercent: 100, resetAtMs: Date.now() + 60 * 60_000 },
+			secondary: {},
+			updatedAt: Date.now(),
+		});
+
+		expect(firstKey).not.toBe(secondKey);
+		expect(scheduler.getDeferral(secondKey, Date.now())).toEqual({
+			defer: false,
+			waitMs: 0,
+		});
+	});
+
+	it("derives distinct stable quota record ids for same-email records", () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, {
+			version: 3,
+			activeIndex: 0,
+			activeIndexByFamily: { codex: 0 },
+			accounts: [
+				{
+					email: "shared@example.com",
+					accountId: "same-account-id",
+					refreshToken: "refresh-one",
+					addedAt: now,
+					lastUsed: now,
+				},
+				{
+					email: "SHARED@example.com",
+					accountId: "same-account-id",
+					refreshToken: "refresh-two",
+					addedAt: now,
+					lastUsed: now,
+				},
+			],
+		});
+		const first = accountManager.getAccountByIndex(0);
+		const second = accountManager.getAccountByIndex(1);
+
+		expect(first?.recordId).toBeTypeOf("string");
+		expect(first?.recordId).not.toBe(second?.recordId);
+		expect(
+			first && second
+				? buildQuotaScheduleKey(first, "codex", "gpt-5-codex")
+				: null,
+		).not.toBe(
+			first && second
+				? buildQuotaScheduleKey(second, "codex", "gpt-5-codex")
+				: null,
+		);
+	});
+
+	it("normalizes email casing and whitespace in quota identity keys", () => {
+		expect(
+			buildQuotaScheduleKey(
+				{ email: "  MixedCase@Example.COM  ", refreshToken: "refresh-a" },
+				"codex",
+				"gpt-5-codex",
+			),
+		).toBe(
+			buildQuotaScheduleKey(
+				{ email: "mixedcase@example.com", refreshToken: "refresh-b" },
+				"codex",
+				"gpt-5-codex",
+			),
+		);
+	});
+
 	it("pins repeated session requests to the first served account", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 3));
@@ -2377,11 +2566,62 @@ describe("runtime rotation proxy", () => {
 		expect(calls).toHaveLength(1);
 		expect(calls[0]?.headers.get(OPENAI_HEADERS.ACCOUNT_ID)).toBe("acc_1");
 		expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("auth-failure");
+		expect(accountManager.getAccountByIndex(0)).toMatchObject({
+			authInvalidatedAt: expect.any(Number),
+			authInvalidationErrorCode: "token_invalidated",
+		});
 		// token invalidation applies the long cooldown (~5min), not the generic 30s
 		const coolingDownUntil = accountManager.getAccountByIndex(0)?.coolingDownUntil ?? 0;
 		expect(coolingDownUntil).toBeGreaterThan(now + 250_000);
 		expect(coolingDownUntil).toBeLessThan(now + 350_000);
 		expect(proxy.getStatus().rotations).toBe(0);
+	});
+
+	it("persists a distinct upstream invalidation code from a 401 body", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		let persistedStorage: AccountStorageV3 | null = null;
+		withAccountStorageTransactionMock.mockImplementationOnce(
+			async (
+				handler: (
+					current: AccountStorageV3 | null,
+					persist: (storage: AccountStorageV3) => Promise<void>,
+				) => Promise<unknown>,
+			) => {
+				await handler(null, async (storage) => {
+					persistedStorage = structuredClone(storage);
+				});
+			},
+		);
+		const invalidationBody = JSON.stringify({
+			error: {
+				code: "oauth_token_revoked",
+				message: "The OAuth token has been invalidated by the provider.",
+			},
+		});
+		const { calls, fetchImpl } = createRecordingFetch(
+			() =>
+				new Response(invalidationBody, {
+					status: HTTP_STATUS.UNAUTHORIZED,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const proxy = await startProxy({ accountManager, fetchImpl });
+
+		const response = await postResponses(proxy, { model: "gpt-5-codex" });
+
+		expect(response.status).toBe(HTTP_STATUS.UNAUTHORIZED);
+		expect(calls).toHaveLength(1);
+		expect(accountManager.getAccountByIndex(0)).toMatchObject({
+			authInvalidatedAt: expect.any(Number),
+			authInvalidationErrorCode: "oauth_token_revoked",
+		});
+		expect(persistedStorage).not.toBeNull();
+		const reloadedManager = new AccountManager(undefined, persistedStorage);
+		expect(reloadedManager.getAccountByIndex(0)).toMatchObject({
+			authInvalidatedAt: expect.any(Number),
+			authInvalidationErrorCode: "oauth_token_revoked",
+		});
 	});
 
 	it("rotates to next account on a generic 401 that is not a token invalidation", async () => {
@@ -2460,6 +2700,10 @@ describe("runtime rotation proxy", () => {
 		expect(calls).toHaveLength(0);
 		const coolingDownUntil = accountManager.getAccountByIndex(0)?.coolingDownUntil ?? 0;
 		expect(coolingDownUntil).toBeGreaterThan(now + 250_000);
+		expect(accountManager.getAccountByIndex(0)).toMatchObject({
+			authInvalidatedAt: expect.any(Number),
+			authInvalidationErrorCode: "token_invalidated",
+		});
 		expect(proxy.getStatus().rotations).toBe(0);
 		// session affinity cleared — next request with same session routes to healthy account
 		const followUp = await postResponses(proxy, bodyWithSession);

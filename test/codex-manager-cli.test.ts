@@ -167,6 +167,30 @@ vi.mock("../lib/prompts/codex.js", () => ({
 }));
 
 vi.mock("../lib/accounts.js", () => ({
+	AccountManager: class MockAccountManager {
+		private readonly accounts: Array<Record<string, unknown>>;
+
+		constructor(
+			_unusedStoragePath: unknown,
+			storage: { accounts: Array<Record<string, unknown>> },
+		) {
+			this.accounts = storage.accounts.map((account, index) => ({
+				...account,
+				index,
+				rateLimitResetTimes: account.rateLimitResetTimes ?? {},
+				addedAt: account.addedAt ?? Date.now(),
+				lastUsed: account.lastUsed ?? Date.now(),
+			}));
+		}
+
+		getAccountsSnapshot() {
+			return this.accounts;
+		}
+
+		getManagedAccountRuntimeSkipReason(account: { enabled?: boolean }) {
+			return account.enabled === false ? "disabled" : null;
+		}
+	},
 	extractAccountEmail: vi.fn(() => undefined),
 	extractAccountId: vi.fn(() => "acc_test"),
 	formatAccountLabel: vi.fn((account: { email?: string }, index: number) =>

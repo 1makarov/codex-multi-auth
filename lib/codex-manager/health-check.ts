@@ -1,4 +1,5 @@
 import {
+	AUTH_INVALIDATION_MARKER,
 	extractAccountEmail,
 	extractAccountId,
 	formatAccountLabel,
@@ -40,6 +41,16 @@ import {
 	pruneUnsafeQuotaEmailCacheEntry,
 	updateQuotaCacheForAccount,
 } from "./quota-cache-helpers.js";
+
+function appendAuthInvalidationMarker(
+	account: { authInvalidatedAt?: number },
+	detail: string,
+): string {
+	return typeof account.authInvalidatedAt === "number" &&
+		Number.isFinite(account.authInvalidatedAt)
+		? `${detail} [${AUTH_INVALIDATION_MARKER}]`
+		: detail;
+}
 
 /**
  * Body of the `check` command, also reused by the login dashboard's quick
@@ -166,6 +177,7 @@ export async function runHealthCheck(
 			if (hasLikelyInvalidRefreshToken(account.refreshToken)) {
 				healthDetail += " (re-login suggested soon)";
 			}
+			healthDetail = appendAuthInvalidationMarker(account, healthDetail);
 			ok += 1;
 			if (display.showPerAccountRows) {
 				const healthMarker = healthTone === "success" ? "✓" : "!";
@@ -206,6 +218,14 @@ export async function runHealthCheck(
 			}
 			if (account.enabled === false) {
 				account.enabled = true;
+				changed = true;
+			}
+			if (
+				typeof account.authInvalidatedAt === "number" ||
+				account.authInvalidationErrorCode !== undefined
+			) {
+				delete account.authInvalidatedAt;
+				delete account.authInvalidationErrorCode;
 				changed = true;
 			}
 			if (accountIdentityChanged && liveProbe && workingQuotaCache) {
@@ -272,6 +292,7 @@ export async function runHealthCheck(
 				}
 			}
 			if (display.showPerAccountRows) {
+				healthyMessage = appendAuthInvalidationMarker(account, healthyMessage);
 				const healthyMarker = healthyTone === "success" ? "✓" : "!";
 				console.log(
 					`  ${stylePromptText(healthyMarker, healthyTone)} ${labelText} ${stylePromptText("|", "muted")} ${styleAccountDetailText(healthyMessage, healthyTone)}`,
@@ -285,15 +306,20 @@ export async function runHealthCheck(
 					signedInOnly += 1;
 				}
 				if (display.showPerAccountRows) {
+					const detailWithMarker = appendAuthInvalidationMarker(
+						account,
+						`refresh failed (${detail}) but this account still works right now`,
+					);
 					console.log(
-						`  ${stylePromptText("!", "warning")} ${labelText} ${stylePromptText("|", "muted")} ${stylePromptText(`refresh failed (${detail}) but this account still works right now`, "warning")}`,
+						`  ${stylePromptText("!", "warning")} ${labelText} ${stylePromptText("|", "muted")} ${stylePromptText(detailWithMarker, "warning")}`,
 					);
 				}
 			} else {
 				failed += 1;
 				if (display.showPerAccountRows) {
+					const detailWithMarker = appendAuthInvalidationMarker(account, detail);
 					console.log(
-						`  ${stylePromptText("✗", "danger")} ${labelText} ${stylePromptText("|", "muted")} ${stylePromptText(detail, "danger")}`,
+						`  ${stylePromptText("✗", "danger")} ${labelText} ${stylePromptText("|", "muted")} ${stylePromptText(detailWithMarker, "danger")}`,
 					);
 				}
 			}

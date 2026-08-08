@@ -1,4 +1,8 @@
-import { formatAccountLabel, formatWaitTime } from "./accounts.js";
+import {
+	AUTH_INVALIDATION_MARKER,
+	formatAccountLabel,
+	formatWaitTime,
+} from "./accounts.js";
 import type { CodexQuotaSnapshot } from "./quota-probe.js";
 import type { QuotaCacheData } from "./quota-cache.js";
 import {
@@ -202,6 +206,15 @@ export function evaluateForecastAccount(
 		availability = "unavailable";
 		riskScore += 95;
 		reasons.push("account is disabled");
+	}
+
+	if (
+		typeof account.authInvalidatedAt === "number" &&
+		Number.isFinite(account.authInvalidatedAt)
+	) {
+		availability = "unavailable";
+		riskScore += 95;
+		reasons.push(AUTH_INVALIDATION_MARKER);
 	}
 
 	if (input.refreshFailure) {

@@ -149,6 +149,12 @@ The 2.0.1 line makes runtime rotation the default for request-bearing wrapper-la
 - Official Codex app binaries are not patched.
 - Pause/drain account policies and budget/profile checks are enforced on the rotation path via `evaluateRuntimePolicy`.
 
+`codex app-server` launched through the wrapper changed transport (#659). Three consequences worth knowing before you upgrade:
+
+- It runs against your canonical `CODEX_HOME` and no longer creates a shadow home under `<CODEX_HOME>/multi-auth/runtime-shadow-homes/`. On 0.147.0 the old path was effectively unusable: Codex refuses to start when `<CODEX_HOME>/app-server-control` is a symlink, which is what the shadow mirror made of it, and a server that did start served every attached client a frozen copy of the thread index.
+- The rotation helper is stopped when the server exits rather than left to idle out. This is the opposite of the interactive TUI, which detaches its helper on purpose — a resident server owns its proxy for its whole lifetime, and a supervisor that restarts the server would otherwise strand one helper per restart.
+- A rotation proxy that cannot start now fails the server hard with a diagnostic and exit 1, instead of silently running it without rotation. An unrotated resident server bills whatever account the official CLI resolves for every attached client, which is a billing error you would not see; a failed launch is one you would.
+
 Validate after enabling:
 
 ```bash

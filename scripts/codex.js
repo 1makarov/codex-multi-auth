@@ -76,6 +76,8 @@ const APP_RUNTIME_HELPER_REAL_CODEX_HOME_ENV =
 	"CODEX_MULTI_AUTH_REAL_CODEX_HOME";
 const APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME";
+const APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV =
+	"CODEX_MULTI_AUTH_APP_ROTATION_INSTALL_APP_SERVER_SHIM";
 const APP_SERVER_CONFIG_ARGS_ENV =
 	"CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON";
 const APP_RUNTIME_HELPER_STATUS_FILE =
@@ -1769,6 +1771,10 @@ async function forwardToRealCodex(codexBin, rawArgs, baseEnv = process.env) {
 			compatibility,
 			rawArgs,
 		);
+		if (runtimeProxyContext.startupError) {
+			console.error(runtimeProxyContext.startupError);
+			return 1;
+		}
 		const result = await forwardToRealCodexOnce(
 			codexBin,
 			runtimeProxyContext.args,
@@ -4058,17 +4064,30 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 					clientApiKey,
 					configTomlModule,
 				);
-		const appServerConfigArgs = useCanonicalHome
-			? [
-					...(runtimeContext.args ?? []),
-					"-c",
-					`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
-				]
-			: [];
-		appServerShimDir = installRuntimeRotationAppServerCliShim(
-			runtimeContext.env,
-			appServerConfigArgs,
-		);
+		// The shim only exists so a Codex process that spawns its own
+		// `codex app-server` through `CODEX_CLI_PATH` — the desktop app — gets that
+		// spawn routed back through the wrapper. Installing it is not free and not
+		// inert: it copies the node image into a per-pid directory and stamps
+		// `CODEX_CLI_PATH`, `NODE_OPTIONS` and `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0`
+		// onto the environment every forwarded child inherits. A wrapper-invoked
+		// `app-server` is already launched with the rotation overrides on its own
+		// command line, so it must not pay for or inherit any of that (#659).
+		const installAppServerShim =
+			(process.env[APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV] ?? "1").trim() !==
+			"0";
+		if (installAppServerShim) {
+			const appServerConfigArgs = useCanonicalHome
+				? [
+						...(runtimeContext.args ?? []),
+						"-c",
+						`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
+					]
+				: [];
+			appServerShimDir = installRuntimeRotationAppServerCliShim(
+				runtimeContext.env,
+				appServerConfigArgs,
+			);
+		}
 		lastRequestCount = proxyServer.getStatus?.().totalRequests ?? 0;
 		publishStatus("running");
 		process.stdout.write(
@@ -4194,6 +4213,8 @@ function startRuntimeRotationAppHelper(baseContext, options = {}) {
 			[APP_RUNTIME_HELPER_REAL_CODEX_HOME_ENV]: realCodexHome,
 			[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV]:
 				options.useCanonicalHome === true ? "1" : "0",
+			[APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV]:
+				options.installAppServerShim === false ? "0" : "1",
 		};
 		const helper = spawn(
 			process.execPath,
@@ -4227,6 +4248,12 @@ function startRuntimeRotationAppHelper(baseContext, options = {}) {
 		}, APP_RUNTIME_HELPER_LAUNCH_TIMEOUT_MS);
 		helper.stdout?.setEncoding("utf8");
 		helper.stdout?.on("data", (chunk) => {
+			// Keep consuming after startup settles so the helper never blocks on a
+			// full pipe, but stop accumulating: `app-server` holds this parent open
+			// for the resident server's whole life, so a buffer that only ever grows
+			// is a leak, and re-parsing the retained ready line on every later chunk
+			// is pure waste.
+			if (settled) return;
 			stdoutBuffer += chunk;
 			const newlineIndex = stdoutBuffer.indexOf("\n");
 			if (newlineIndex < 0) return;
@@ -4249,6 +4276,7 @@ function startRuntimeRotationAppHelper(baseContext, options = {}) {
 		});
 		helper.stderr?.setEncoding("utf8");
 		helper.stderr?.on("data", (chunk) => {
+			if (settled) return;
 			stderrBuffer += chunk;
 		});
 		helper.once("error", fail);
@@ -4268,11 +4296,17 @@ async function createRuntimeRotationAppHelperContext(
 	configTomlModule,
 	options = {},
 ) {
-	const startedAt = Date.now();
 	const { helper, message } = await startRuntimeRotationAppHelper(
 		baseContext,
 		options,
 	);
+	// Start the grace clock once the helper is ready, not before it is launched.
+	// Launching is bounded by APP_RUNTIME_HELPER_LAUNCH_TIMEOUT_MS (15s), so a
+	// cold or loaded machine could otherwise burn the whole 5s window before the
+	// forwarded command had run at all, and `codex app` — which relies on the
+	// window rather than an explicit `detachOnExit` — would kill the helper it
+	// had just handed the desktop app off to.
+	const startedAt = Date.now();
 	const helperEnv = message.env ?? {};
 	const helperShimDir =
 		typeof helperEnv.CODEX_CLI_PATH === "string" &&
@@ -4284,9 +4318,16 @@ async function createRuntimeRotationAppHelperContext(
 		: [];
 	const detachGraceMs = resolveRuntimeRotationAppHelperDetachGraceMs(baseContext.env);
 
+	// An explicit `detachOnExit: false` is a decision, not a default: a resident
+	// server owns its proxy for its whole lifetime, and leaving the helper behind
+	// on a short-lived run — a client attaches, runs one query, disconnects —
+	// strands it for the full idle timeout with nobody left to refresh its
+	// activity clock. Only an unset `detachOnExit` falls back to the grace window.
 	const cleanup = async ({ exitCode } = {}) => {
 		const livedMs = Date.now() - startedAt;
-		if (exitCode === 0 && (options.detachOnExit === true || livedMs < detachGraceMs)) {
+		const detachWithinGrace =
+			options.detachOnExit !== false && livedMs < detachGraceMs;
+		if (exitCode === 0 && (options.detachOnExit === true || detachWithinGrace)) {
 			helper.stdout?.destroy();
 			helper.stderr?.destroy();
 			helper.unref();
@@ -4321,6 +4362,11 @@ async function createRuntimeRotationAppHelperContext(
 			...baseContext.env,
 			...helperEnv,
 		},
+		// Without the app-server shim there is no `CODEX_MULTI_AUTH_APP_SERVER_ACCOUNT_LABEL`
+		// in the forwarded environment, so the caller has to ask for the
+		// `account/read` / `getAuthStatus` / `account/rateLimits/read` rewriting
+		// explicitly. Only the shadow branch used to set it.
+		proxyAppServerAccountRead: options.proxyAppServerAccountRead === true,
 		cleanup: async (details) => {
 			try {
 				await cleanup(details);
@@ -4348,14 +4394,56 @@ async function createRuntimeRotationProxyContextIfEnabled(
 		return baseContext;
 	}
 
+	// A helper that cannot start is a hard failure for these branches — unlike the
+	// shadow path below, there is no rotation-off shape left to degrade into. Turn
+	// it into a diagnostic and a nonzero exit rather than an unhandled rejection,
+	// and release the compatibility shadow home the caller already built.
+	const startAppHelperContext = async (options) => {
+		try {
+			return await createRuntimeRotationAppHelperContext(
+				baseContext,
+				configTomlModule,
+				options,
+			);
+		} catch (error) {
+			try {
+				baseContext.cleanup?.();
+			} catch {
+				// Best-effort cleanup only; report the original failure.
+			}
+			return {
+				startupError: `codex-multi-auth runtime rotation helper failed to start: ${
+					error instanceof Error ? error.message : String(error)
+				}`,
+			};
+		}
+	};
+
+	// `app-server` is a resident process, and the shadow home cannot host one: the
+	// mirror links directories, so Codex's lstat-strict check on
+	// `<CODEX_HOME>/app-server-control` refuses to start, and a server that does
+	// start serves every attached client a frozen snapshot of the thread index for
+	// its whole life. Same reasoning that moved `resume`/`fork` in #648 (#659).
+	if (isCodexAppServerCommand(rawArgs)) {
+		return startAppHelperContext({
+			// A resident server owns its proxy for its whole lifetime.
+			detachOnExit: false,
+			useCanonicalHome: true,
+			// Nothing here spawns `codex app-server` through `CODEX_CLI_PATH`; the
+			// server is launched with the rotation overrides already on its command
+			// line. See the shim gate in `runRuntimeRotationAppHelper`.
+			installAppServerShim: false,
+			proxyAppServerAccountRead: true,
+		});
+	}
 	if (isCodexAppCommand(rawArgs)) {
-		return createRuntimeRotationAppHelperContext(baseContext, configTomlModule);
+		return startAppHelperContext();
 	}
 	if (
 		isCodexInteractiveTuiCommand(rawArgs) ||
 		isCodexInteractiveResumeCommand(rawArgs)
 	) {
-		return createRuntimeRotationAppHelperContext(baseContext, configTomlModule, {
+		return startAppHelperContext({
 			detachOnExit: true,
 			useCanonicalHome: true,
 		});

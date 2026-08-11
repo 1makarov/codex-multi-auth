@@ -817,6 +817,24 @@ async function waitForFileText(
 	);
 }
 
+// Windows has no SIGTERM, so a helper the wrapper stops is hard-terminated and
+// never reaches the handler that appends its own `close` marker. Asserting the
+// process is gone pins "the wrapper reaped its helper" on every platform — and
+// it fails for a *stranded* helper too, which keeps the default 12h idle window
+// and stays alive long past any timeout here.
+async function expectAppHelperReaped(markerPath: string): Promise<void> {
+	const pidMatch = readFileSync(markerPath, "utf8").match(
+		/^start:[^\n]*:pid=(\d+)$/m,
+	);
+	expect(pidMatch?.[1]).toBeTruthy();
+	const helperPid = Number(pidMatch?.[1]);
+	// Termination is asynchronous; give the OS a moment to reap the helper.
+	for (let attempt = 0; attempt < 40 && isProcessAlive(helperPid); attempt += 1) {
+		await sleep(100);
+	}
+	expect(isProcessAlive(helperPid)).toBe(false);
+}
+
 function combinedOutput(
 	result: SpawnSyncReturns<string> | WrapperAsyncResult,
 ): string {
@@ -2146,23 +2164,185 @@ describe("codex bin wrapper", () => {
 		}
 	});
 
-	it("starts the opt-in runtime rotation proxy for app-server without capturing protocol stdio", () => {
+	// `app-server` used to take the shadow-home transport, which a resident server
+	// cannot live on: the mirror links directories, so Codex's lstat-strict check
+	// on `<CODEX_HOME>/app-server-control` refuses to start, and a server that does
+	// start serves every attached client a frozen snapshot of the thread index for
+	// its whole life. It now takes the canonical-home app helper, like the bare TUI
+	// and `resume`/`fork` (#659).
+	it("runs app-server on the canonical Codex home without capturing protocol stdio (#659)", async () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
 		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
 			"#!/usr/bin/env node",
 			'const fs = require("node:fs");',
 			'const path = require("node:path");',
-			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
-			'console.log(`CODEX_HOME:${process.env.CODEX_HOME ?? ""}`);',
+			"const args = process.argv.slice(2);",
+			'console.log(`FORWARDED:${args.join(" ")}`);',
+			'console.log(`HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);',
 			'console.log(`OPENAI_API_KEY:${process.env.OPENAI_API_KEY ?? ""}`);',
+			'console.log(`KEY_IN_ARGS:${args.includes(process.env.OPENAI_API_KEY ?? "__missing__")}`);',
 			'console.log(`CODEX_CLI_PATH:${process.env.CODEX_CLI_PATH ?? ""}`);',
 			'console.log(`APP_SERVER_LABEL:${process.env.CODEX_MULTI_AUTH_APP_SERVER_ACCOUNT_LABEL ?? ""}`);',
 			'console.log(`RUNTIME_PROXY_ENV:${process.env.CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY ?? ""}`);',
 			'console.log(`NODE_OPTIONS_HAS_APP_SERVER_PRELOAD:${(process.env.NODE_OPTIONS ?? "").includes("codex-multi-auth-app-server-preload.mjs")}`);',
 			'const configPath = path.join(process.env.CODEX_HOME ?? "", "config.toml");',
-			'console.log(fs.readFileSync(configPath, "utf8"));',
+			'console.log(`CONFIG:${fs.readFileSync(configPath, "utf8")}`);',
 			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const result = runWrapper(fixtureRoot, ["app-server", "--listen", "stdio://"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER_PID: "1",
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("HOME_IS_ORIGINAL:true");
+		expect(output).toContain(
+			'FORWARDED:app-server --listen stdio:// -c cli_auth_credentials_store="file"',
+		);
+		// Rotation rides along as `-c` overrides on the command line rather than as a
+		// rewritten shadow `config.toml`, so the canonical config is never touched.
+		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.name="codex-multi-auth"`,
+		);
+		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.base_url=`,
+		);
+		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.env_key="OPENAI_API_KEY"`,
+		);
+		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.requires_openai_auth=false`,
+		);
+		expect(output).toContain(
+			`model_providers.${RUNTIME_ROTATION_PROXY_PROVIDER_ID}.wire_api="responses"`,
+		);
+		expect(output).toContain("disable_response_storage=false");
+		expect(output).toContain(
+			`model_provider="${RUNTIME_ROTATION_PROXY_PROVIDER_ID}"`,
+		);
+		// The bearer token reaches the server through the environment, never through
+		// an argv the OS exposes to every other process on the machine.
+		expect(output).toMatch(/^OPENAI_API_KEY:[0-9a-f]{64}$/m);
+		expect(output).toContain("KEY_IN_ARGS:false");
+		expect(output).toContain('CONFIG:model_provider = "openai"');
+		expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toBe(
+			'model_provider = "openai"\n',
+		);
+		// The shadow transport is gone, not merely bypassed.
+		expect(
+			existsSync(join(originalHome, "multi-auth", "runtime-shadow-homes")),
+		).toBe(false);
+		// The app-server CLI shim exists so the Codex *desktop app* can have its own
+		// `app-server` spawn intercepted through `CODEX_CLI_PATH`. A wrapper-invoked
+		// app-server already carries the overrides on its command line, so it must
+		// neither pay for the shim nor inherit the environment it stamps — most of
+		// all `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0`, which every process the
+		// server spawns would otherwise inherit and use to bypass the pool.
+		expect(output).toMatch(/^CODEX_CLI_PATH:$/m);
+		expect(output).toMatch(/^APP_SERVER_LABEL:$/m);
+		expect(output).toContain("RUNTIME_PROXY_ENV:1");
+		expect(output).toContain("NODE_OPTIONS_HAS_APP_SERVER_PRELOAD:false");
+		// A resident server owns its proxy for its whole lifetime, so the helper is
+		// stopped rather than left to idle out. No shortened idle timeout here on
+		// purpose: this is a regression test for the detach clause, and a stranded
+		// helper would keep the default 12h window and stay alive.
+		await expectAppHelperReaped(markerPath);
+	}, 20_000);
+
+	// Reproduction 1 and 2 from #659, from the server's own point of view: the two
+	// canonical-home entries that the shadow mirror destroyed.
+	it("gives app-server a real app-server-control directory and the live thread index (#659)", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'const fs = require("node:fs");',
+			'const path = require("node:path");',
+			"const args = process.argv.slice(2);",
+			'const home = process.env.CODEX_HOME ?? "";',
+			'console.log(`LISTEN:${args[args.indexOf("--listen") + 1] ?? ""}`);',
+			// Codex applies an lstat-strict check here and refuses to start when the
+			// path is a symlink, which is exactly what the shadow mirror made of it.
+			'const controlPath = path.join(home, "app-server-control");',
+			'const controlStat = fs.lstatSync(controlPath);',
+			"console.log(`CONTROL_IS_DIR:${controlStat.isDirectory()}`);",
+			"console.log(`CONTROL_IS_SYMLINK:${controlStat.isSymbolicLink()}`);",
+			// The shadow mirror snapshots the runtime SQLite state rather than linking
+			// it, so a resident server held a frozen copy of the thread index and threw
+			// away every thread it created (#647 is the same defect for `resume`).
+			'const statePath = path.join(home, "state_5.sqlite");',
+			'console.log(`THREAD_INDEX:${fs.readFileSync(statePath, "utf8").trim()}`);',
+			'fs.appendFileSync(statePath, "server-created-thread\\n", "utf8");',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		// Fixture-local, so concurrent workers and repeat runs cannot collide on a
+		// process-global path.
+		const socketPath = join(fixtureRoot, "app-server.sock");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(join(originalHome, "app-server-control"), { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		writeFileSync(
+			join(originalHome, "state_5.sqlite"),
+			"canonical-thread-index\n",
+			"utf8",
+		);
+
+		const listenUrl = `unix://${socketPath.replace(/\\/g, "/")}`;
+		const result = runWrapper(
+			fixtureRoot,
+			["app-server", "--listen", listenUrl],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER_PID: "1",
+				OPENAI_API_KEY: undefined,
+			},
+		);
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain(`LISTEN:${listenUrl}`);
+		expect(output).toContain("CONTROL_IS_DIR:true");
+		expect(output).toContain("CONTROL_IS_SYMLINK:false");
+		expect(output).toContain("THREAD_INDEX:canonical-thread-index");
+		// What the server writes lands in the canonical home rather than in a copy
+		// that is discarded at exit.
+		expect(readFileSync(join(originalHome, "state_5.sqlite"), "utf8")).toBe(
+			"canonical-thread-index\nserver-created-thread\n",
+		);
+		await expectAppHelperReaped(markerPath);
+	}, 20_000);
+
+	// A supervised app-server that dies is the common production case, and it is
+	// the branch that actually differs from the pre-#659 detach condition. Nothing
+	// covered it before.
+	it("stops the rotation helper when app-server exits nonzero (#659)", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			"process.exit(3);",
 		]);
 		const originalHome = join(fixtureRoot, "codex-home");
 		const markerPath = join(fixtureRoot, "proxy-marker.txt");
@@ -2174,26 +2354,91 @@ describe("codex bin wrapper", () => {
 			CODEX_HOME: originalHome,
 			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
 			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER_PID: "1",
+			OPENAI_API_KEY: undefined,
+		});
+
+		expect(result.status).toBe(3);
+		await expectAppHelperReaped(markerPath);
+	}, 20_000);
+
+	// The motivating use case for #659 is one account-pinned app-server per
+	// account. The pin can only reach the proxy by environment across the detached
+	// helper boundary, so pin the crossing for this branch too (#623).
+	it("propagates the resolved --account pin into the app-server rotation helper (#659)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "forced-app-server-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeAccountsFixture(originalHome, 3);
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			"process.exit(0);",
+		]);
+
+		const result = runWrapper(
+			fixtureRoot,
+			["--account", "2", "app-server", "--listen", "stdio://"],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER_FORCED: "1",
+				OPENAI_API_KEY: undefined,
+			},
+		);
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		// The helper process saw the resolved index (account 2 -> 0-based 1).
+		expect(readFileSync(markerPath, "utf8")).toContain("forced-index-env:1");
+		// The launcher-only flag never reaches the official CLI.
+		expect(output).not.toContain("--account");
+	});
+
+	// The shadow branch degrades to rotation-off when its proxy cannot start. The
+	// helper branches have no such shape to fall back to, so they fail hard — but
+	// hard has to mean a diagnostic and an exit code, not ERR_UNHANDLED_REJECTION
+	// with a raw stack trace and a leaked compatibility home (#659).
+	it("reports a clean error when the app-server rotation helper cannot start (#659)", () => {
+		const fixtureRoot = createWrapperFixture();
+		// Config helpers present, proxy module absent: the parent reaches the helper
+		// branch, and the helper dies during startup.
+		createRuntimeConfigTomlFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const result = runWrapper(fixtureRoot, ["app-server", "--listen", "stdio://"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
 			OPENAI_API_KEY: undefined,
 		});
 
 		const output = combinedOutput(result);
-		expect(result.status).toBe(0);
+		expect(result.status).toBe(1);
 		expect(output).toContain(
-			`FORWARDED:app-server --listen stdio:// -c cli_auth_credentials_store="file" -c model_provider="${RUNTIME_ROTATION_PROXY_PROVIDER_ID}"`,
+			"codex-multi-auth runtime rotation helper failed to start",
 		);
-		const apiKeyMatch = output.match(/^OPENAI_API_KEY:([0-9a-f]{64})$/m);
-		expect(apiKeyMatch?.[1]).toBeTruthy();
-		expect(output).toContain("requires_openai_auth = false");
-		expect(output).toContain('name = "codex-multi-auth"');
-		expect(output).toContain(
-			`experimental_bearer_token = "${apiKeyMatch?.[1]}"`,
-		);
-		expect(output).toContain('wire_api = "responses"');
-		expect(output).not.toContain("env_key");
-		expect(readFileSync(markerPath, "utf8")).toBe(
-			"start:http://127.0.0.1:4567\nclose\n",
-		);
+		expect(output).not.toContain("ERR_UNHANDLED_REJECTION");
+		// Failing hard means the server never ran unrotated.
+		expect(output).not.toContain("FORWARDED:");
 	});
 
 	it("rewrites app-server account/read responses to the codex-multi-auth display name", () => {

@@ -2441,6 +2441,59 @@ describe("codex bin wrapper", () => {
 		expect(output).not.toContain("FORWARDED:");
 	});
 
+	// `createCompatibilityCodexHome` runs *before* the transport is chosen, so a
+	// helper that cannot start has to release a shadow home it never used. That
+	// home is an `mkdtemp` under the OS temp dir — not the rotation shadow root
+	// under `<CODEX_HOME>/multi-auth/runtime-shadow-homes` — so pointing TMPDIR at
+	// the fixture is what makes the assertion deterministic and non-vacuous. Drop
+	// the `baseContext.cleanup?.()` call on the failure path and this fails; on
+	// Windows the stranded home is a locked directory the next run has to sweep.
+	it("releases the compatibility home when the app-server rotation helper cannot start (#659)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeConfigTomlFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const controlledTmp = join(fixtureRoot, "tmp");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(controlledTmp, { recursive: true });
+		// `--model gpt-5.1` coerces `xhigh` down to `high`, which is the only thing
+		// that makes `createCompatibilityCodexHome` build a shadow mirror at all.
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\nmodel_reasoning_effort = "xhigh"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(
+			fixtureRoot,
+			["app-server", "--listen", "stdio://", "--model", "gpt-5.1"],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				TMP: controlledTmp,
+				TEMP: controlledTmp,
+				TMPDIR: controlledTmp,
+				OPENAI_API_KEY: undefined,
+			},
+		);
+
+		const output = combinedOutput(result);
+		expect(result.status).toBe(1);
+		expect(output).toContain(
+			"codex-multi-auth runtime rotation helper failed to start",
+		);
+		expect(
+			readdirSync(controlledTmp).filter((entry) =>
+				entry.startsWith("codex-multi-auth-home-"),
+			),
+		).toEqual([]);
+	});
+
 	it("rewrites app-server account/read responses to the codex-multi-auth display name", () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);

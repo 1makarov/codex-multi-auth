@@ -4329,11 +4329,13 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 	const countOpenConnections = () => {
 		if (typeof proxyServer?.getOpenConnectionCount !== "function") return 0;
 		const open = proxyServer.getOpenConnectionCount();
-		// A garbage reading is "unknown", and unknown degrades the same way a
-		// missing method does. Returning it raw would compare non-finite against
-		// 0, block the reap forever, and silently restore the leak this exists
-		// to close — failing in the one direction the fix cannot afford.
-		return Number.isFinite(open) ? open : 0;
+		// Only a positive count of sockets is evidence of a consumer. Anything
+		// else — negative, fractional, NaN, Infinity — is "unknown", and unknown
+		// degrades exactly the way a missing method does. Comparing a garbage
+		// reading against 0 directly would block the reap forever and silently
+		// restore the leak this exists to close, which is the one direction the
+		// fix cannot afford to fail in.
+		return Number.isSafeInteger(open) && open > 0 ? open : 0;
 	};
 	// The deadline the reaper will actually enforce, which is the earlier of the
 	// idle timeout and — once the owner is gone — the detached window.

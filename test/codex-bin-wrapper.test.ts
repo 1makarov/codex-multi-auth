@@ -337,6 +337,18 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			// its proxy and later goes away. Static counters cannot express
 			// "traffic is still arriving", which is exactly what the detached
 			// reaper reads.
+			// Garbage readings have to be expressible: a proxy that answers `-1`,
+			// `NaN`, or `Infinity` must degrade to "nothing attached", never to
+			// "someone is attached forever".
+			"function readProxyOpenConnections() {",
+			"  const raw = (process.env.CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS ?? '').trim().toLowerCase();",
+			"  if (raw === '') return 0;",
+			"  if (raw === 'nan') return Number.NaN;",
+			"  if (raw === 'infinity') return Number.POSITIVE_INFINITY;",
+			"  const parsed = Number.parseInt(raw, 10);",
+			"  return Number.isNaN(parsed) ? 0 : parsed;",
+			"}",
+			"",
 			"const proxyStartedAt = Date.now();",
 			"function rampedRequestCount() {",
 			"  const rampMs = readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_REQUEST_RAMP_MS');",
@@ -413,7 +425,7 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			// its live socket set. The detached reap treats a connected consumer as
 			// proof the handoff was real, so a test needs to be able to say "someone
 			// is attached" without standing up a real client.
-			"    getOpenConnectionCount: () => readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS') ?? 0,",
+			"    getOpenConnectionCount: () => readProxyOpenConnections(),",
 			"    getStatus: () => buildStatus(),",
 			"  };",
 			"}",
@@ -3531,6 +3543,50 @@ describe("codex bin wrapper", () => {
 			}
 		},
 	);
+
+	// Only a positive socket count is evidence of a consumer. A proxy that
+	// answers with garbage must not be able to pin a stranded helper alive
+	// forever — that is the leak wearing a different hat.
+	for (const [label, reading] of [
+		["a negative count", "-1"],
+		["NaN", "nan"],
+		["Infinity", "infinity"],
+	] as const) {
+		it.skipIf(process.platform === "win32")(
+			`treats ${label} from the proxy as nothing attached and still reaps`,
+			async () => {
+				const fixtureRoot = createWrapperFixture();
+				createRuntimeRotationProxyFixtureModule(fixtureRoot);
+				const originalHome = join(fixtureRoot, "codex-home");
+				const multiAuthDir = join(fixtureRoot, "multi-auth");
+				mkdirSync(originalHome, { recursive: true });
+				writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+				const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+					CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_DIR: multiAuthDir,
+					CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+					CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+					CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS: reading,
+					CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+				});
+				try {
+					await Promise.race([closed, sleep(5_000)]);
+					expect(isProcessAlive(ready.pid)).toBe(false);
+					const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+						state: string;
+					};
+					expect(status.state).toBe("owner-gone");
+				} finally {
+					await stopDirectAppHelper(helper, closed);
+				}
+			},
+		);
+	}
 
 	// The escape hatch is a real escape hatch: 0 restores the pre-fix behavior
 	// for anyone who was depending on a stranded helper outliving its launcher

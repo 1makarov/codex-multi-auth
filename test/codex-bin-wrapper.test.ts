@@ -332,9 +332,21 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			"  return value.length > 0 ? value : null;",
 			"}",
 			"",
+			// Opt-in: a request counter that climbs on its own for the first N ms
+			// and then stops, standing in for a detached consumer that keeps using
+			// its proxy and later goes away. Static counters cannot express
+			// "traffic is still arriving", which is exactly what the detached
+			// reaper reads.
+			"const proxyStartedAt = Date.now();",
+			"function rampedRequestCount() {",
+			"  const rampMs = readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_REQUEST_RAMP_MS');",
+			"  if (rampMs === null) return null;",
+			"  return Math.floor(Math.min(Date.now() - proxyStartedAt, rampMs) / 100);",
+			"}",
+			"",
 			"function buildStatus() {",
 			"  return {",
-			"    totalRequests: readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_REQUESTS') ?? 0,",
+			"    totalRequests: rampedRequestCount() ?? readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_REQUESTS') ?? 0,",
 			"    upstreamRequests: 0,",
 			"    retries: 0,",
 			"    rotations: readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_ROTATIONS') ?? 0,",
@@ -3394,6 +3406,51 @@ describe("codex bin wrapper", () => {
 				// Many detached windows' worth of ticks with a socket held open.
 				await sleep(1_500);
 				expect(isProcessAlive(ready.pid)).toBe(true);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// Connections are one kind of evidence; traffic is the other. A detached
+	// consumer that reconnects per request — no socket held between them —
+	// must keep its helper alive on the requests alone, and must lose it once
+	// the requests stop. Both halves in one run: the fixture's counter climbs
+	// for 1.2s and then freezes.
+	it.skipIf(process.platform === "win32")(
+		"lets traffic after the owner's death carry a stranded helper, and reaps it once traffic stops",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_REQUEST_RAMP_MS: "1200",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				// Two detached windows into the ramp, traffic alone is holding it up.
+				await sleep(1_000);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+				// Traffic stops at 1.2s; the window then runs out with nothing
+				// connected and nothing arriving.
+				await Promise.race([closed, sleep(5_000)]);
+				expect(isProcessAlive(ready.pid)).toBe(false);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("owner-gone");
 			} finally {
 				await stopDirectAppHelper(helper, closed);
 			}

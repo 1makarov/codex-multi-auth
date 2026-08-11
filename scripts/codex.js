@@ -4323,10 +4323,15 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 	// so it blocks the detached reap even with no requests in flight. A proxy
 	// that cannot report connections (older shape, test fixtures) reads as
 	// zero: the deadline is then carried by activity alone, as before.
-	const countOpenConnections = () =>
-		typeof proxyServer?.getOpenConnectionCount === "function"
-			? proxyServer.getOpenConnectionCount()
-			: 0;
+	const countOpenConnections = () => {
+		if (typeof proxyServer?.getOpenConnectionCount !== "function") return 0;
+		const open = proxyServer.getOpenConnectionCount();
+		// A garbage reading is "unknown", and unknown degrades the same way a
+		// missing method does. Returning it raw would compare non-finite against
+		// 0, block the reap forever, and silently restore the leak this exists
+		// to close — failing in the one direction the fix cannot afford.
+		return Number.isFinite(open) ? open : 0;
+	};
 	// The deadline the reaper will actually enforce, which is the earlier of the
 	// idle timeout and — once the owner is gone — the detached window.
 	const resolveIdleDeadline = () =>

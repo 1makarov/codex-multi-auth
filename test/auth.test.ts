@@ -217,6 +217,7 @@ describe("Auth Module", () => {
 			expect(flow.pkce).toHaveProperty("verifier");
 			expect(flow.pkce.verifier.length).toBeGreaterThanOrEqual(43);
 			expect(flow.pkce.verifier.length).toBeLessThanOrEqual(128);
+			expect(flow.pkce.verifier).toMatch(/^[A-Za-z0-9_-]+$/);
 			expect(flow.pkce.challenge).toBe(
 				createHash("sha256")
 					.update(flow.pkce.verifier)

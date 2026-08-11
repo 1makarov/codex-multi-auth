@@ -1,5 +1,4 @@
-import { generatePKCE } from "@openauthjs/openauth/pkce";
-import { randomBytes } from "node:crypto";
+import { randomBytes, webcrypto } from "node:crypto";
 import type {
 	PKCEPair,
 	AuthorizationFlow,
@@ -410,6 +409,16 @@ export interface AuthorizationFlowOptions {
 	forceNewLogin?: boolean;
 }
 
+async function generatePKCE(): Promise<PKCEPair> {
+	const verifier = randomBytes(64).toString("base64url");
+	const digest = await webcrypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(verifier),
+	);
+	const challenge = Buffer.from(digest).toString("base64url");
+	return { verifier, challenge };
+}
+
 /**
  * Create OAuth authorization flow
  * @param options - Optional configuration for the flow
@@ -418,7 +427,7 @@ export interface AuthorizationFlowOptions {
 export async function createAuthorizationFlow(
 	options?: AuthorizationFlowOptions,
 ): Promise<AuthorizationFlow> {
-	const pkce = (await generatePKCE()) as PKCEPair;
+	const pkce = await generatePKCE();
 	const state = createState();
 
 	const url = new URL(AUTHORIZE_URL);

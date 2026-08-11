@@ -174,7 +174,6 @@
 	"dependencies": {
 		"@codex-ai/plugin": "file:vendor/codex-ai-plugin",
 		"@codex-ai/sdk": "file:vendor/codex-ai-sdk",
-		"@openauthjs/openauth": "^0.4.3",
 		"hono": "4.12.33",
 		"undici": "6.28.0",
 		"zod": "4.4.3"

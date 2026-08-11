@@ -3445,11 +3445,17 @@ describe("codex bin wrapper", () => {
 		mkdirSync(originalHome, { recursive: true });
 		mkdirSync(multiAuthDir, { recursive: true });
 		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
-		const staleStatusPath = join(
-			multiAuthDir,
-			"runtime-rotation-app-helper.99999997.json",
-		);
-		writeFileSync(staleStatusPath, '{"pid":99999997,"state":"running"}\n', "utf8");
+		const staleStatusPaths = [
+			join(multiAuthDir, "runtime-rotation-app-helper.99999996.json"),
+			join(multiAuthDir, "runtime-rotation-app-helper.99999997.json"),
+		];
+		for (const [index, path] of staleStatusPaths.entries()) {
+			writeFileSync(
+				path,
+				`{"pid":9999999${6 + index},"state":"running"}\n`,
+				"utf8",
+			);
+		}
 
 		const result = runWrapper(fixtureRoot, ["app", "."], {
 			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
@@ -3457,13 +3463,21 @@ describe("codex bin wrapper", () => {
 			CODEX_MULTI_AUTH_DIR: multiAuthDir,
 			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
 			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
-			// The first two deletion attempts throw simulated EBUSY; only a
-			// retrying deletion removes the file.
+			// The failure counter is process-wide: two simulated EBUSY throws land
+			// on the deletions in whatever order the sweep visits the two files.
+			// `withSynchronousFileOperationRetry` allows four attempts per call, so
+			// even the worst split (one file eating both failures) succeeds on that
+			// file's third attempt — the outcome is order-independent as long as
+			// the retry budget stays at three attempts or more. If that budget ever
+			// shrinks below three, this test fails and the sweep would silently
+			// leave stale metadata behind on transient Windows locks.
 			CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES: "2",
 			OPENAI_API_KEY: undefined,
 		});
 		expect(result.status).toBe(0);
-		expect(existsSync(staleStatusPath)).toBe(false);
+		for (const path of staleStatusPaths) {
+			expect(existsSync(path)).toBe(false);
+		}
 	});
 
 	// Owner files have no post-mortem value and go with the helper; stale

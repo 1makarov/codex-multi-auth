@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
-import { mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import process from "node:process";
@@ -1499,74 +1499,102 @@ async function unbindCodexAppRuntimeRotationLocked(
 		);
 	}
 
-	const helperStatusPath = join(
-		dirname(paths.bindDir),
-		APP_RUNTIME_HELPER_STATUS_FILE,
+	// Helpers publish per-PID status files (`runtime-rotation-app-helper.<pid>.json`);
+	// the un-suffixed name is the legacy shared path from before that change,
+	// still checked so a pre-upgrade helper is torn down too. Every candidate
+	// walks the same per-helper logic the single file used to get: stopping is
+	// gated on ownership verification (status/owner identity-token agreement
+	// plus process identity), so unbind reaps each helper it can prove is one
+	// of ours and preserves — with a warning — anything it cannot.
+	const helperBaseDir = dirname(paths.bindDir);
+	const helperStatusPrefix = APP_RUNTIME_HELPER_STATUS_FILE.replace(
+		/\.json$/i,
+		"",
 	);
-	const helperRead = await readRuntimeHelperStatus(helperStatusPath);
-	let removeHelperStatus = false;
-	let removeHelperOwner = false;
-	let helperOwnerPath: string | null = null;
-	if (helperRead.kind === "valid") {
+	const helperStatusPattern = new RegExp(
+		`^${helperStatusPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.json$`,
+		"i",
+	);
+	let helperStatusNames: string[] = [];
+	try {
+		helperStatusNames = (await readdir(helperBaseDir)).filter((name) =>
+			helperStatusPattern.test(name),
+		);
+	} catch {
+		helperStatusNames = [];
+	}
+	const helperStatusPaths = [
+		...helperStatusNames.map((name) => join(helperBaseDir, name)),
+		join(helperBaseDir, APP_RUNTIME_HELPER_STATUS_FILE),
+	];
+	const helperCleanupPaths: string[] = [];
+	for (const helperStatusPath of helperStatusPaths) {
+		const helperRead = await readRuntimeHelperStatus(helperStatusPath);
+		if (helperRead.kind !== "valid") continue;
 		const helper = helperRead.status;
-		if (helper.kind === "codex-app-runtime-rotation-helper") {
-			helperOwnerPath = resolveRuntimeHelperOwnerPath(
-				dirname(paths.bindDir),
-				helper.pid,
-			);
-			const helperOwner = helperOwnerPath
-				? await readRuntimeHelperOwner(helperOwnerPath)
-				: null;
-			const helperOwnershipMatches =
-				!helper.identityToken ||
-				(helperOwner !== null &&
-					helper.identityToken === helperOwner.identityToken);
-			if (helper.state === "running") {
-				if (helper.pid === null) {
+		if (helper.kind !== "codex-app-runtime-rotation-helper") continue;
+		let removeHelperStatus = false;
+		let removeHelperOwner = false;
+		const helperOwnerPath = resolveRuntimeHelperOwnerPath(
+			helperBaseDir,
+			helper.pid,
+		);
+		const helperOwner = helperOwnerPath
+			? await readRuntimeHelperOwner(helperOwnerPath)
+			: null;
+		const helperOwnershipMatches =
+			!helper.identityToken ||
+			(helperOwner !== null &&
+				helper.identityToken === helperOwner.identityToken);
+		if (helper.state === "running") {
+			if (helper.pid === null) {
+				options.log?.(
+					"Warning: runtime app helper status has no valid PID; preserving status",
+				);
+			} else {
+				const wasAlive = isProcessAlive(helper.pid);
+				if (!wasAlive) {
+					removeHelperStatus = true;
+					removeHelperOwner =
+						helperOwnershipMatches && helperOwnerPath !== null;
+				} else if (!helperOwnershipMatches) {
 					options.log?.(
-						"Warning: runtime app helper status has no valid PID; preserving status",
+						"Warning: runtime app helper ownership metadata does not match; preserving status",
 					);
 				} else {
-					const wasAlive = isProcessAlive(helper.pid);
-					if (!wasAlive) {
-						removeHelperStatus = true;
-						removeHelperOwner =
-							helperOwnershipMatches && helperOwnerPath !== null;
-					} else if (!helperOwnershipMatches) {
+					const stopped = await stopRuntimeRotationAppHelperProcess(helper, {
+						platform,
+						log: options.log,
+						identityToken: helper.identityToken
+							? helperOwner?.identityToken
+							: undefined,
+						verifyProcessIdentity: options.verifyProcessIdentity,
+					});
+					const stillAlive = isProcessAlive(helper.pid);
+					removeHelperStatus = stopped && !stillAlive;
+					removeHelperOwner =
+						removeHelperStatus && helperOwnerPath !== null;
+					if (!removeHelperStatus) {
 						options.log?.(
-							"Warning: runtime app helper ownership metadata does not match; preserving status",
+							`Warning: runtime app helper (pid ${helper.pid}) did not stop; preserving status`,
 						);
-					} else {
-						const stopped = await stopRuntimeRotationAppHelperProcess(helper, {
-							platform,
-							log: options.log,
-							identityToken: helper.identityToken
-								? helperOwner?.identityToken
-								: undefined,
-							verifyProcessIdentity: options.verifyProcessIdentity,
-						});
-						const stillAlive = isProcessAlive(helper.pid);
-						removeHelperStatus = stopped && !stillAlive;
-						removeHelperOwner =
-							removeHelperStatus && helperOwnerPath !== null;
-						if (!removeHelperStatus) {
-							options.log?.(
-								`Warning: runtime app helper (pid ${helper.pid}) did not stop; preserving status`,
-							);
-						}
 					}
 				}
-			} else {
-				// A non-running, owned record is removable only when its PID is
-				// absent or no longer alive. This avoids deleting a status file
-				// while a helper is still serving despite a stale state value.
-				removeHelperStatus =
-					helper.pid === null || !isProcessAlive(helper.pid);
-				removeHelperOwner =
-					removeHelperStatus &&
-					helperOwnershipMatches &&
-					helperOwnerPath !== null;
 			}
+		} else {
+			// A non-running, owned record is removable only when its PID is
+			// absent or no longer alive. This avoids deleting a status file
+			// while a helper is still serving despite a stale state value.
+			removeHelperStatus =
+				helper.pid === null || !isProcessAlive(helper.pid);
+			removeHelperOwner =
+				removeHelperStatus &&
+				helperOwnershipMatches &&
+				helperOwnerPath !== null;
+		}
+		if (removeHelperStatus) helperCleanupPaths.push(helperStatusPath);
+		if (removeHelperOwner && helperOwnerPath !== null) {
+			helperCleanupPaths.push(helperOwnerPath);
 		}
 	}
 	await removeAppBindStartup(state ?? paths);
@@ -1617,8 +1645,7 @@ async function unbindCodexAppRuntimeRotationLocked(
 		paths.backupPath,
 		paths.statusPath,
 		state?.logPath ?? paths.logPath,
-		...(removeHelperStatus ? [helperStatusPath] : []),
-		...(removeHelperOwner && helperOwnerPath ? [helperOwnerPath] : []),
+		...helperCleanupPaths,
 	];
 	for (const candidate of cleanupCandidates) {
 		try {

@@ -689,6 +689,19 @@ function expectWrapperReturned(
 	).toBeUndefined();
 }
 
+// Mirrors the wrapper's own owner-identity capture: kernel start time via
+// `ps -o lstart=` under the C locale, parsed to epoch ms.
+function readOwnProcessStartTimeMs(): number | null {
+	const result = spawnSync("ps", ["-o", "lstart=", "-p", String(process.pid)], {
+		encoding: "utf8",
+		env: { ...process.env, LC_ALL: "C" },
+	});
+	const out = (result.stdout ?? "").trim();
+	if (!out) return null;
+	const parsed = Date.parse(out);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
 function isProcessAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
@@ -2832,9 +2845,13 @@ describe("codex bin wrapper", () => {
 		expect(readFileSync(markerPath, "utf8")).toBe(
 			"start:http://127.0.0.1:4567\nclose\n",
 		);
-		const helperStatus = JSON.parse(
-			readFileSync(join(multiAuthDir, "runtime-rotation-app-helper.json"), "utf8"),
-		) as {
+		// Status is published per helper PID; exactly one helper ran here.
+		const helperStatusFiles = readdirSync(multiAuthDir).filter((name) =>
+			/^runtime-rotation-app-helper\.\d+\.json$/.test(name),
+		);
+		expect(helperStatusFiles).toHaveLength(1);
+		const helperStatusPath = join(multiAuthDir, helperStatusFiles[0] ?? "");
+		const helperStatus = JSON.parse(readFileSync(helperStatusPath, "utf8")) as {
 			state: string;
 			totalRequests: number;
 			lastAccountIndex: number | null;
@@ -2850,10 +2867,7 @@ describe("codex bin wrapper", () => {
 		expect(helperStatus.lastAccountId).toBe("acc_second");
 		expect(helperStatus.lastAccountUpdatedAt).toBe(12345);
 		if (process.platform !== "win32") {
-			expect(
-				statSync(join(multiAuthDir, "runtime-rotation-app-helper.json")).mode &
-					0o777,
-			).toBe(0o600);
+			expect(statSync(helperStatusPath).mode & 0o777).toBe(0o600);
 		}
 		if (shadowHomeMatch?.[1]) {
 			expect(existsSync(shadowHomeMatch[1])).toBe(false);
@@ -3067,6 +3081,13 @@ describe("codex bin wrapper", () => {
 					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
 					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
 					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+					// Production launchers always pass the owner's start time, so
+					// EPERM tolerance must hold on the identity branch, not just the
+					// bare-liveness fallback — and a *matching* identity is what keeps
+					// a live owner's helper alive (the false-positive direction).
+					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: String(
+						readOwnProcessStartTimeMs() ?? "",
+					),
 					CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
 					NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}`,
 				}),
@@ -3135,6 +3156,305 @@ describe("codex bin wrapper", () => {
 			}
 		}
 	});
+
+	// Spawns a helper directly (the EPERM harness above) with the given env and
+	// waits for its ready line; the caller owns assertions and shutdown.
+	async function spawnDirectAppHelper(
+		fixtureRoot: string,
+		env: Record<string, string | undefined>,
+	): Promise<{
+		helper: ReturnType<typeof spawn>;
+		ready: { statusPath: string; pid: number };
+		closed: Promise<void>;
+		output: () => string;
+	}> {
+		const helper = spawn(
+			process.execPath,
+			[join(fixtureRoot, "scripts", "codex.js"), "--codex-multi-auth-runtime-app-helper"],
+			{
+				env: buildWrapperEnv(env),
+				stdio: ["ignore", "pipe", "pipe"],
+			},
+		);
+		let stdout = "";
+		let stderr = "";
+		const closed = new Promise<void>((resolve) => {
+			helper.once("close", () => resolve());
+		});
+		helper.stdout?.setEncoding("utf8");
+		helper.stderr?.setEncoding("utf8");
+		helper.stdout?.on("data", (chunk: string) => {
+			stdout += chunk;
+		});
+		helper.stderr?.on("data", (chunk: string) => {
+			stderr += chunk;
+		});
+		const ready = await new Promise<{ statusPath: string; pid: number }>(
+			(resolve, reject) => {
+				const timeout = setTimeout(() => {
+					reject(new Error(`helper did not become ready\n${stdout}\n${stderr}`));
+				}, 5_000);
+				helper.stdout?.on("data", () => {
+					const newlineIndex = stdout.indexOf("\n");
+					if (newlineIndex < 0) return;
+					try {
+						const message = JSON.parse(stdout.slice(0, newlineIndex)) as {
+							type?: string;
+							statusPath?: string;
+							pid?: number;
+						};
+						if (message.type === "ready" && message.statusPath && message.pid) {
+							clearTimeout(timeout);
+							resolve({ statusPath: message.statusPath, pid: message.pid });
+						}
+					} catch (error) {
+						clearTimeout(timeout);
+						reject(error);
+					}
+				});
+				helper.once("close", () => {
+					clearTimeout(timeout);
+					reject(new Error(`helper exited before ready\n${stdout}\n${stderr}`));
+				});
+			},
+		);
+		return { helper, ready, closed, output: () => `${stdout}\n${stderr}` };
+	}
+
+	async function stopDirectAppHelper(
+		helper: ReturnType<typeof spawn>,
+		closed: Promise<void>,
+	): Promise<void> {
+		if (helper.pid && isProcessAlive(helper.pid)) {
+			helper.kill("SIGTERM");
+		}
+		await Promise.race([closed, sleep(2_000)]);
+		if (helper.pid && isProcessAlive(helper.pid)) {
+			helper.kill("SIGKILL");
+			await Promise.race([closed, sleep(2_000)]);
+		}
+	}
+
+	// The idle reaper's owner check is PID *plus* the owner's process start
+	// time. A recycled PID — a live process holding the dead launcher's integer
+	// — must not push the idle deadline forward: one false "alive" per window
+	// is a ratchet the helper never recovers from, which is how helpers were
+	// observed running 33 hours past a 12-hour timeout. Simulated here by
+	// pointing the helper at a genuinely live process (this test) with a start
+	// time that cannot match. Fails against the bare kill(pid, 0) check.
+	it("idles out when the owner PID is alive but its identity does not match", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+		});
+		try {
+			await Promise.race([closed, sleep(5_000)]);
+			expect(isProcessAlive(ready.pid)).toBe(false);
+			const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+				state: string;
+			};
+			expect(status.state).toBe("idle-timeout");
+		} finally {
+			await stopDirectAppHelper(helper, closed);
+		}
+	});
+
+	// The absolute lifetime ceiling is unconditional on activity: it exists for
+	// exactly the case where activity accounting is wrong, so a genuinely live
+	// owner must not extend a helper past it.
+	it("stops at the max-lifetime ceiling even while its owner is alive", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			// Idle can never fire inside this test; only the ceiling can.
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+			CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS: "400",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+		});
+		try {
+			await Promise.race([closed, sleep(5_000)]);
+			expect(isProcessAlive(ready.pid)).toBe(false);
+			const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+				state: string;
+			};
+			expect(status.state).toBe("max-lifetime");
+		} finally {
+			await stopDirectAppHelper(helper, closed);
+		}
+	});
+
+	// N helpers, N status files: each helper publishes
+	// `runtime-rotation-app-helper.<pid>.json` and never the shared legacy
+	// path, so concurrent helpers stop last-writer-winning one file and every
+	// reader can see every helper.
+	it("publishes one status file per helper PID instead of one shared file", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const commonEnv = {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+		};
+		const first = await spawnDirectAppHelper(fixtureRoot, {
+			...commonEnv,
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker-1.txt"),
+		});
+		try {
+			const second = await spawnDirectAppHelper(fixtureRoot, {
+				...commonEnv,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker-2.txt"),
+			});
+			try {
+				expect(first.ready.statusPath).not.toBe(second.ready.statusPath);
+				expect(first.ready.statusPath).toContain(`.${first.ready.pid}.`);
+				expect(second.ready.statusPath).toContain(`.${second.ready.pid}.`);
+				const firstStatus = JSON.parse(
+					readFileSync(first.ready.statusPath, "utf8"),
+				) as { pid: number; state: string };
+				const secondStatus = JSON.parse(
+					readFileSync(second.ready.statusPath, "utf8"),
+				) as { pid: number; state: string };
+				expect(firstStatus.pid).toBe(first.ready.pid);
+				expect(secondStatus.pid).toBe(second.ready.pid);
+				expect(firstStatus.state).toBe("running");
+				expect(secondStatus.state).toBe("running");
+				expect(
+					existsSync(join(multiAuthDir, "runtime-rotation-app-helper.json")),
+				).toBe(false);
+			} finally {
+				await stopDirectAppHelper(second.helper, second.closed);
+			}
+		} finally {
+			await stopDirectAppHelper(first.helper, first.closed);
+		}
+	});
+
+	// Owner files have no post-mortem value and go with the helper; stale
+	// per-PID metadata from killed helpers — and a legacy shared status file
+	// whose recorded PID is dead — is swept when the next launcher starts a
+	// helper, which is what keeps 579-files-vs-183-helpers from recurring.
+	it("removes its owner file on exit and sweeps dead helpers' metadata on the next launch", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(multiAuthDir, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		// Metadata for a helper PID that cannot be alive, plus a legacy shared
+		// status file recording the same dead PID: all three must be swept.
+		const staleStatusPath = join(
+			multiAuthDir,
+			"runtime-rotation-app-helper.99999999.json",
+		);
+		const staleOwnerPath = join(
+			multiAuthDir,
+			"runtime-rotation-app-helper-owner.99999999.json",
+		);
+		const legacyStatusPath = join(multiAuthDir, "runtime-rotation-app-helper.json");
+		writeFileSync(staleStatusPath, '{"pid":99999999,"state":"running"}\n', "utf8");
+		writeFileSync(staleOwnerPath, '{"launcherPid":1,"identityToken":"x"}\n', "utf8");
+		writeFileSync(legacyStatusPath, '{"pid":99999999,"state":"running"}\n', "utf8");
+
+		const result = runWrapper(fixtureRoot, ["app", "."], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+			OPENAI_API_KEY: undefined,
+		});
+		expect(result.status).toBe(0);
+
+		// The launcher's sweep ran before its helper spawned.
+		expect(existsSync(staleStatusPath)).toBe(false);
+		expect(existsSync(staleOwnerPath)).toBe(false);
+		expect(existsSync(legacyStatusPath)).toBe(false);
+
+		// The launcher's own helper detached (grace window), then idles out with
+		// its owner gone; on exit it removes its owner file and leaves only its
+		// terminal status stamp.
+		const ownerPattern = /^runtime-rotation-app-helper-owner\.(\d+)\.json$/;
+		const statusPattern = /^runtime-rotation-app-helper\.(\d+)\.json$/;
+		const deadline = Date.now() + 5_000;
+		let ownerFiles: string[] = [];
+		let statusFiles: string[] = [];
+		let sawHelperMetadata = false;
+		for (;;) {
+			ownerFiles = readdirSync(multiAuthDir).filter((name) =>
+				ownerPattern.test(name),
+			);
+			statusFiles = readdirSync(multiAuthDir).filter((name) =>
+				statusPattern.test(name),
+			);
+			if (ownerFiles.length > 0 || statusFiles.length > 0) {
+				sawHelperMetadata = true;
+			}
+			const statuses = statusFiles.map(
+				(name) =>
+					JSON.parse(readFileSync(join(multiAuthDir, name), "utf8")) as {
+						state: string;
+					},
+			);
+			if (
+				sawHelperMetadata &&
+				ownerFiles.length === 0 &&
+				statuses.length > 0 &&
+				statuses.every((status) => status.state !== "running")
+			) {
+				break;
+			}
+			if (Date.now() >= deadline) {
+				throw new Error(
+					`helper metadata did not settle: owners=${JSON.stringify(ownerFiles)} statuses=${JSON.stringify(statusFiles)}`,
+				);
+			}
+			await sleep(50);
+		}
+		expect(ownerFiles).toHaveLength(0);
+		expect(statusFiles).toHaveLength(1);
+		const finalStatus = JSON.parse(
+			readFileSync(join(multiAuthDir, statusFiles[0] ?? ""), "utf8"),
+		) as { state: string };
+		expect(finalStatus.state).toBe("idle-timeout");
+	}, 15_000);
 
 	it("stops failed app helpers before unsupported-model retries", async () => {
 		const fixtureRoot = createWrapperFixture();
@@ -3275,8 +3595,11 @@ describe("codex bin wrapper", () => {
 
 		const marker = readFileSync(markerPath, "utf8");
 		expect(marker).toContain(`real-home-env:${originalHome}\n`);
+		// Status is per helper PID; the shared legacy path is no longer written.
 		expect(
-			existsSync(join(originalHome, "multi-auth", "runtime-rotation-app-helper.json")),
+			readdirSync(join(originalHome, "multi-auth")).some((name) =>
+				/^runtime-rotation-app-helper\.\d+\.json$/.test(name),
+			),
 		).toBe(true);
 		const compatibilityHomeMatch = marker.match(/^codex-home-env:(.+)$/m);
 		expect(compatibilityHomeMatch?.[1]).toBeTruthy();

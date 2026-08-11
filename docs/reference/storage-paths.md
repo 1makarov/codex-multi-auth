@@ -39,7 +39,7 @@ Override root:
 | Budget guards | `~/.codex/multi-auth/budget-guards.json` |
 | Local bridge client tokens | `~/.codex/multi-auth/local-client-tokens.json` |
 | Cross-process refresh leases | `~/.codex/multi-auth/refresh-leases/` |
-| Runtime app helper status | `~/.codex/multi-auth/runtime-rotation-app-helper.json` |
+| Runtime app helper status | `~/.codex/multi-auth/runtime-rotation-app-helper.<pid>.json` |
 | Runtime app helper owner metadata | `~/.codex/multi-auth/runtime-rotation-app-helper-owner.<pid>.json` |
 | Persistent app bind directory | `~/.codex/multi-auth/app-bind/` |
 | Named pool backups | `~/.codex/multi-auth/backups/` |
@@ -159,7 +159,7 @@ Runtime rotation adds local state only when enabled or when a helper has recentl
 | Path | Purpose |
 | --- | --- |
 | `~/.codex/multi-auth/runtime-observability.json` | request counters, last selected runtime account metadata, and cooldown context for status/report commands |
-| `~/.codex/multi-auth/runtime-rotation-app-helper.json` | wrapper-launched `codex app` helper state, idle timeout, request count, and last-account metadata |
+| `~/.codex/multi-auth/runtime-rotation-app-helper.<pid>.json` | wrapper-launched `codex app` helper state, idle timeout, request count, and last-account metadata — one file per helper; the un-suffixed name is the legacy shared path from older versions, still read |
 | `~/.codex/multi-auth/app-bind/runtime-rotation-app-bind.json` | persistent packaged-app bind state |
 | `~/.codex/multi-auth/app-bind/codex-config-backup.json` | backup metadata for restoring the real Codex `config.toml` |
 | `~/.codex/multi-auth/app-bind/runtime-rotation-app-bind-status.json` | persistent app router status |

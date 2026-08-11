@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
 import type { RuntimeObservabilitySnapshot } from "./runtime-observability.js";
@@ -124,8 +124,9 @@ function isProcessAlive(pid: number | null): boolean {
 	}
 }
 
-export function readAppRuntimeHelperStatus(): AppRuntimeHelperAccountStatus | null {
-	const statusPath = join(getCodexMultiAuthDir(), APP_RUNTIME_HELPER_STATUS_FILE);
+function readAppRuntimeHelperStatusFile(
+	statusPath: string,
+): AppRuntimeHelperAccountStatus | null {
 	if (!existsSync(statusPath)) return null;
 	try {
 		const stat = statSync(statusPath);
@@ -150,6 +151,50 @@ export function readAppRuntimeHelperStatus(): AppRuntimeHelperAccountStatus | nu
 	} catch {
 		return null;
 	}
+}
+
+// Helpers publish per-PID status files (`runtime-rotation-app-helper.<pid>.json`)
+// so N concurrent helpers stop overwriting one shared path; the un-suffixed
+// legacy path is still read so a helper from before that change stays visible.
+function listAppRuntimeHelperStatusPaths(multiAuthDir: string): string[] {
+	const basePattern = APP_RUNTIME_HELPER_STATUS_FILE.replace(/\.json$/i, "");
+	const perPidPattern = new RegExp(
+		`^${basePattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.json$`,
+		"i",
+	);
+	let entries: string[] = [];
+	try {
+		entries = readdirSync(multiAuthDir);
+	} catch {
+		entries = [];
+	}
+	const paths = entries
+		.filter((name) => perPidPattern.test(name))
+		.map((name) => join(multiAuthDir, name));
+	paths.push(join(multiAuthDir, APP_RUNTIME_HELPER_STATUS_FILE));
+	return paths;
+}
+
+export function readAppRuntimeHelperStatus(): AppRuntimeHelperAccountStatus | null {
+	const statuses = listAppRuntimeHelperStatusPaths(getCodexMultiAuthDir())
+		.map(readAppRuntimeHelperStatusFile)
+		.filter(
+			(status): status is AppRuntimeHelperAccountStatus =>
+				status !== null && status.kind === APP_RUNTIME_HELPER_KIND,
+		);
+	if (statuses.length === 0) return null;
+	// Prefer a live running helper; among several, the most recently updated.
+	// Absent any live helper, the freshest terminal stamp keeps the previous
+	// "reports the last helper's final state" behavior.
+	const byRecency = (
+		left: AppRuntimeHelperAccountStatus,
+		right: AppRuntimeHelperAccountStatus,
+	) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0);
+	const live = statuses
+		.filter((status) => status.state === "running" && isProcessAlive(status.pid))
+		.sort(byRecency);
+	if (live.length > 0) return live[0] ?? null;
+	return statuses.sort(byRecency)[0] ?? null;
 }
 
 export function appRuntimeHelperStatusToSignal(

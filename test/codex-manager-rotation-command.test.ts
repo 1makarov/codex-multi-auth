@@ -446,6 +446,63 @@ describe("codex-multi-auth rotation command", () => {
 		expect(infos.join("\n")).toContain("Codex app helper: not running");
 	});
 
+	it("prefers the newest live per-PID helper status and counts the others", async () => {
+		const root = await createTempRoot("codex-rotation-helper-per-pid-");
+		process.env.CODEX_MULTI_AUTH_DIR = root;
+		await mkdir(root, { recursive: true });
+		const now = Date.now();
+		// A live per-PID helper (this test's own PID is alive), a second live
+		// helper record on the legacy shared path, and a dead per-PID record
+		// that must count for nothing.
+		await writeFile(
+			join(root, `runtime-rotation-app-helper.${process.pid}.json`),
+			`${JSON.stringify({
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper",
+				state: "running",
+				pid: process.pid,
+				totalRequests: 7,
+				rotations: 2,
+				idleExpiresAt: now + 60_000,
+				updatedAt: now,
+			})}\n`,
+			"utf8",
+		);
+		await writeFile(
+			join(root, "runtime-rotation-app-helper.json"),
+			`${JSON.stringify({
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper",
+				state: "running",
+				pid: process.ppid,
+				totalRequests: 1,
+				rotations: 0,
+				updatedAt: now - 5_000,
+			})}\n`,
+			"utf8",
+		);
+		await writeFile(
+			join(root, "runtime-rotation-app-helper.99999999.json"),
+			`${JSON.stringify({
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper",
+				state: "running",
+				pid: 99999999,
+				updatedAt: now,
+			})}\n`,
+			"utf8",
+		);
+		const { deps, infos } = createDeps({ storage: null });
+
+		await expect(runRotationCommand(["status"], deps)).resolves.toBe(0);
+
+		const output = infos.join("\n");
+		// Newest live helper wins the line; the dead PID is not counted.
+		expect(output).toContain(`Codex app helper: running pid=${process.pid}`);
+		expect(output).toContain("requests=7");
+		expect(output).toContain("(+1 more running)");
+	});
+
 	it("treats an array helper status file as not running", async () => {
 		// Pins the canonical isRecord contract (lib/utils.ts): a status file
 		// whose top-level JSON value is an array must read as "no status", not

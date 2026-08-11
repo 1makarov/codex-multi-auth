@@ -267,7 +267,9 @@ Cross-process refresh lease knobs: `CODEX_AUTH_REFRESH_LEASE`, `CODEX_AUTH_REFRE
 | `CODEX_MODE` | Toggle Codex mode |
 | `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY` | Toggle localhost Responses proxy for forwarded Codex sessions (`1`/`true` to enable, `0`/`false` to disable) |
 | `CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS` | Override idle timeout for the wrapper-launched Codex app runtime helper |
+| `CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS` | Absolute ceiling on a runtime helper's life regardless of activity (default 24h; `0` disables). The backstop that bounds the leak if activity accounting is ever wrong again |
 | `CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID` | Internal owner PID used by the wrapper-launched app helper |
+| `CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS` | Internal owner process start time (epoch ms) the helper uses to tell its launcher from a later process that recycled the PID |
 | `CODEX_MULTI_AUTH_REAL_CODEX_HOME` | Internal original Codex home pointer used by runtime rotation helpers |
 | `CODEX_MULTI_AUTH_APP_BIND_INSTALL` | Opt out/in of packaged Codex app bind self-heal on first CLI run or rotation enable |
 | `CODEX_MULTI_AUTH_APP_BIND` | Legacy/manual app-bind override consumed by the first-run setup hook (`lib/runtime/first-run.ts`) |

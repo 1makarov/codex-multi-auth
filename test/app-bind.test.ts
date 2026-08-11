@@ -1130,6 +1130,41 @@ describe("Codex app runtime rotation bind", () => {
 		expect(existsSync(statusPath)).toBe(false);
 	});
 
+	it("removes dead helpers recorded in per-PID status files on unbind", async () => {
+		// Helpers publish `runtime-rotation-app-helper.<pid>.json`; unbind must
+		// walk those, not just the legacy shared path — a regression here means
+		// `uninstall` silently stops nothing while reporting success.
+		const root = await createTempRoot("codex-app-bind-helper-per-pid-");
+		const env = {
+			CODEX_MULTI_AUTH_DIR: join(root, "multi-auth"),
+			CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME: join(root, "codex-home"),
+		};
+		const legacyPath = resolveRuntimeHelperStatusPath({ home: root, env });
+		const deadPid = 2_147_483_646;
+		const perPidPath = legacyPath.replace(/\.json$/i, `.${deadPid}.json`);
+		await mkdir(dirname(perPidPath), { recursive: true });
+		await writeFile(
+			perPidPath,
+			`${JSON.stringify({
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper",
+				state: "running",
+				pid: deadPid,
+				startedAt: Date.now(),
+				scriptPath: join(root, "runtime-helper.mjs"),
+			})}\n`,
+			"utf8",
+		);
+
+		await unbindCodexAppRuntimeRotation({
+			platform: process.platform,
+			home: root,
+			env,
+		});
+
+		expect(existsSync(perPidPath)).toBe(false);
+	});
+
 	it("fails fast when the router script cannot be resolved", async () => {
 		const root = await createTempRoot("codex-app-bind-missing-router-");
 		const multiAuthDir = join(root, "multi-auth");

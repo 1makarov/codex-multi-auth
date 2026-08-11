@@ -30,7 +30,7 @@
 | Local bridge client tokens | `~/.codex/multi-auth/local-client-tokens.json` | SHA-256 token hashes plus prefixes and labels; plaintext tokens are shown only on create/rotate |
 | Named backups | `~/.codex/multi-auth/backups/` | Operator-exported named account-pool backups |
 | Project account pools | `~/.codex/multi-auth/projects/<project-key>/` | Per-repo account pools when project scope is enabled |
-| Runtime app helper status | `~/.codex/multi-auth/runtime-rotation-app-helper.json` | Local helper status for wrapper-launched Codex app sessions |
+| Runtime app helper status | `~/.codex/multi-auth/runtime-rotation-app-helper.<pid>.json` (one per helper; plus the legacy un-suffixed file from older versions) | Local helper status for wrapper-launched Codex app sessions |
 | Persistent app bind state/logs | `~/.codex/multi-auth/app-bind/` | Reversible packaged-app router state, backup metadata, and local router log |
 | Logs | `~/.codex/multi-auth/logs/codex-plugin/` | Optional diagnostics |
 | Prompt/cache files | `~/.codex/multi-auth/cache/` | Cached prompt/template metadata |
@@ -88,7 +88,7 @@ rm -rf ~/.codex/multi-auth/refresh-leases
 rm -rf ~/.codex/multi-auth/usage
 rm -rf ~/.codex/multi-auth/backups
 rm -rf ~/.codex/multi-auth/projects
-rm -f ~/.codex/multi-auth/runtime-rotation-app-helper.json
+rm -f ~/.codex/multi-auth/runtime-rotation-app-helper.json ~/.codex/multi-auth/runtime-rotation-app-helper.*.json ~/.codex/multi-auth/runtime-rotation-app-helper-owner.*.json
 rm -rf ~/.codex/multi-auth/app-bind
 rm -rf ~/.codex/multi-auth/logs/codex-plugin
 rm -rf ~/.codex/multi-auth/cache
@@ -115,7 +115,7 @@ Remove-Item "$HOME\.codex\multi-auth\refresh-leases" -Recurse -Force -ErrorActio
 Remove-Item "$HOME\.codex\multi-auth\usage" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\backups" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\projects" -Recurse -Force -ErrorAction SilentlyContinue
-Remove-Item "$HOME\.codex\multi-auth\runtime-rotation-app-helper.json" -Force -ErrorAction SilentlyContinue
+Remove-Item "$HOME\.codex\multi-auth\runtime-rotation-app-helper*.json","$HOME\.codex\multi-auth\runtime-rotation-app-helper-owner*.json" -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\app-bind" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\logs\codex-plugin" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item "$HOME\.codex\multi-auth\cache" -Recurse -Force -ErrorAction SilentlyContinue

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
 	chmodSync,
@@ -85,6 +85,19 @@ const APP_RUNTIME_HELPER_STATUS_FILE =
 const APP_RUNTIME_HELPER_OWNER_FILE =
 	RUNTIME_CONSTANTS.APP_RUNTIME_HELPER_OWNER_FILE;
 const DEFAULT_APP_RUNTIME_HELPER_IDLE_MS = 12 * 60 * 60 * 1000;
+// Absolute ceiling on a helper's life, independent of the idle tracker. The
+// idle reaper depends on activity accounting being correct; any bug there —
+// PID reuse briefly reviving a dead owner is the observed one — previously
+// produced an *unbounded* leak because nothing else bounded the process.
+const DEFAULT_APP_RUNTIME_HELPER_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const APP_RUNTIME_HELPER_OWNER_START_TIME_ENV =
+	"CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS";
+// Re-verify owner identity (not just PID liveness) at most this often; a
+// process spawn per tick would cost more than the leak it prevents.
+const APP_RUNTIME_HELPER_OWNER_IDENTITY_RECHECK_MS = 60_000;
+// Status telemetry heartbeat: the tick's job is the timeout check, so status
+// is republished only on change, plus a heartbeat so freshness readers work.
+const APP_RUNTIME_HELPER_STATUS_HEARTBEAT_MS = 60_000;
 const DEFAULT_APP_RUNTIME_HELPER_DETACH_GRACE_MS = 5_000;
 const APP_RUNTIME_HELPER_LAUNCH_TIMEOUT_MS = 15_000;
 const APP_SERVER_SHIM_DIR_NAME = "app-server-shims";
@@ -3776,10 +3789,21 @@ function installRuntimeRotationAppServerCliShim(forwardedEnv, configArgs = []) {
 	return shimDir;
 }
 
-function resolveRuntimeRotationAppHelperStatusPath(env = process.env) {
+// With a helper PID the path is per-helper, mirroring the owner files below —
+// N concurrent helpers each publish their own status instead of last-writer-
+// winning one shared file. Without a PID it is the legacy shared path, kept
+// only so readers can still see a helper from before this change.
+function resolveRuntimeRotationAppHelperStatusPath(env = process.env, helperPid) {
 	const multiAuthDir =
 		resolveOriginalMultiAuthDir(env) ?? join(resolveCodexHomeDir(env), "multi-auth");
-	return join(multiAuthDir, APP_RUNTIME_HELPER_STATUS_FILE);
+	const statusFileName =
+		typeof helperPid === "number" && Number.isInteger(helperPid) && helperPid > 0
+			? APP_RUNTIME_HELPER_STATUS_FILE.replace(
+					/\.json$/i,
+					`.${helperPid}.json`,
+				)
+			: APP_RUNTIME_HELPER_STATUS_FILE;
+	return join(multiAuthDir, statusFileName);
 }
 
 function resolveRuntimeRotationAppHelperOwnerPath(env = process.env, helperPid) {
@@ -3852,6 +3876,52 @@ function resolveRuntimeRotationAppHelperOwnerPid(env = process.env) {
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function resolveRuntimeRotationAppHelperMaxLifetimeMs(env = process.env) {
+	const parsed = Number.parseInt(
+		env.CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS ?? "",
+		10,
+	);
+	// 0 disables the ceiling explicitly; anything unset or invalid gets the
+	// default rather than unbounded life.
+	return Number.isFinite(parsed) && parsed >= 0
+		? parsed
+		: DEFAULT_APP_RUNTIME_HELPER_MAX_LIFETIME_MS;
+}
+
+function resolveRuntimeRotationAppHelperOwnerStartTimeMs(env = process.env) {
+	const parsed = Number.parseInt(
+		env[APP_RUNTIME_HELPER_OWNER_START_TIME_ENV] ?? "",
+		10,
+	);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+// The kernel's start time for a PID, in epoch ms — the identity that survives
+// PID reuse. Null on platforms without `ps` (Windows) or for a PID that is
+// already gone; callers must treat null as "identity unknown" and fall back
+// to bare liveness rather than declaring the process dead.
+function readProcessStartTimeMs(pid) {
+	try {
+		const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+			encoding: "utf8",
+			stdio: ["ignore", "pipe", "ignore"],
+			// `lstart` is strftime-formatted and locale-sensitive; Date.parse on a
+			// localized string is implementation-defined and can yield NaN, which
+			// would silently disable the identity check. Pin the C locale so both
+			// sides of every comparison parse the same shape.
+			env: { ...process.env, LC_ALL: "C" },
+			// A wedged `ps` must not hang the caller — the helper-side caller is
+			// a live proxy's event loop.
+			timeout: 2_000,
+		}).trim();
+		if (!out) return null;
+		const parsed = Date.parse(out);
+		return Number.isFinite(parsed) ? parsed : null;
+	} catch {
+		return null;
+	}
+}
+
 function isProcessAlive(pid) {
 	try {
 		process.kill(pid, 0);
@@ -3861,8 +3931,42 @@ function isProcessAlive(pid) {
 	}
 }
 
-function isRuntimeRotationAppHelperOwnerAlive(pid) {
-	return isProcessAlive(pid);
+// `kill(pid, 0)` answers "does *a* process hold this integer", never "is this
+// still my owner". PIDs recycle, and a helper that mistakes a recycled PID for
+// its owner pushes its idle deadline forward — a ratchet, because one false
+// "alive" is never corrected by later true "dead"s, which is how helpers were
+// observed running 33 hours past a 12-hour timeout. Identity is the owner's
+// process start time, captured by the launcher at spawn: a recycled PID
+// necessarily has a later start time, so the match fails and the helper
+// correctly sees a dead owner. When the start time is unknown (no `ps`, or a
+// pre-upgrade launcher), behavior degrades to the bare liveness check.
+function createRuntimeRotationAppHelperOwnerLivenessCheck(
+	ownerPid,
+	expectedStartTimeMs,
+	recheckIntervalMs = APP_RUNTIME_HELPER_OWNER_IDENTITY_RECHECK_MS,
+) {
+	let lastIdentityCheckedAt = 0;
+	let lastIdentityVerdict = true;
+	return (currentTime) => {
+		if (!ownerPid || !isProcessAlive(ownerPid)) {
+			return false;
+		}
+		if (expectedStartTimeMs === null) {
+			return true;
+		}
+		if (currentTime - lastIdentityCheckedAt >= recheckIntervalMs) {
+			lastIdentityCheckedAt = currentTime;
+			const actualStartTimeMs = readProcessStartTimeMs(ownerPid);
+			// A failed read is "identity unknown", not "owner dead": under the
+			// process-table pressure this fix exists for, fork itself can fail,
+			// and declaring a live owner dead would kill the proxy out from under
+			// an active session. Keep the previous verdict and retry next window.
+			if (actualStartTimeMs !== null) {
+				lastIdentityVerdict = actualStartTimeMs === expectedStartTimeMs;
+			}
+		}
+		return lastIdentityVerdict;
+	};
 }
 
 function resolveRuntimeRotationAppHelperDetachGraceMs(env = process.env) {
@@ -3900,10 +4004,106 @@ function pickRuntimeRotationAppHelperEnv(env) {
 
 function writeRuntimeRotationAppHelperStatus(payload, env = process.env) {
 	try {
-		const statusPath = resolveRuntimeRotationAppHelperStatusPath(env);
+		const statusPath = resolveRuntimeRotationAppHelperStatusPath(
+			env,
+			payload?.pid,
+		);
 		writeOwnerOnlyJsonFileAtomicSync(statusPath, payload);
 	} catch {
 		// Best-effort status only; the helper must not fail because telemetry is unavailable.
+	}
+}
+
+function removeRuntimeRotationAppHelperOwnerFile(env = process.env, helperPid) {
+	try {
+		rmSync(resolveRuntimeRotationAppHelperOwnerPath(env, helperPid), {
+			force: true,
+		});
+	} catch {
+		// Best-effort metadata cleanup only.
+	}
+}
+
+// Owner and status files are written per helper PID and removed on clean
+// helper exit; a killed helper leaves its files behind. This sweep runs when a
+// launcher starts the next helper, mirroring the app-server shim-dir sweep:
+// any per-PID metadata whose helper is no longer alive is stale, as is the
+// legacy shared status file once the PID recorded inside it is dead. Terminal
+// status stamps ("idle-timeout", "stopped") therefore survive until the next
+// helper launch — long enough to be read, without accumulating forever.
+function sweepStaleRuntimeRotationAppHelperMetadata(env = process.env) {
+	const multiAuthDir =
+		resolveOriginalMultiAuthDir(env) ?? join(resolveCodexHomeDir(env), "multi-auth");
+	let entries = [];
+	try {
+		entries = readdirSync(multiAuthDir, { withFileTypes: true });
+	} catch {
+		return;
+	}
+	const perPidPattern = (baseName) =>
+		new RegExp(
+			`^${baseName.replace(/\.json$/i, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.(\\d+)\\.json$`,
+			"i",
+		);
+	const statusPattern = perPidPattern(APP_RUNTIME_HELPER_STATUS_FILE);
+	const ownerPattern = perPidPattern(APP_RUNTIME_HELPER_OWNER_FILE);
+	// A live kill(pid, 0) is not proof the helper is alive — the PID may have
+	// been recycled since a SIGKILLed helper left its files behind, and a
+	// recycled PID would otherwise shield the stale file from every future
+	// sweep. When the file records when its helper started, a current process
+	// whose kernel start time is meaningfully later cannot be that helper.
+	const isSweepCandidateDead = (pid, filePath) => {
+		if (!isProcessAlive(pid)) return true;
+		let recordedAt = null;
+		try {
+			const parsed = JSON.parse(readFileSync(filePath, "utf8"));
+			if (parsed && typeof parsed === "object") {
+				recordedAt =
+					typeof parsed.startedAt === "number"
+						? parsed.startedAt
+						: typeof parsed.createdAt === "number"
+							? parsed.createdAt
+							: null;
+			}
+		} catch {
+			return false;
+		}
+		if (recordedAt === null) return false;
+		const actualStartTimeMs = readProcessStartTimeMs(pid);
+		if (actualStartTimeMs === null) return false;
+		return actualStartTimeMs > recordedAt + 60_000;
+	};
+	for (const entry of entries) {
+		if (!entry.isFile()) continue;
+		const match =
+			statusPattern.exec(entry.name) ?? ownerPattern.exec(entry.name);
+		if (!match) continue;
+		const pid = Number.parseInt(match[1], 10);
+		if (!Number.isInteger(pid) || pid <= 0) continue;
+		const entryPath = join(multiAuthDir, entry.name);
+		if (!isSweepCandidateDead(pid, entryPath)) continue;
+		try {
+			rmSync(entryPath, { force: true });
+		} catch {
+			// Best-effort sweep only.
+		}
+	}
+	const legacyStatusPath = join(multiAuthDir, APP_RUNTIME_HELPER_STATUS_FILE);
+	try {
+		const parsed = JSON.parse(readFileSync(legacyStatusPath, "utf8"));
+		const legacyPid =
+			parsed && typeof parsed === "object" && Number.isInteger(parsed.pid)
+				? parsed.pid
+				: null;
+		if (
+			legacyPid === null ||
+			legacyPid <= 0 ||
+			isSweepCandidateDead(legacyPid, legacyStatusPath)
+		) {
+			rmSync(legacyStatusPath, { force: true });
+		}
+	} catch {
+		// Missing or unreadable legacy status; nothing to sweep.
 	}
 }
 
@@ -3985,21 +4185,51 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 	let closing = false;
 	const startedAt = Date.now();
 	const idleTimeoutMs = resolveRuntimeRotationAppHelperIdleMs();
+	const maxLifetimeMs = resolveRuntimeRotationAppHelperMaxLifetimeMs();
 	const ownerPid = resolveRuntimeRotationAppHelperOwnerPid();
+	const isOwnerAlive = createRuntimeRotationAppHelperOwnerLivenessCheck(
+		ownerPid,
+		resolveRuntimeRotationAppHelperOwnerStartTimeMs(),
+	);
 	let lastActivityAt = startedAt;
 	let lastRequestCount = 0;
+	let lastPublishedToken = null;
+	let lastPublishedAt = 0;
+	// Freshness readers tolerate hours of staleness, but tests run the whole
+	// lifecycle in milliseconds — heartbeat at least once per idle window.
+	const statusHeartbeatMs = Math.min(
+		APP_RUNTIME_HELPER_STATUS_HEARTBEAT_MS,
+		idleTimeoutMs,
+	);
 
-	const publishStatus = (state) => {
-		writeRuntimeRotationAppHelperStatus(
-			createRuntimeRotationAppHelperStatus({
-				proxyServer,
-				startedAt,
-				identityToken,
-				idleTimeoutMs,
-				lastActivityAt,
-				state,
-			}),
-		);
+	const publishStatus = (state, { force = false } = {}) => {
+		const payload = createRuntimeRotationAppHelperStatus({
+			proxyServer,
+			startedAt,
+			identityToken,
+			idleTimeoutMs,
+			lastActivityAt,
+			state,
+		});
+		// `updatedAt` moves every call and `idleExpiresAt` moves every tick the
+		// owner is alive; neither is a reason to rewrite the file. Everything
+		// else changing — state, traffic counters, account fields — is.
+		const publishToken = JSON.stringify({
+			...payload,
+			updatedAt: 0,
+			idleExpiresAt: 0,
+		});
+		const now = Date.now();
+		if (
+			!force &&
+			publishToken === lastPublishedToken &&
+			now - lastPublishedAt < statusHeartbeatMs
+		) {
+			return;
+		}
+		lastPublishedToken = publishToken;
+		lastPublishedAt = now;
+		writeRuntimeRotationAppHelperStatus(payload);
 	};
 
 	const cleanup = async (state = "stopped") => {
@@ -4022,7 +4252,11 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 			try {
 				await proxyServer?.close?.();
 			} finally {
-				publishStatus(state);
+				// The terminal stamp is always written; the next launcher's sweep
+				// removes it once this PID is dead. The owner file has no
+				// post-mortem value, so it goes now.
+				publishStatus(state, { force: true });
+				removeRuntimeRotationAppHelperOwnerFile(process.env, process.pid);
 			}
 		}
 	};
@@ -4095,7 +4329,10 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 				type: "ready",
 				pid: process.pid,
 				baseUrl: proxyServer.baseUrl,
-				statusPath: resolveRuntimeRotationAppHelperStatusPath(),
+				statusPath: resolveRuntimeRotationAppHelperStatusPath(
+					process.env,
+					process.pid,
+				),
 				args: runtimeContext.args ?? [],
 				env: pickRuntimeRotationAppHelperEnv(runtimeContext.env),
 			})}\n`,
@@ -4108,12 +4345,19 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 				lastRequestCount = requestCount;
 				lastActivityAt = currentTime;
 			}
-			if (ownerPid && isRuntimeRotationAppHelperOwnerAlive(ownerPid)) {
+			if (isOwnerAlive(currentTime)) {
 				lastActivityAt = currentTime;
 			}
 			publishStatus("running");
 			if (currentTime - lastActivityAt >= idleTimeoutMs) {
 				exitAfterCleanup("idle-timeout", 0);
+			} else if (
+				maxLifetimeMs > 0 &&
+				currentTime - startedAt >= maxLifetimeMs
+			) {
+				// The ceiling is deliberately unconditional on activity: it exists
+				// for exactly the case where activity accounting is wrong.
+				exitAfterCleanup("max-lifetime", 0);
 			}
 		}, Math.min(1_000, Math.max(50, Math.floor(idleTimeoutMs / 2))));
 	} catch (error) {
@@ -4203,19 +4447,32 @@ function startRuntimeRotationAppHelper(baseContext, options = {}) {
 		let stderrBuffer = "";
 		let settled = false;
 		const identityToken = randomBytes(24).toString("hex");
+		// The launcher states its own identity — PID plus kernel start time — so
+		// the helper's owner-liveness check can tell "my launcher" from a later
+		// process that recycled the PID. An empty value (no `ps` on this
+		// platform) leaves the helper on the bare liveness check.
+		const launcherStartTimeMs = readProcessStartTimeMs(process.pid);
 		const helperEnv = {
 			...baseContext.env,
 			CODEX_MULTI_AUTH_DIR: resolveRuntimeRotationOriginalMultiAuthDir(
 				realCodexHome,
 				baseContext.env,
 			),
+			// PID and start time are two halves of one identity and must describe
+			// the same process: both always come from this launcher's own capture,
+			// never from an inherited environment value, which would marry this
+			// PID to another process's start time and make the helper declare its
+			// live owner dead at the first recheck.
 			[APP_RUNTIME_HELPER_OWNER_PID_ENV]: String(process.pid),
+			[APP_RUNTIME_HELPER_OWNER_START_TIME_ENV]:
+				launcherStartTimeMs !== null ? String(launcherStartTimeMs) : "",
 			[APP_RUNTIME_HELPER_REAL_CODEX_HOME_ENV]: realCodexHome,
 			[APP_RUNTIME_HELPER_USE_CANONICAL_HOME_ENV]:
 				options.useCanonicalHome === true ? "1" : "0",
 			[APP_RUNTIME_HELPER_INSTALL_APP_SERVER_SHIM_ENV]:
 				options.installAppServerShim === false ? "0" : "1",
 		};
+		sweepStaleRuntimeRotationAppHelperMetadata(helperEnv);
 		const helper = spawn(
 			process.execPath,
 			[

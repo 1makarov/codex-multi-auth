@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
 	AccountManager,
@@ -515,8 +515,9 @@ function readOptionalString(record: Record<string, unknown>, key: string): strin
 
 const MAX_STATUS_FILE_BYTES = 1024 * 1024; // 1 MB sanity cap
 
-function readAppRuntimeHelperStatus(): AppRuntimeHelperStatus | null {
-	const statusPath = join(getCodexMultiAuthDir(), APP_RUNTIME_HELPER_STATUS_FILE);
+function readAppRuntimeHelperStatusFile(
+	statusPath: string,
+): AppRuntimeHelperStatus | null {
 	if (!existsSync(statusPath)) return null;
 	try {
 		const stat = statSync(statusPath);
@@ -544,6 +545,58 @@ function readAppRuntimeHelperStatus(): AppRuntimeHelperStatus | null {
 	} catch {
 		return null;
 	}
+}
+
+// Helpers publish per-PID status files (`runtime-rotation-app-helper.<pid>.json`);
+// the un-suffixed path is the legacy shared file, still read so a helper from
+// before that change stays visible. Kept in sync with the identically named
+// reader in lib/runtime/runtime-current-account.ts — each consumer owns its
+// hardened copy by design.
+function readAppRuntimeHelperStatuses(): AppRuntimeHelperStatus[] {
+	const multiAuthDir = getCodexMultiAuthDir();
+	const basePattern = APP_RUNTIME_HELPER_STATUS_FILE.replace(/\.json$/i, "");
+	const perPidPattern = new RegExp(
+		`^${basePattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.json$`,
+		"i",
+	);
+	let entries: string[] = [];
+	try {
+		entries = readdirSync(multiAuthDir);
+	} catch {
+		entries = [];
+	}
+	const paths = entries
+		.filter((name) => perPidPattern.test(name))
+		.map((name) => join(multiAuthDir, name));
+	paths.push(join(multiAuthDir, APP_RUNTIME_HELPER_STATUS_FILE));
+	return paths
+		.map(readAppRuntimeHelperStatusFile)
+		.filter((status): status is AppRuntimeHelperStatus => status !== null);
+}
+
+function readAppRuntimeHelperStatus(): AppRuntimeHelperStatus | null {
+	const statuses = readAppRuntimeHelperStatuses().filter(
+		(status) => status.kind === "codex-app-runtime-rotation-helper",
+	);
+	if (statuses.length === 0) return null;
+	const byRecency = (
+		left: AppRuntimeHelperStatus,
+		right: AppRuntimeHelperStatus,
+	) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0);
+	const live = statuses
+		.filter((status) => status.state === "running" && isProcessAlive(status.pid))
+		.sort(byRecency);
+	if (live.length > 0) return live[0] ?? null;
+	return statuses.sort(byRecency)[0] ?? null;
+}
+
+function countLiveAppRuntimeHelpers(): number {
+	return readAppRuntimeHelperStatuses().filter(
+		(status) =>
+			status.kind === "codex-app-runtime-rotation-helper" &&
+			status.state === "running" &&
+			isProcessAlive(status.pid),
+	).length;
 }
 
 function isProcessAlive(pid: number | null): boolean {
@@ -576,6 +629,7 @@ function formatHelperLastAccount(status: AppRuntimeHelperStatus): string | null 
 function formatAppRuntimeHelperStatus(
 	now: number,
 	status = readAppRuntimeHelperStatus(),
+	liveHelperCount = countLiveAppRuntimeHelpers(),
 ): string {
 	if (!status) return "Codex app helper: not running";
 	if (status.kind !== "codex-app-runtime-rotation-helper") {
@@ -592,6 +646,12 @@ function formatAppRuntimeHelperStatus(
 	if (lastAccount) parts.push(`lastAccount=${lastAccount}`);
 	if (status.idleExpiresAt !== null && status.idleExpiresAt > now) {
 		parts.push(`idle-expires=${formatWaitTime(status.idleExpiresAt - now)}`);
+	}
+	// The line shows the most recently active helper; with per-account
+	// app-servers several can be live at once, so say so instead of implying
+	// this one is the only one.
+	if (liveHelperCount > 1) {
+		parts.push(`(+${liveHelperCount - 1} more running)`);
 	}
 	return `Codex app helper: ${parts.join(", ")}`;
 }

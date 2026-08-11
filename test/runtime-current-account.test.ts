@@ -541,4 +541,59 @@ describe("readAppRuntimeHelperStatus", () => {
 		await writeStatusFile("[]");
 		expect(readAppRuntimeHelperStatus()).toBeNull();
 	});
+
+	it("prefers a live per-PID helper over a fresher record with a dead PID", async () => {
+		const now = Date.now();
+		// Per-PID file for a live process (this test), older updatedAt.
+		await fs.writeFile(
+			join(tempDir, `runtime-rotation-app-helper.${process.pid}.json`),
+			JSON.stringify({
+				kind: "codex-app-runtime-rotation-helper",
+				state: "running",
+				pid: process.pid,
+				lastAccountId: "acc_live",
+				updatedAt: now - 30_000,
+			}),
+			"utf8",
+		);
+		// Legacy shared file naming a dead PID, fresher updatedAt: recency must
+		// not outrank liveness.
+		await writeStatusFile(
+			JSON.stringify({
+				kind: "codex-app-runtime-rotation-helper",
+				state: "running",
+				pid: 99999999,
+				lastAccountId: "acc_dead",
+				updatedAt: now,
+			}),
+		);
+		expect(readAppRuntimeHelperStatus()?.lastAccountId).toBe("acc_live");
+	});
+
+	it("falls back to the freshest terminal stamp when no helper is live", async () => {
+		const now = Date.now();
+		await fs.writeFile(
+			join(tempDir, "runtime-rotation-app-helper.99999998.json"),
+			JSON.stringify({
+				kind: "codex-app-runtime-rotation-helper",
+				state: "idle-timeout",
+				pid: 99999998,
+				lastAccountId: "acc_older",
+				updatedAt: now - 60_000,
+			}),
+			"utf8",
+		);
+		await fs.writeFile(
+			join(tempDir, "runtime-rotation-app-helper.99999999.json"),
+			JSON.stringify({
+				kind: "codex-app-runtime-rotation-helper",
+				state: "stopped",
+				pid: 99999999,
+				lastAccountId: "acc_newer",
+				updatedAt: now - 10_000,
+			}),
+			"utf8",
+		);
+		expect(readAppRuntimeHelperStatus()?.lastAccountId).toBe("acc_newer");
+	});
 });

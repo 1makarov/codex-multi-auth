@@ -503,6 +503,32 @@ describe("codex-multi-auth rotation command", () => {
 		expect(output).toContain("(+1 more running)");
 	});
 
+	it("treats a max-lifetime helper record as not running even when its PID is alive", async () => {
+		// "max-lifetime" is a terminal state the ceiling exit publishes; a live
+		// kill(pid, 0) on a terminal record proves nothing — the PID may be
+		// recycled, which is the exact gate this fix stopped trusting.
+		const root = await createTempRoot("codex-rotation-helper-max-lifetime-");
+		process.env.CODEX_MULTI_AUTH_DIR = root;
+		await mkdir(root, { recursive: true });
+		await writeFile(
+			join(root, `runtime-rotation-app-helper.${process.pid}.json`),
+			`${JSON.stringify({
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper",
+				state: "max-lifetime",
+				pid: process.pid,
+				totalRequests: 4,
+				updatedAt: Date.now(),
+			})}\n`,
+			"utf8",
+		);
+		const { deps, infos } = createDeps({ storage: null });
+
+		await expect(runRotationCommand(["status"], deps)).resolves.toBe(0);
+
+		expect(infos.join("\n")).toContain("Codex app helper: not running");
+	});
+
 	it("treats an array helper status file as not running", async () => {
 		// Pins the canonical isRecord contract (lib/utils.ts): a status file
 		// whose top-level JSON value is an array must read as "no status", not

@@ -1165,6 +1165,107 @@ describe("Codex app runtime rotation bind", () => {
 		expect(existsSync(perPidPath)).toBe(false);
 	});
 
+	it("removes every dead helper record — per-PID and legacy — in one unbind", async () => {
+		// A loop bug that processes only the first candidate would still pass the
+		// single-file test above; this is the actual multi-helper regression.
+		const root = await createTempRoot("codex-app-bind-helper-multi-");
+		const env = {
+			CODEX_MULTI_AUTH_DIR: join(root, "multi-auth"),
+			CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME: join(root, "codex-home"),
+		};
+		const legacyPath = resolveRuntimeHelperStatusPath({ home: root, env });
+		await mkdir(dirname(legacyPath), { recursive: true });
+		const record = (pid: number) =>
+			`${JSON.stringify({
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper",
+				state: "running",
+				pid,
+				startedAt: Date.now(),
+				scriptPath: join(root, "runtime-helper.mjs"),
+			})}\n`;
+		const deadPids = [2_147_483_646, 2_147_483_645];
+		const perPidPaths = deadPids.map((pid) =>
+			legacyPath.replace(/\.json$/i, `.${pid}.json`),
+		);
+		for (const [index, path] of perPidPaths.entries()) {
+			await writeFile(path, record(deadPids[index] ?? 0), "utf8");
+		}
+		await writeFile(legacyPath, record(2_147_483_644), "utf8");
+		// An owner file beside a dead per-PID record goes with it.
+		const ownerPath = join(
+			dirname(legacyPath),
+			`runtime-rotation-app-helper-owner.${deadPids[0]}.json`,
+		);
+		await writeFile(
+			ownerPath,
+			`${JSON.stringify({
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper-owner",
+				identityToken: "does-not-matter-for-dead-pid",
+				launcherPid: 1,
+				createdAt: Date.now(),
+			})}\n`,
+			"utf8",
+		);
+
+		await unbindCodexAppRuntimeRotation({
+			platform: process.platform,
+			home: root,
+			env,
+		});
+
+		for (const path of [...perPidPaths, legacyPath]) {
+			expect(existsSync(path)).toBe(false);
+		}
+		expect(existsSync(ownerPath)).toBe(false);
+	});
+
+	it("preserves a running per-PID helper whose ownership cannot be verified", async () => {
+		// The ownership gate is what keeps unbind from signalling foreign PIDs; a
+		// future change that drops it must fail here, not in production.
+		const root = await createTempRoot("codex-app-bind-helper-foreign-");
+		const env = {
+			CODEX_MULTI_AUTH_DIR: join(root, "multi-auth"),
+			CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME: join(root, "codex-home"),
+		};
+		const legacyPath = resolveRuntimeHelperStatusPath({ home: root, env });
+		await mkdir(dirname(legacyPath), { recursive: true });
+		// A live PID (this test process) with an identityToken and no owner file:
+		// ownership cannot be verified, so the record must survive with a warning.
+		const perPidPath = legacyPath.replace(/\.json$/i, `.${process.pid}.json`);
+		await writeFile(
+			perPidPath,
+			`${JSON.stringify({
+				version: 1,
+				kind: "codex-app-runtime-rotation-helper",
+				state: "running",
+				pid: process.pid,
+				startedAt: Date.now(),
+				scriptPath: join(root, "runtime-helper.mjs"),
+				identityToken: "token-without-owner-file",
+			})}\n`,
+			"utf8",
+		);
+		const logs: string[] = [];
+
+		await unbindCodexAppRuntimeRotation({
+			platform: process.platform,
+			home: root,
+			env,
+			log: (message) => {
+				logs.push(message);
+			},
+		});
+
+		expect(existsSync(perPidPath)).toBe(true);
+		expect(
+			logs.some((message) =>
+				message.includes("ownership metadata does not match"),
+			),
+		).toBe(true);
+	});
+
 	it("fails fast when the router script cannot be resolved", async () => {
 		const root = await createTempRoot("codex-app-bind-missing-router-");
 		const multiAuthDir = join(root, "multi-auth");

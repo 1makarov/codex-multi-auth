@@ -1,9 +1,8 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
 import process from "node:process";
 import type { RuntimeObservabilitySnapshot } from "./runtime-observability.js";
 import type { AppBindRouterStatus } from "./app-bind.js";
-import { APP_RUNTIME_HELPER_STATUS_FILE } from "../runtime-constants.js";
+import { listRuntimeHelperStatusPaths } from "../runtime-constants.js";
 import { getCodexMultiAuthDir } from "../runtime-paths.js";
 import type { AccountStorageV3 } from "../storage.js";
 import { isRecord } from "../utils.js";
@@ -154,25 +153,16 @@ function readAppRuntimeHelperStatusFile(
 }
 
 // Helpers publish per-PID status files (`runtime-rotation-app-helper.<pid>.json`)
-// so N concurrent helpers stop overwriting one shared path; the un-suffixed
-// legacy path is still read so a helper from before that change stays visible.
+// so N concurrent helpers stop overwriting one shared path; path discovery is
+// shared with every other reader via listRuntimeHelperStatusPaths.
 function listAppRuntimeHelperStatusPaths(multiAuthDir: string): string[] {
-	const basePattern = APP_RUNTIME_HELPER_STATUS_FILE.replace(/\.json$/i, "");
-	const perPidPattern = new RegExp(
-		`^${basePattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.json$`,
-		"i",
-	);
 	let entries: string[] = [];
 	try {
 		entries = readdirSync(multiAuthDir);
 	} catch {
 		entries = [];
 	}
-	const paths = entries
-		.filter((name) => perPidPattern.test(name))
-		.map((name) => join(multiAuthDir, name));
-	paths.push(join(multiAuthDir, APP_RUNTIME_HELPER_STATUS_FILE));
-	return paths;
+	return listRuntimeHelperStatusPaths(multiAuthDir, entries);
 }
 
 export function readAppRuntimeHelperStatus(): AppRuntimeHelperAccountStatus | null {

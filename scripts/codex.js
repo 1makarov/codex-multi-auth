@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
 	chmodSync,
@@ -3896,30 +3896,61 @@ function resolveRuntimeRotationAppHelperOwnerStartTimeMs(env = process.env) {
 	return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+// `lstart` is strftime-formatted and locale-sensitive; Date.parse on a
+// localized string is implementation-defined and can yield NaN, which would
+// silently disable the identity check. Both readers pin the C locale so both
+// sides of every comparison parse the same shape.
+function parseProcessStartTimeOutput(out) {
+	const trimmed = (out ?? "").trim();
+	if (!trimmed) return null;
+	const parsed = Date.parse(trimmed);
+	return Number.isFinite(parsed) ? parsed : null;
+}
+
 // The kernel's start time for a PID, in epoch ms — the identity that survives
 // PID reuse. Null on platforms without `ps` (Windows) or for a PID that is
 // already gone; callers must treat null as "identity unknown" and fall back
-// to bare liveness rather than declaring the process dead.
+// to bare liveness rather than declaring the process dead. Synchronous —
+// launcher/sweep use only; the helper's tick uses the async variant below.
 function readProcessStartTimeMs(pid) {
 	try {
-		const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-			// `lstart` is strftime-formatted and locale-sensitive; Date.parse on a
-			// localized string is implementation-defined and can yield NaN, which
-			// would silently disable the identity check. Pin the C locale so both
-			// sides of every comparison parse the same shape.
-			env: { ...process.env, LC_ALL: "C" },
-			// A wedged `ps` must not hang the caller — the helper-side caller is
-			// a live proxy's event loop.
-			timeout: 2_000,
-		}).trim();
-		if (!out) return null;
-		const parsed = Date.parse(out);
-		return Number.isFinite(parsed) ? parsed : null;
+		return parseProcessStartTimeOutput(
+			execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+				env: { ...process.env, LC_ALL: "C" },
+				timeout: 2_000,
+			}),
+		);
 	} catch {
 		return null;
 	}
+}
+
+// Async variant for the helper's status tick, which runs on the live rotation
+// proxy's event loop: a wedged `ps` must stall a background probe, never an
+// in-flight Responses stream. Same parse, same C locale, same null contract.
+function readProcessStartTimeMsAsync(pid, onResult) {
+	let child;
+	try {
+		child = execFile(
+			"ps",
+			["-o", "lstart=", "-p", String(pid)],
+			{
+				encoding: "utf8",
+				env: { ...process.env, LC_ALL: "C" },
+				timeout: 2_000,
+			},
+			(error, stdout) => {
+				onResult(error ? null : parseProcessStartTimeOutput(stdout));
+			},
+		);
+	} catch {
+		onResult(null);
+		return;
+	}
+	// The probe must not keep the helper's event loop referenced on shutdown.
+	child.unref?.();
 }
 
 function isProcessAlive(pid) {
@@ -3947,6 +3978,7 @@ function createRuntimeRotationAppHelperOwnerLivenessCheck(
 ) {
 	let lastIdentityCheckedAt = 0;
 	let lastIdentityVerdict = true;
+	let probeInFlight = false;
 	return (currentTime) => {
 		if (!ownerPid || !isProcessAlive(ownerPid)) {
 			return false;
@@ -3954,16 +3986,27 @@ function createRuntimeRotationAppHelperOwnerLivenessCheck(
 		if (expectedStartTimeMs === null) {
 			return true;
 		}
-		if (currentTime - lastIdentityCheckedAt >= recheckIntervalMs) {
+		// The probe is asynchronous and single-flight: the tick runs on the live
+		// proxy's event loop, so it always answers from the last verdict and the
+		// probe updates it in the background — a stale verdict is tolerated by
+		// design (one recheck window against a 12h timeout), and single-flight
+		// means a wedged `ps` holds one child, not one per tick.
+		if (
+			!probeInFlight &&
+			currentTime - lastIdentityCheckedAt >= recheckIntervalMs
+		) {
 			lastIdentityCheckedAt = currentTime;
-			const actualStartTimeMs = readProcessStartTimeMs(ownerPid);
-			// A failed read is "identity unknown", not "owner dead": under the
-			// process-table pressure this fix exists for, fork itself can fail,
-			// and declaring a live owner dead would kill the proxy out from under
-			// an active session. Keep the previous verdict and retry next window.
-			if (actualStartTimeMs !== null) {
-				lastIdentityVerdict = actualStartTimeMs === expectedStartTimeMs;
-			}
+			probeInFlight = true;
+			readProcessStartTimeMsAsync(ownerPid, (actualStartTimeMs) => {
+				probeInFlight = false;
+				// A failed read is "identity unknown", not "owner dead": under the
+				// process-table pressure this fix exists for, fork itself can fail,
+				// and declaring a live owner dead would kill the proxy out from
+				// under an active session. Keep the verdict and retry next window.
+				if (actualStartTimeMs !== null) {
+					lastIdentityVerdict = actualStartTimeMs === expectedStartTimeMs;
+				}
+			});
 		}
 		return lastIdentityVerdict;
 	};
@@ -4014,14 +4057,41 @@ function writeRuntimeRotationAppHelperStatus(payload, env = process.env) {
 	}
 }
 
-function removeRuntimeRotationAppHelperOwnerFile(env = process.env, helperPid) {
+let helperMetadataCleanupBusyFailuresRemaining = Number.parseInt(
+	process.env.CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES ?? "0",
+	10,
+);
+
+function maybeThrowSimulatedHelperMetadataFileError() {
+	if (
+		Number.isFinite(helperMetadataCleanupBusyFailuresRemaining) &&
+		helperMetadataCleanupBusyFailuresRemaining > 0
+	) {
+		helperMetadataCleanupBusyFailuresRemaining -= 1;
+		const error = new Error("simulated EBUSY");
+		error.code = "EBUSY";
+		throw error;
+	}
+}
+
+// Windows can hold a transient lock on a file another process just closed, so
+// every metadata deletion goes through the shared retry rather than a bare
+// rmSync — a swallowed EBUSY here is how stale files outlive their sweep.
+function removeHelperMetadataFileWithRetry(targetPath) {
 	try {
-		rmSync(resolveRuntimeRotationAppHelperOwnerPath(env, helperPid), {
-			force: true,
+		withSynchronousFileOperationRetry(() => {
+			maybeThrowSimulatedHelperMetadataFileError();
+			rmSync(targetPath, { force: true });
 		});
 	} catch {
-		// Best-effort metadata cleanup only.
+		// Best-effort metadata cleanup only; the next sweep retries.
 	}
+}
+
+function removeRuntimeRotationAppHelperOwnerFile(env = process.env, helperPid) {
+	removeHelperMetadataFileWithRetry(
+		resolveRuntimeRotationAppHelperOwnerPath(env, helperPid),
+	);
 }
 
 // Owner and status files are written per helper PID and removed on clean
@@ -4052,6 +4122,21 @@ function sweepStaleRuntimeRotationAppHelperMetadata(env = process.env) {
 	// recycled PID would otherwise shield the stale file from every future
 	// sweep. When the file records when its helper started, a current process
 	// whose kernel start time is meaningfully later cannot be that helper.
+	// Identity probes are bounded: results are memoized per PID for the sweep
+	// (the same PID backs both a status and an owner file), and at most a
+	// handful of `ps` spawns run per launch — candidates past the cap are
+	// treated as not-dead and the next launch finishes the work. Dead-PID
+	// files, the overwhelming majority after a leak, never probe at all.
+	const probedStartTimes = new Map();
+	let probeBudget = 20;
+	const probeStartTime = (pid) => {
+		if (probedStartTimes.has(pid)) return probedStartTimes.get(pid);
+		if (probeBudget <= 0) return undefined;
+		probeBudget -= 1;
+		const startTime = readProcessStartTimeMs(pid);
+		probedStartTimes.set(pid, startTime);
+		return startTime;
+	};
 	const isSweepCandidateDead = (pid, filePath) => {
 		if (!isProcessAlive(pid)) return true;
 		let recordedAt = null;
@@ -4069,8 +4154,10 @@ function sweepStaleRuntimeRotationAppHelperMetadata(env = process.env) {
 			return false;
 		}
 		if (recordedAt === null) return false;
-		const actualStartTimeMs = readProcessStartTimeMs(pid);
-		if (actualStartTimeMs === null) return false;
+		const actualStartTimeMs = probeStartTime(pid);
+		if (actualStartTimeMs === null || actualStartTimeMs === undefined) {
+			return false;
+		}
 		return actualStartTimeMs > recordedAt + 60_000;
 	};
 	for (const entry of entries) {
@@ -4082,11 +4169,7 @@ function sweepStaleRuntimeRotationAppHelperMetadata(env = process.env) {
 		if (!Number.isInteger(pid) || pid <= 0) continue;
 		const entryPath = join(multiAuthDir, entry.name);
 		if (!isSweepCandidateDead(pid, entryPath)) continue;
-		try {
-			rmSync(entryPath, { force: true });
-		} catch {
-			// Best-effort sweep only.
-		}
+		removeHelperMetadataFileWithRetry(entryPath);
 	}
 	const legacyStatusPath = join(multiAuthDir, APP_RUNTIME_HELPER_STATUS_FILE);
 	try {
@@ -4100,7 +4183,7 @@ function sweepStaleRuntimeRotationAppHelperMetadata(env = process.env) {
 			legacyPid <= 0 ||
 			isSweepCandidateDead(legacyPid, legacyStatusPath)
 		) {
-			rmSync(legacyStatusPath, { force: true });
+			removeHelperMetadataFileWithRetry(legacyStatusPath);
 		}
 	} catch {
 		// Missing or unreadable legacy status; nothing to sweep.

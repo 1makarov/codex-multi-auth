@@ -159,7 +159,7 @@ Runtime rotation adds local state only when enabled or when a helper has recentl
 | Path | Purpose |
 | --- | --- |
 | `~/.codex/multi-auth/runtime-observability.json` | request counters, last selected runtime account metadata, and cooldown context for status/report commands |
-| `~/.codex/multi-auth/runtime-rotation-app-helper.<pid>.json` | wrapper-launched `codex app` helper state, idle timeout, request count, and last-account metadata — one file per helper; the un-suffixed name is the legacy shared path from older versions, still read |
+| `~/.codex/multi-auth/runtime-rotation-app-helper.<pid>.json` | wrapper-launched `codex app` helper state, idle timeout, request count, and last-account metadata — one file per helper; the un-suffixed name is the legacy shared path from older versions, still read. A terminal stamp persists until the next helper launch sweeps files whose PID is dead; the owner file is removed on clean helper exit |
 | `~/.codex/multi-auth/app-bind/runtime-rotation-app-bind.json` | persistent packaged-app bind state |
 | `~/.codex/multi-auth/app-bind/codex-config-backup.json` | backup metadata for restoring the real Codex `config.toml` |
 | `~/.codex/multi-auth/app-bind/runtime-rotation-app-bind-status.json` | persistent app router status |

@@ -10,7 +10,7 @@ import { withFileOperationRetry } from "../fs-retry.js";
 import { getCodexMultiAuthDir } from "../runtime-paths.js";
 import {
 	APP_RUNTIME_HELPER_OWNER_FILE,
-	APP_RUNTIME_HELPER_STATUS_FILE,
+	listRuntimeHelperStatusPaths,
 } from "../runtime-constants.js";
 import {
 	configHasRuntimeRotationProvider,
@@ -1507,26 +1507,30 @@ async function unbindCodexAppRuntimeRotationLocked(
 	// plus process identity), so unbind reaps each helper it can prove is one
 	// of ours and preserves — with a warning — anything it cannot.
 	const helperBaseDir = dirname(paths.bindDir);
-	const helperStatusPrefix = APP_RUNTIME_HELPER_STATUS_FILE.replace(
-		/\.json$/i,
-		"",
-	);
-	const helperStatusPattern = new RegExp(
-		`^${helperStatusPrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\d+\\.json$`,
-		"i",
-	);
-	let helperStatusNames: string[] = [];
+	let helperDirEntries: string[] = [];
 	try {
-		helperStatusNames = (await readdir(helperBaseDir)).filter((name) =>
-			helperStatusPattern.test(name),
+		helperDirEntries = await withFileOperationRetry(() =>
+			readdir(helperBaseDir),
 		);
-	} catch {
-		helperStatusNames = [];
+	} catch (error) {
+		// Degrading to legacy-only cleanup while reporting success would leave
+		// every per-PID helper running with the user told the app was unbound —
+		// say so. ENOENT just means no helper ever ran.
+		const code =
+			error && typeof error === "object" && "code" in error
+				? String((error as { code?: unknown }).code)
+				: "unknown";
+		if (code !== "ENOENT") {
+			options.log?.(
+				`Warning: could not enumerate runtime app helper status files (${code}); only the legacy helper path is checked`,
+			);
+		}
+		helperDirEntries = [];
 	}
-	const helperStatusPaths = [
-		...helperStatusNames.map((name) => join(helperBaseDir, name)),
-		join(helperBaseDir, APP_RUNTIME_HELPER_STATUS_FILE),
-	];
+	const helperStatusPaths = listRuntimeHelperStatusPaths(
+		helperBaseDir,
+		helperDirEntries,
+	);
 	const helperCleanupPaths: string[] = [];
 	for (const helperStatusPath of helperStatusPaths) {
 		const helperRead = await readRuntimeHelperStatus(helperStatusPath);

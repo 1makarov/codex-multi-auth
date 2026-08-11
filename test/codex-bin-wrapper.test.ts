@@ -3242,7 +3242,9 @@ describe("codex bin wrapper", () => {
 	// observed running 33 hours past a 12-hour timeout. Simulated here by
 	// pointing the helper at a genuinely live process (this test) with a start
 	// time that cannot match. Fails against the bare kill(pid, 0) check.
-	it("idles out when the owner PID is alive but its identity does not match", async () => {
+	// POSIX-only: on Windows there is no `ps`, identity is unknowable, and the
+	// designed degradation is bare liveness — the companion test below.
+	it.skipIf(process.platform === "win32")("idles out when the owner PID is alive but its identity does not match", async () => {
 		const fixtureRoot = createWrapperFixture();
 		createRuntimeRotationProxyFixtureModule(fixtureRoot);
 		const originalHome = join(fixtureRoot, "codex-home");
@@ -3272,6 +3274,40 @@ describe("codex bin wrapper", () => {
 			await stopDirectAppHelper(helper, closed);
 		}
 	});
+
+	// The designed Windows degradation: with no `ps`, owner identity is
+	// unknowable, and an unknowable identity must never kill a helper whose
+	// owner PID is genuinely alive — bare liveness keeps it running.
+	it.runIf(process.platform === "win32")(
+		"keeps the helper alive when owner identity is unavailable",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				// A start time that cannot match: with no way to read the real one,
+				// the check must degrade to bare liveness, not declare death.
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				await sleep(1_000);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
 
 	// The absolute lifetime ceiling is unconditional on activity: it exists for
 	// exactly the case where activity accounting is wrong, so a genuinely live
@@ -3360,6 +3396,74 @@ describe("codex bin wrapper", () => {
 		} finally {
 			await stopDirectAppHelper(first.helper, first.closed);
 		}
+	});
+
+	// One of the four defects was helpers rewriting status at 1 Hz; publishing
+	// is now change-token + heartbeat. A quiet helper's status file must not
+	// churn between ticks, or N helpers reintroduce the write storm silently.
+	it("does not rewrite an unchanged status file on every tick", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			// Long idle: the 1s tick keeps running, but with no traffic and a
+			// 60s heartbeat nothing about the payload changes between ticks.
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+		});
+		try {
+			const firstMtime = statSync(ready.statusPath).mtimeMs;
+			// Several ticks pass (tick interval is 1s at this idle timeout).
+			await sleep(2_600);
+			expect(statSync(ready.statusPath).mtimeMs).toBe(firstMtime);
+		} finally {
+			await stopDirectAppHelper(helper, closed);
+		}
+	});
+
+	// Windows can hold transient locks on files another process just closed;
+	// metadata deletions retry instead of silently leaving the stale file the
+	// sweep exists to remove.
+	it("retries transient lock failures while sweeping helper metadata", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(multiAuthDir, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		const staleStatusPath = join(
+			multiAuthDir,
+			"runtime-rotation-app-helper.99999997.json",
+		);
+		writeFileSync(staleStatusPath, '{"pid":99999997,"state":"running"}\n', "utf8");
+
+		const result = runWrapper(fixtureRoot, ["app", "."], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+			// The first two deletion attempts throw simulated EBUSY; only a
+			// retrying deletion removes the file.
+			CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES: "2",
+			OPENAI_API_KEY: undefined,
+		});
+		expect(result.status).toBe(0);
+		expect(existsSync(staleStatusPath)).toBe(false);
 	});
 
 	// Owner files have no post-mortem value and go with the helper; stale

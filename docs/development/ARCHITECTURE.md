@@ -276,6 +276,7 @@ Canonical multi-auth root: `~/.codex/multi-auth`.
 | `local-client-tokens.json` | Local bridge token hashes (no plaintext) |
 | `usage/usage-ledger.jsonl` | Append-only local usage metadata (+ rotated archives) |
 | `runtime-rotation-app-helper.<pid>.json` | Wrapper-launched Codex app helper status, one per live helper (the un-suffixed name is the pre-per-PID legacy path, still read) |
+| `runtime-rotation-app-helper-owner.<pid>.json` | Owner identity token for a wrapper-launched helper, one per helper; removed by the helper on exit and swept when its PID is dead |
 | `app-bind/` | Packaged app bind state, backup metadata, router status/log |
 | `logs/` | Diagnostics when logging is enabled |
 | `cache/` | Prompt/cache artifacts |

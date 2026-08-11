@@ -826,6 +826,10 @@ export async function startRuntimeRotationProxy(
 			await closeServer(server, sockets);
 			await state.activeAccountManager.flushPendingSave();
 		},
+		// Live client connections, which the app helper reads as evidence that a
+		// detached consumer is still attached: a helper whose launcher is gone
+		// and whose socket set is empty has nobody left to serve.
+		getOpenConnectionCount: () => sockets.size,
 		getStatus: () => ({
 			...state.status,
 			// Redact any email/token material that leaked into a raw upstream or

@@ -90,6 +90,16 @@ const DEFAULT_APP_RUNTIME_HELPER_IDLE_MS = 12 * 60 * 60 * 1000;
 // PID reuse briefly reviving a dead owner is the observed one — previously
 // produced an *unbounded* leak because nothing else bounded the process.
 const DEFAULT_APP_RUNTIME_HELPER_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+// A helper whose launcher is gone is not idle in the same sense as one whose
+// launcher is sitting at a prompt: nobody is coming back to it unless a
+// detached consumer picked it up. The detach grace below hands helpers off
+// optimistically — every launcher that exits cleanly within the window leaves
+// its helper running — so short forwarded commands strand helpers that then
+// hold the full idle timeout with no owner and no traffic. This window is the
+// idle timeout that applies from the moment the owner is confirmed dead, and
+// it only ever fires with zero open client connections, so a consumer that
+// really did take the handoff is never reaped out from under.
+const DEFAULT_APP_RUNTIME_HELPER_DETACHED_IDLE_MS = 15 * 60 * 1000;
 const APP_RUNTIME_HELPER_OWNER_START_TIME_ENV =
 	"CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS";
 // Re-verify owner identity (not just PID liveness) at most this often; a
@@ -4012,6 +4022,24 @@ function createRuntimeRotationAppHelperOwnerLivenessCheck(
 	};
 }
 
+function resolveRuntimeRotationAppHelperTickMs(idleTimeoutMs, detachedIdleMs) {
+	const shortestWindowMs =
+		detachedIdleMs > 0 ? Math.min(idleTimeoutMs, detachedIdleMs) : idleTimeoutMs;
+	return Math.min(1_000, Math.max(50, Math.floor(shortestWindowMs / 2)));
+}
+
+function resolveRuntimeRotationAppHelperDetachedIdleMs(env = process.env) {
+	const parsed = Number.parseInt(
+		env.CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS ?? "",
+		10,
+	);
+	// 0 disables the detached window explicitly, leaving a stranded helper on
+	// the full idle timeout — the pre-fix behavior, for anyone who depends on it.
+	return Number.isFinite(parsed) && parsed >= 0
+		? parsed
+		: DEFAULT_APP_RUNTIME_HELPER_DETACHED_IDLE_MS;
+}
+
 function resolveRuntimeRotationAppHelperDetachGraceMs(env = process.env) {
 	const parsed = Number.parseInt(
 		env.CODEX_MULTI_AUTH_APP_ROTATION_DETACH_GRACE_MS ?? "",
@@ -4224,6 +4252,7 @@ function createRuntimeRotationAppHelperStatus({
 	identityToken,
 	idleTimeoutMs,
 	lastActivityAt,
+	idleExpiresAt,
 	state,
 }) {
 	const proxyStatus =
@@ -4247,7 +4276,13 @@ function createRuntimeRotationAppHelperStatus({
 		updatedAt: Date.now(),
 		baseUrl: proxyServer?.baseUrl ?? null,
 		idleTimeoutMs,
-		idleExpiresAt: lastActivityAt + idleTimeoutMs,
+		// The reaper's real deadline, which is the detached window once the owner
+		// is gone. Reporting the raw idle timeout there would tell `rotation
+		// status` a helper has 12h left when it has minutes.
+		idleExpiresAt:
+			typeof idleExpiresAt === "number"
+				? idleExpiresAt
+				: lastActivityAt + idleTimeoutMs,
 		totalRequests: proxyStatus.totalRequests ?? 0,
 		upstreamRequests: proxyStatus.upstreamRequests ?? 0,
 		retries: proxyStatus.retries ?? 0,
@@ -4269,6 +4304,7 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 	const startedAt = Date.now();
 	const idleTimeoutMs = resolveRuntimeRotationAppHelperIdleMs();
 	const maxLifetimeMs = resolveRuntimeRotationAppHelperMaxLifetimeMs();
+	const detachedIdleMs = resolveRuntimeRotationAppHelperDetachedIdleMs();
 	const ownerPid = resolveRuntimeRotationAppHelperOwnerPid();
 	const isOwnerAlive = createRuntimeRotationAppHelperOwnerLivenessCheck(
 		ownerPid,
@@ -4278,6 +4314,28 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 	let lastRequestCount = 0;
 	let lastPublishedToken = null;
 	let lastPublishedAt = 0;
+	// When the owner was first confirmed dead. Null while it is alive, and reset
+	// to null if a later probe revives the verdict, so a transient "dead" cannot
+	// ratchet the detached deadline the way the old liveness check ratcheted the
+	// idle one.
+	let ownerGoneSince = null;
+	// A detached consumer holding a socket is evidence the handoff was real,
+	// so it blocks the detached reap even with no requests in flight. A proxy
+	// that cannot report connections (older shape, test fixtures) reads as
+	// zero: the deadline is then carried by activity alone, as before.
+	const countOpenConnections = () =>
+		typeof proxyServer?.getOpenConnectionCount === "function"
+			? proxyServer.getOpenConnectionCount()
+			: 0;
+	// The deadline the reaper will actually enforce, which is the earlier of the
+	// idle timeout and — once the owner is gone — the detached window.
+	const resolveIdleDeadline = () =>
+		ownerGoneSince !== null && detachedIdleMs > 0
+			? Math.min(
+					lastActivityAt + idleTimeoutMs,
+					Math.max(lastActivityAt, ownerGoneSince) + detachedIdleMs,
+				)
+			: lastActivityAt + idleTimeoutMs;
 	// Freshness readers tolerate hours of staleness, but tests run the whole
 	// lifecycle in milliseconds — heartbeat at least once per idle window.
 	const statusHeartbeatMs = Math.min(
@@ -4292,6 +4350,7 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 			identityToken,
 			idleTimeoutMs,
 			lastActivityAt,
+			idleExpiresAt: resolveIdleDeadline(),
 			state,
 		});
 		// `updatedAt` moves every call and `idleExpiresAt` moves every tick the
@@ -4430,10 +4489,23 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 			}
 			if (isOwnerAlive(currentTime)) {
 				lastActivityAt = currentTime;
+				ownerGoneSince = null;
+			} else if (ownerGoneSince === null) {
+				ownerGoneSince = currentTime;
 			}
 			publishStatus("running");
 			if (currentTime - lastActivityAt >= idleTimeoutMs) {
 				exitAfterCleanup("idle-timeout", 0);
+			} else if (
+				ownerGoneSince !== null &&
+				detachedIdleMs > 0 &&
+				currentTime >= resolveIdleDeadline() &&
+				countOpenConnections() === 0
+			) {
+				// The launcher is gone, nothing is connected, and nothing has been
+				// proxied for the detached window: this helper was stranded by a
+				// launcher that exited, not handed to a consumer that wants it.
+				exitAfterCleanup("owner-gone", 0);
 			} else if (
 				maxLifetimeMs > 0 &&
 				currentTime - startedAt >= maxLifetimeMs
@@ -4442,7 +4514,11 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 				// for exactly the case where activity accounting is wrong.
 				exitAfterCleanup("max-lifetime", 0);
 			}
-		}, Math.min(1_000, Math.max(50, Math.floor(idleTimeoutMs / 2))));
+			// Tick against the shortest window that can fire, so a short detached
+			// window is enforced at its own resolution rather than the idle
+			// timeout's. Both defaults are far above 2s, so production still ticks
+			// once a second.
+		}, resolveRuntimeRotationAppHelperTickMs(idleTimeoutMs, detachedIdleMs));
 	} catch (error) {
 		process.stdout.write(
 			`${JSON.stringify({

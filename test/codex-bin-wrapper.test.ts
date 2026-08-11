@@ -397,6 +397,11 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			"        await new Promise(() => {});",
 			"      }",
 			"    },",
+			// Opt-in: report open client connections, which the real proxy reads off
+			// its live socket set. The detached reap treats a connected consumer as
+			// proof the handoff was real, so a test needs to be able to say "someone
+			// is attached" without standing up a real client.
+			"    getOpenConnectionCount: () => readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS') ?? 0,",
 			"    getStatus: () => buildStatus(),",
 			"  };",
 			"}",
@@ -3302,6 +3307,125 @@ describe("codex bin wrapper", () => {
 			});
 			try {
 				await sleep(1_000);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The detach grace hands a helper off to nobody whenever a launcher merely
+	// exits quickly — every short forwarded command strands one — and before
+	// this window those helpers held the full idle timeout (12h by default)
+	// with a dead owner, no traffic, and nothing connected. A stranded helper
+	// is garbage the moment the detached window elapses. Owner death is
+	// simulated the same way as the ratchet test: a live PID whose identity
+	// cannot match, which the liveness check correctly reads as dead.
+	it.skipIf(process.platform === "win32")(
+		"reaps a stranded helper on the detached window instead of the full idle timeout",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				// Idle can never fire inside this test; only the detached window can,
+				// which is the whole point — before it existed, this helper lived on.
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			});
+			try {
+				await Promise.race([closed, sleep(5_000)]);
+				expect(isProcessAlive(ready.pid)).toBe(false);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+					idleExpiresAt: number;
+					updatedAt: number;
+				};
+				expect(status.state).toBe("owner-gone");
+				// The reported deadline is the one actually enforced: `rotation
+				// status` must not advertise the 60s idle window to a helper the
+				// detached window is about to reap.
+				expect(status.idleExpiresAt - status.updatedAt).toBeLessThan(60_000);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The detached window reaps strays, not handoffs. A consumer holding a
+	// connection is the evidence that the detach was real — `codex app` hands
+	// the desktop app a proxy and exits — so an attached helper keeps the full
+	// idle timeout no matter how long its launcher has been gone.
+	it.skipIf(process.platform === "win32")(
+		"keeps a stranded helper alive while a client connection is open",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "200",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS: "1",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				// Many detached windows' worth of ticks with a socket held open.
+				await sleep(1_500);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The escape hatch is a real escape hatch: 0 restores the pre-fix behavior
+	// for anyone who was depending on a stranded helper outliving its launcher
+	// without holding a connection.
+	it.skipIf(process.platform === "win32")(
+		"keeps a stranded helper on the full idle timeout when the detached window is disabled",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "0",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				await sleep(1_500);
 				expect(isProcessAlive(ready.pid)).toBe(true);
 			} finally {
 				await stopDirectAppHelper(helper, closed);

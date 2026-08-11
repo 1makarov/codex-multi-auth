@@ -628,9 +628,10 @@ function formatAppRuntimeHelperStatus(
 	}
 	const alive = isProcessAlive(status.pid);
 	// Only "running" is running: "stopped", "idle-timeout", "max-lifetime",
-	// "error", and anything a future helper invents are all terminal, and a
-	// live kill(pid, 0) on a terminal record proves nothing — the PID may be
-	// recycled, which is the exact gate this fix stopped trusting.
+	// "owner-gone", "error", and anything a future helper invents are all
+	// terminal, and a live kill(pid, 0) on a terminal record proves nothing —
+	// the PID may be recycled, which is the exact gate this fix stopped
+	// trusting.
 	if (!alive || status.state !== "running") {
 		return "Codex app helper: not running";
 	}

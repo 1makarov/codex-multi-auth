@@ -7,6 +7,13 @@ export interface RuntimeRotationProxyServer {
 	baseUrl: string;
 	close: () => Promise<void>;
 	getStatus: () => RuntimeRotationProxyStatus;
+	/**
+	 * Number of client sockets currently open against the proxy. The detached
+	 * app helper uses it to tell a handed-off consumer from a stranded process;
+	 * optional so a proxy shape without it degrades to activity-only accounting
+	 * rather than failing to start.
+	 */
+	getOpenConnectionCount?: () => number;
 }
 
 export interface RuntimeRotationProxyStatus {

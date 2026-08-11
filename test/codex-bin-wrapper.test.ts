@@ -3206,10 +3206,31 @@ describe("codex bin wrapper", () => {
 		helper.stderr?.on("data", (chunk: string) => {
 			stderr += chunk;
 		});
+		// A rejection here throws before the caller reaches its try/finally, so
+		// nothing would ever call `stopDirectAppHelper` — the harness for a leak
+		// fix would leak a helper per failure, each holding a 1s status tick and,
+		// on the long-idle fixtures, a ref'd handle for a minute. Kill on the way
+		// out instead. (`close`-before-ready is already terminal.)
+		const rejectAndReap = (
+			reject: (error: Error) => void,
+			error: Error,
+		): void => {
+			if (helper.pid && isProcessAlive(helper.pid)) {
+				try {
+					helper.kill("SIGKILL");
+				} catch {
+					// Best-effort: the helper may have exited between the check and here.
+				}
+			}
+			reject(error);
+		};
 		const ready = await new Promise<{ statusPath: string; pid: number }>(
 			(resolve, reject) => {
 				const timeout = setTimeout(() => {
-					reject(new Error(`helper did not become ready\n${stdout}\n${stderr}`));
+					rejectAndReap(
+						reject,
+						new Error(`helper did not become ready\n${stdout}\n${stderr}`),
+					);
 				}, 5_000);
 				helper.stdout?.on("data", () => {
 					const newlineIndex = stdout.indexOf("\n");
@@ -3226,7 +3247,10 @@ describe("codex bin wrapper", () => {
 						}
 					} catch (error) {
 						clearTimeout(timeout);
-						reject(error);
+						rejectAndReap(
+							reject,
+							error instanceof Error ? error : new Error(String(error)),
+						);
 					}
 				});
 				helper.once("close", () => {
@@ -3375,6 +3399,57 @@ describe("codex bin wrapper", () => {
 			}
 		},
 	);
+
+	// The companion that runs everywhere, Windows included. The tests above
+	// simulate owner death with an unmatchable start time, which only POSIX can
+	// evaluate — with no `ps`, identity is unknowable and the check degrades to
+	// bare liveness. A *genuinely* dead owner PID is readable on every
+	// platform through that same bare check, so the reap itself is covered on
+	// win32 even though the identity flavor of it cannot be.
+	it("reaps a stranded helper whose owner PID is genuinely dead", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		// A PID this test owned and then killed, so "dead" is a fact rather than
+		// a sentinel integer that different platforms classify differently.
+		const sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+			stdio: "ignore",
+		});
+		const deadOwnerPid = sleeper.pid;
+		expect(deadOwnerPid).toBeTruthy();
+		sleeper.kill("SIGKILL");
+		for (let attempt = 0; attempt < 50 && isProcessAlive(Number(deadOwnerPid)); attempt += 1) {
+			await sleep(20);
+		}
+		expect(isProcessAlive(Number(deadOwnerPid))).toBe(false);
+
+		const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+			CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(deadOwnerPid),
+			// Left unset on purpose: this is the degraded bare-liveness path.
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: undefined,
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+		});
+		try {
+			await Promise.race([closed, sleep(5_000)]);
+			expect(isProcessAlive(ready.pid)).toBe(false);
+			const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+				state: string;
+			};
+			expect(status.state).toBe("owner-gone");
+		} finally {
+			await stopDirectAppHelper(helper, closed);
+		}
+	});
 
 	// The detached window reaps strays, not handoffs. A consumer holding a
 	// connection is the evidence that the detach was real — `codex app` hands

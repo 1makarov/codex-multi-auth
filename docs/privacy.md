@@ -31,6 +31,7 @@
 | Named backups | `~/.codex/multi-auth/backups/` | Operator-exported named account-pool backups |
 | Project account pools | `~/.codex/multi-auth/projects/<project-key>/` | Per-repo account pools when project scope is enabled |
 | Runtime app helper status | `~/.codex/multi-auth/runtime-rotation-app-helper.<pid>.json` (one per helper; plus the legacy un-suffixed file from older versions) | Local helper status for wrapper-launched Codex app sessions |
+| Runtime app helper owner identity | `~/.codex/multi-auth/runtime-rotation-app-helper-owner.<pid>.json` (one per helper) | Local identity token and launcher PID, so a helper can tell its own launcher from a recycled PID; removed on helper exit and swept once the PID is dead |
 | Persistent app bind state/logs | `~/.codex/multi-auth/app-bind/` | Reversible packaged-app router state, backup metadata, and local router log |
 | Logs | `~/.codex/multi-auth/logs/codex-plugin/` | Optional diagnostics |
 | Prompt/cache files | `~/.codex/multi-auth/cache/` | Cached prompt/template metadata |

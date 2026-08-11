@@ -4320,9 +4320,12 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 	// idle one.
 	let ownerGoneSince = null;
 	// A detached consumer holding a socket is evidence the handoff was real,
-	// so it blocks the detached reap even with no requests in flight. A proxy
-	// that cannot report connections (older shape, test fixtures) reads as
-	// zero: the deadline is then carried by activity alone, as before.
+	// so it blocks the detached reap even with no requests in flight. The
+	// absence of that evidence is not evidence of absence, and this fails
+	// open on purpose: a proxy that cannot report connections reads as zero,
+	// so the detached window still reaps it on activity alone. Erring the
+	// other way — treating "unknown" as "someone is attached" — would restore
+	// the leak for any shape that stopped answering.
 	const countOpenConnections = () => {
 		if (typeof proxyServer?.getOpenConnectionCount !== "function") return 0;
 		const open = proxyServer.getOpenConnectionCount();

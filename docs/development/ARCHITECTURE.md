@@ -53,15 +53,20 @@ scripts/codex.js
   v
 Official Codex CLI
 
-Runtime rotation enabled -> one of three transports
+Runtime rotation enabled -> one of two homes, over four branches
   |
-  |- interactive TUI (no forwarded subcommand)
+  |- interactive TUI (no forwarded subcommand), resume, fork
   |    canonical CODEX_HOME + ephemeral -c provider overrides
   |    (no shadow copy, no provider/transport rewrite of config.toml,
   |     detach on exit; the auth-store reconcile above still applies)
   |
+  |- app-server
+  |    same canonical CODEX_HOME transport, but the helper is stopped
+  |    with the server rather than detached, and no app-server CLI shim
+  |    is installed
+  |
   |- codex app
-  |    app runtime helper process + shadow CODEX_HOME
+  |    app runtime helper process + shadow CODEX_HOME + app-server CLI shim
   |
   |- every other request-bearing command
   |    shadow CODEX_HOME/config.toml
@@ -162,26 +167,35 @@ Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained acco
 
 1. The wrapper checks `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY` and `codexRuntimeRotationProxy`.
 2. If disabled, the command forwards to the official Codex CLI unchanged except for normal wrapper compatibility settings.
-3. If enabled, `createRuntimeRotationProxyContextIfEnabled` (`scripts/codex.js`) picks one of three transports from the forwarded argv:
+3. If enabled, `createRuntimeRotationProxyContextIfEnabled` (`scripts/codex.js`) picks a transport from the forwarded argv. There are two homes — canonical and shadow — reached over four selection branches, because the canonical-home branches differ in helper lifetime and shim installation. The table splits the first branch into its two predicates for clarity:
 
    | Branch | Predicate | Transport |
    | --- | --- | --- |
    | Interactive TUI | `isCodexInteractiveTuiCommand` — no forwarded subcommand at all | App runtime helper with `useCanonicalHome: true` and `detachOnExit: true`. Runs against the **canonical** `CODEX_HOME`; the provider is passed as ephemeral `-c model_providers.*` overrides. No shadow copy and no state sync-back. Nothing **provider- or transport-related** is written into `config.toml` on this path — the only top-level key the wrapper still reconciles there is `cli_auth_credentials_store`, which is transport-independent (see step 4 note). |
    | Interactive `resume` / `fork` | `isCodexInteractiveResumeCommand` — forwarded command is `resume` or `fork` | Same transport and options as the interactive TUI above. These open a TUI against an existing thread, so they must see the canonical thread index. |
-   | `codex app` | `isCodexAppCommand` — forwarded command is `app` | App runtime helper process with a shadow `CODEX_HOME`. |
+   | `app-server` | `isCodexAppServerCommand` — forwarded command is `app-server` | App runtime helper with `useCanonicalHome: true`, `detachOnExit: false`, `installAppServerShim: false`, and `proxyAppServerAccountRead: true`. Same canonical home as the interactive branches; the differences are that a resident server owns its proxy for its whole lifetime rather than detaching it, and that the account-response rewriting is requested explicitly because no shim is present to set the label env. |
+   | `codex app` | `isCodexAppCommand` — forwarded command is `app` | App runtime helper process with a shadow `CODEX_HOME`, plus the app-server CLI shim. |
    | Everything else | request-bearing forwarded command | Shadow `CODEX_HOME` created inline by the wrapper process. |
 
-4. The wrapper starts `lib/runtime-rotation-proxy.ts` on `127.0.0.1` with a per-process client API key. Shadow-home branches copy relevant official Codex state and rewrite `config.toml` to select `codex-multi-auth-runtime-proxy`; the canonical-home branch instead injects the same provider through `-c` arguments and passes the client key via `OPENAI_API_KEY`.
+4. The wrapper starts `lib/runtime-rotation-proxy.ts` on `127.0.0.1` with a per-process client API key. Shadow-home branches copy relevant official Codex state and rewrite `config.toml` to select `codex-multi-auth-runtime-proxy`; the canonical-home branches instead inject the same provider through `-c` arguments and pass the client key via `OPENAI_API_KEY`.
 5. The official Codex CLI sends Responses/model traffic to the local provider.
 6. The proxy validates the client token, evaluates runtime policy, selects a managed account, refreshes tokens if needed, and forwards to the official backend.
 7. The proxy rotates to another account before streaming response bytes when it sees retryable auth refresh failures, 429s, 5xx responses, or network errors (subject to pin and min-rotation-interval throttling).
 8. Successful responses stream back to the local Codex client with hop-by-hop/private/stale decoded headers removed.
 9. Usage ledger rows and runtime counters are persisted for status/report/usage/budget commands.
-10. On exit, shadow-home branches sync refreshed official state files back and remove the temporary directory. The canonical-home branch has nothing to sync — it read and wrote official state in place.
+10. On exit, shadow-home branches sync refreshed official state files back and remove the temporary directory. The canonical-home branches have nothing to sync — they read and wrote official state in place.
 
 Why the interactive branch is different: copying the Codex home into a shadow made the official CLI reindex its thread history and SQLite state on every TUI launch. Running interactive sessions against the canonical home keeps that state reusable.
 
 `resume` and `fork` belong to that same branch for a stronger reason. The shadow mirror deliberately omits the runtime SQLite state (`isRuntimeRotationShadowHomeOmittedEntry`), so a shadow home only ever holds a partial thread index rebuilt from the linked `sessions` directory. Resuming a thread that the shadow index does not contain left the TUI on a blank screen forever, while the same command worked under the official CLI and with the proxy disabled. Routing both commands to the canonical home is what makes the thread visible (#647).
+
+`app-server` is the third member of that set, and the shadow home broke it twice over (#659). The mirror links directories rather than copying them, and Codex applies an `lstat`-strict check to `<CODEX_HOME>/app-server-control`, so on any machine where a previous app-server had created that directory the server refused to start at all. Where it did start, the frozen thread index was not a per-launch annoyance but a divergence held for the process's whole life and handed to every attached client, with anything the server created written into a copy discarded at exit.
+
+The app-server CLI shim is deliberately **not** installed on that branch. Its only purpose is to let a Codex process that spawns its own `codex app-server` through `CODEX_CLI_PATH` — the desktop app — have that spawn routed back through the wrapper. Installing it is neither free nor inert: it copies the Node image into a per-pid directory (a full ~100 MB `copyFileSync` on Windows, repeated on every supervised restart) and stamps `CODEX_CLI_PATH`, `NODE_OPTIONS=--import=<preload>`, and `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0` onto the environment the forwarded child inherits. That last one is the dangerous one for a resident server: Codex passes its environment to shell tools and MCP servers, so every nested `codex-multi-auth-codex` invocation would read rotation as disabled and bill whatever account the official CLI resolved — a silent billing error, and exactly what routing `app-server` through rotation exists to prevent.
+
+Because no shim means no `CODEX_MULTI_AUTH_APP_SERVER_ACCOUNT_LABEL` in the forwarded environment, the branch asks for `account/read` / `getAuthStatus` / `account/rateLimits/read` rewriting through the explicit `proxyAppServerAccountRead` option instead. The option is load-bearing: dropping it fails `test/codex-bin-wrapper.test.ts`'s account-response tests.
+
+A helper that cannot start is a hard failure on all of these branches — unlike the shadow path, there is no rotation-off shape left to degrade into, and quietly serving a resident server unrotated is worse than not serving it. Hard means a diagnostic on stderr and exit 1, not an unhandled rejection: `createRuntimeRotationProxyContextIfEnabled` catches the launch failure, releases the compatibility home the caller already built, and returns a `startupError` that `forwardToRealCodex` turns into an exit code before the official CLI is ever spawned.
 
 Helper shutdown is bounded rather than best-effort. `stopRuntimeRotationAppHelper` sends `SIGTERM`, waits out the graceful window, escalates to `SIGKILL` if the helper is still running, and then unconditionally destroys the helper's stdio streams and unrefs the child. That last step is the load-bearing one: the helper is spawned with piped stdio, so a helper that outlives the window — or any process that inherited those pipes — keeps the wrapper's event loop referenced and the shell prompt never returns. On Windows the signals are emulated as unconditional termination, so the stream teardown is the only part that reliably frees the wrapper there.
 
@@ -189,7 +203,7 @@ Two interactive sessions can therefore run concurrently against the same home �
 
 Scope that guarantee to session state only. It does **not** extend to `config.toml`: `ensureCodexCliFileAuthStore` (`lib/codex-cli/writer.ts`) still read-modify-writes the canonical file when the store is not already `"file"`, and the atomic write does not serialize cross-process writers. That is safe in practice rather than by locking — the operation is idempotent, converges on a single value, and lands via atomic rename, so concurrent invocations agree instead of interleaving. Anything added to that write path that is *not* idempotent would need a real lock.
 
-Internal env used by these branches (not operator-facing): `CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME`, `CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON`, `CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID`, `CODEX_MULTI_AUTH_REAL_CODEX_HOME`.
+Internal env used by these branches (not operator-facing): `CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME`, `CODEX_MULTI_AUTH_APP_ROTATION_INSTALL_APP_SERVER_SHIM`, `CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON`, `CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID`, `CODEX_MULTI_AUTH_REAL_CODEX_HOME`.
 
 * * *
 

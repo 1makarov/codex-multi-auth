@@ -317,7 +317,8 @@ Set by the wrapper for its own child processes. Not intended to be set by hand.
 
 | Variable | Purpose |
 | --- | --- |
-| `CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME` | `1` when the app runtime helper must run against the canonical `CODEX_HOME` (interactive TUI path) instead of a shadow home |
+| `CODEX_MULTI_AUTH_APP_ROTATION_USE_CANONICAL_HOME` | `1` when the app runtime helper must run against the canonical `CODEX_HOME` (interactive TUI, `resume`/`fork`, and `app-server` paths) instead of a shadow home |
+| `CODEX_MULTI_AUTH_APP_ROTATION_INSTALL_APP_SERVER_SHIM` | `0` suppresses the app-server CLI shim in the helper. The shim only serves a Codex process that spawns its own `codex app-server` through `CODEX_CLI_PATH`; a wrapper-invoked `app-server` already carries the overrides on its command line and must not inherit the `CODEX_CLI_PATH` / `NODE_OPTIONS` / `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0` environment the shim stamps |
 | `CODEX_MULTI_AUTH_APP_SERVER_CONFIG_ARGS_JSON` | JSON array of `-c` provider overrides the app-server preload replays on the canonical-home path |
 | `CODEX_MULTI_AUTH_RUNTIME_SHADOW_COPY_GENERATED_DIRS` | `1`/`true`/`yes` allows copying generated runtime directories into a shadow `CODEX_HOME` when they cannot be linked. Off by default: the wrapper skips such a directory rather than duplicating active runtime data |
 | `CODEX_MULTI_AUTH_WRAPPER_IMPORT_ONLY` | Import `scripts/codex.js` without running its main entrypoint (used by the preload shim) |

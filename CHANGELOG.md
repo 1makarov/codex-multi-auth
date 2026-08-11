@@ -7,6 +7,28 @@ This repository's current stable release line is `2.x`.
 Current stable release notes live in `docs/releases/`.
 This top-level changelog preserves the foundational `0.x` milestones and points older iteration history to `docs/releases/legacy-pre-0.1-history.md`.
 
+## [2.8.4] - 2026-08-12
+
+A corrective release for the `codex app-server` transport. No user configuration migration is required. It closes [#659](https://github.com/ndycode/codex-multi-auth/issues/659) and landed as [#662](https://github.com/ndycode/codex-multi-auth/pull/662); see [docs/releases/v2.8.4.md](docs/releases/v2.8.4.md) for full details.
+
+### Fixed
+
+- **`codex app-server` could not run on the shadow `CODEX_HOME`.** The shadow mirror links directories, so Codex's strict `lstat` check on `<CODEX_HOME>/app-server-control` refused to start the server on any machine that had previously run one; a server that did start held a frozen snapshot of the thread index for its whole life and discarded threads it created. `app-server` now takes the canonical-home transport already used by the interactive TUI and `resume`/`fork`, with rotation carried as `-c` overrides ([#659](https://github.com/ndycode/codex-multi-auth/issues/659), [#662](https://github.com/ndycode/codex-multi-auth/pull/662))
+- **The app-server CLI shim leaked a rotation-disabling environment into forwarded children.** The shim is reachable only from the app-helper, so routing a command through that helper silently stamped `CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY=0`, `CODEX_CLI_PATH`, and a preload `NODE_OPTIONS` onto the environment Codex passes to shell tools and MCP servers. It is no longer installed for a wrapper-invoked `app-server`, which already carries the overrides on its command line; `codex app` and the interactive branches are unchanged ([#662](https://github.com/ndycode/codex-multi-auth/pull/662))
+- **A short-lived `app-server` stranded its rotation helper for the full 12-hour idle timeout.** An explicit `detachOnExit: false` is now honored instead of being overridden by the clean-exit grace window, and that window's clock starts when the helper reports ready rather than before a launch bounded at 15 seconds ([#662](https://github.com/ndycode/codex-multi-auth/pull/662))
+- **A rotation helper that failed to start surfaced as an unhandled rejection.** The helper branches now emit a diagnostic and exit 1, releasing the compatibility home first, instead of printing a raw stack trace and leaking a temporary directory ([#662](https://github.com/ndycode/codex-multi-auth/pull/662))
+
+### Changed
+
+- `app-server` requests `account/read`, `getAuthStatus`, and `account/rateLimits/read` rewriting explicitly rather than inferring it from an environment variable the removed shim used to set. Stdio clients see unchanged responses ([#662](https://github.com/ndycode/codex-multi-auth/pull/662))
+- A rotation proxy that cannot start now fails an `app-server` hard rather than silently running it unrotated, matching how `--account` already behaves ([#662](https://github.com/ndycode/codex-multi-auth/pull/662))
+- The helper's startup stdout/stderr buffers stop accumulating once startup settles, so a wrapper supervising a resident server for days does not grow them without bound ([#662](https://github.com/ndycode/codex-multi-auth/pull/662))
+
+### Regression coverage
+
+- Five wrapper tests cover canonical-home routing, a real `app-server-control` directory and a live thread index, the absence of every shim side effect, helper reaping on clean and non-zero exits, the startup-failure diagnostic and its compatibility-home release, and `--account` propagation across the detached helper boundary. Reaping is asserted by polling the helper pid, since Windows hard-terminates the helper before its cleanup handler runs.
+- The full suite passes with 337 test files passing and 1 skipped, for 5,364 tests passing and 4 skipped; coverage remains above the project thresholds.
+
 ## [2.8.3] - 2026-08-09
 
 A follow-up patch release for quota presentation. No user configuration migration is required. It landed as [#657](https://github.com/ndycode/codex-multi-auth/pull/657); see [docs/releases/v2.8.3.md](docs/releases/v2.8.3.md) for full details.

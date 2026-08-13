@@ -58,9 +58,10 @@ export function readRuntimeHelperPid(value: unknown): number | null {
  * some platforms raise for a PID above their ceiling — counts as dead.
  */
 export function isRuntimeHelperProcessAlive(pid: number | null): boolean {
-	if (readRuntimeHelperPid(pid) === null) return false;
+	const probePid = readRuntimeHelperPid(pid);
+	if (probePid === null) return false;
 	try {
-		process.kill(pid as number, 0);
+		process.kill(probePid, 0);
 		return true;
 	} catch (error) {
 		const code =

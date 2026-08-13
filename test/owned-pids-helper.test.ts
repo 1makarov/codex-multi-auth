@@ -146,5 +146,17 @@ describe("owned-pids", () => {
 			expect(outcome).not.toBe("HUNG");
 			expect(outcome).toContain("failed to spawn");
 		}, 30_000);
+
+		it("makes withLivePid reject instead of hanging", async () => {
+			// The fourth entry point, and the last unexercised failed-spawn branch:
+			// its cleanup runs from a `finally`, where an unguarded `kill` throw
+			// would replace the reported reason with its own.
+			const outcome = await settlesWithin(
+				withLivePid(() => "unreachable", { spawnChild: spawnFailingChild }),
+				5_000,
+			);
+			expect(outcome).not.toBe("HUNG");
+			expect(outcome).toContain("failed to spawn");
+		}, 30_000);
 	});
 });

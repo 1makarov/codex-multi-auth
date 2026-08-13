@@ -7709,7 +7709,17 @@ describe("codex bin wrapper", () => {
 		let entries: string[] = [];
 		try {
 			entries = readdirSync(multiAuthDir);
-		} catch {
+		} catch (error) {
+			// Only "the directory does not exist yet" is a legitimate zero. Any
+			// other readdir failure — a permissions change, a path that is not a
+			// directory — would otherwise be reported as a clean sweep, and the
+			// bounded-metadata test below asserts upper bounds that a false zero
+			// satisfies perfectly.
+			const code =
+				error && typeof error === "object" && "code" in error
+					? String((error as { code?: unknown }).code)
+					: "unknown";
+			if (code !== "ENOENT") throw error;
 			return { status: 0, owner: 0 };
 		}
 		return {
@@ -7747,8 +7757,49 @@ describe("codex bin wrapper", () => {
 				"utf8",
 			);
 
+			// Before measuring accumulation, prove the fixture actually produces
+			// helpers. Every assertion below is an upper bound, so a launch path
+			// that silently never publishes metadata — a wrong env gate, a proxy
+			// fixture that never engages, `app .` short-circuiting on the fake bin
+			// — would leave every count at zero and pass the whole test while
+			// demonstrating nothing about the leak it exists to guard.
+			const probe = runWrapper(fixtureRoot, ["app", "."], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				// Long enough that the helper is unambiguously still alive when the
+				// probe looks for it.
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "30000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "0",
+				OPENAI_API_KEY: undefined,
+			});
+			expect(probe.status).toBe(0);
+			const probeCounts = countHelperMetadata(multiAuthDir);
+			expect(probeCounts.status).toBeGreaterThan(0);
+			expect(probeCounts.owner).toBeGreaterThan(0);
+			// Tear that one down before the accumulation loop starts, so it cannot
+			// be mistaken for a leaked helper later.
+			const probeEntries = readdirSync(multiAuthDir).filter((name) =>
+				name.startsWith("runtime-rotation-app-helper"),
+			);
+			for (const name of probeEntries) {
+				const match = /\.(\d+)\.json$/.exec(name);
+				const pid = match?.[1] ? Number.parseInt(match[1], 10) : null;
+				if (pid !== null && isProcessAlive(pid)) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {
+						// Already gone.
+					}
+				}
+				rmSync(join(multiAuthDir, name), { force: true });
+			}
+			await sleep(200);
+
 			const cycles = 30;
 			const counts: number[] = [];
+			let sawHelperDuringLoop = false;
 			for (let cycle = 0; cycle < cycles; cycle += 1) {
 				const result = runWrapper(fixtureRoot, ["app", "."], {
 					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
@@ -7763,7 +7814,9 @@ describe("codex bin wrapper", () => {
 				});
 				expect(result.status).toBe(0);
 				await sleep(120);
-				counts.push(countHelperMetadata(multiAuthDir).owner);
+				const sample = countHelperMetadata(multiAuthDir);
+				if (sample.owner > 0 || sample.status > 0) sawHelperDuringLoop = true;
+				counts.push(sample.owner);
 			}
 
 			// Give the last cycle's helper time to exit and one more launch to sweep
@@ -7782,6 +7835,9 @@ describe("codex bin wrapper", () => {
 
 			const final = countHelperMetadata(multiAuthDir);
 			const peak = Math.max(...counts);
+			// The loop has to have observed at least one helper at some point,
+			// otherwise the upper bounds below are vacuous.
+			expect(sawHelperDuringLoop).toBe(true);
 			// The pre-fix behaviour was one owner file per launch, kept forever, so
 			// the count climbed with the cycle count. A few concurrent files are
 			// expected — each helper outlives the launch that spawned it by its
@@ -7872,9 +7928,9 @@ describe("codex bin wrapper", () => {
 	it.skipIf(process.platform === "win32")(
 		"stress: the reap matrix reaps exactly the stranded helpers and no others",
 		async () => {
-			// The whole lifecycle contract in one run, with all four configurations
-			// live at the same time so a rule that fires on the wrong one is visible
-			// as a divergence rather than as a single red test.
+			// The whole lifecycle contract in one run, with every configuration live
+			// at the same time so a rule that fires on the wrong one is visible as a
+			// divergence rather than as a single red test.
 			const fixtureRoot = createWrapperFixture();
 			createRuntimeRotationProxyFixtureModule(fixtureRoot);
 			const originalHome = join(fixtureRoot, "codex-home");
@@ -7957,24 +8013,40 @@ describe("codex bin wrapper", () => {
 					// been, and anything that survives this has survived on a rule.
 					await sleep(4_000);
 
-					const actual = cases.map((testCase, index) => ({
-						label: testCase.label,
-						expected: testCase.survives,
-						alive: isProcessAlive(running[index]?.ready.pid ?? 0),
-					}));
+					// Zipped off `running`, not indexed with a fallback: passing `0` to
+					// `isProcessAlive` would probe the caller's own process group on
+					// POSIX and answer true, so a missing helper would read as alive —
+					// and four of these five cases expect exactly that.
+					expect(running).toHaveLength(cases.length);
+					const actual = running.map(({ ready }, index) => {
+						const testCase = cases[index];
+						expect(testCase).toBeDefined();
+						return {
+							label: testCase?.label ?? `case-${index}`,
+							expected: testCase?.survives ?? false,
+							alive: isProcessAlive(ready.pid),
+							statusPath: ready.statusPath,
+						};
+					});
 					// Compared as a whole so a failure names every divergence at once.
 					expect(actual.map((a) => `${a.label}=${a.alive}`)).toEqual(
 						actual.map((a) => `${a.label}=${a.expected}`),
 					);
 
-					// The one that died did so for the stated reason.
-					const reaped = running[1];
-					if (reaped) {
-						const status = JSON.parse(
-							readFileSync(reaped.ready.statusPath, "utf8"),
-						) as { state: string };
-						expect(status.state).toBe("owner-gone");
-					}
+					// The one that died did so for the stated reason. Looked up by
+					// label and asserted unconditionally: hardcoding an index meant
+					// reordering `cases` would silently assert `owner-gone` against a
+					// helper that was supposed to survive, and a guard around it would
+					// let the only assertion that proves *why* it died skip itself.
+					const reaped = actual.find(
+						(a) => a.label === "owner dead, never served",
+					);
+					expect(reaped).toBeDefined();
+					expect(reaped?.alive).toBe(false);
+					const status = JSON.parse(
+						readFileSync(reaped?.statusPath ?? "", "utf8"),
+					) as { state: string };
+					expect(status.state).toBe("owner-gone");
 				} finally {
 					await Promise.all(
 						running.map(({ helper, closed }) =>

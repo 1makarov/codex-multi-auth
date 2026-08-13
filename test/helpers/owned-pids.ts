@@ -29,7 +29,19 @@ function spawnIdleChild(): ChildProcess {
 async function waitForExit(child: ChildProcess): Promise<void> {
 	if (child.exitCode === null && child.signalCode === null) {
 		await new Promise<void>((resolve) => {
-			child.once("exit", () => resolve());
+			let settled = false;
+			const finish = (): void => {
+				if (settled) return;
+				settled = true;
+				resolve();
+			};
+			child.once("exit", finish);
+			// A child that never spawned emits `error`, never `exit`. Waiting on
+			// `exit` alone leaves this promise pending forever — and the batched
+			// helpers below await a whole batch concurrently, so a single failed
+			// spawn would stall every sibling and hang the run rather than failing
+			// it. Either event means "this child is not running".
+			child.once("error", finish);
 		});
 	}
 	// `exit` fires before the stdio streams are torn down, so the parent's write
@@ -101,6 +113,10 @@ export async function withDeadPids<T>(
 		const size = Math.min(batchSize, count - offset);
 		const children = Array.from({ length: size }, () => spawnIdleChild());
 		const pids = children.map((child) => child.pid);
+		// Reap the whole batch first — including any child that failed to spawn,
+		// which `waitForExit` now settles on `error` — and only then decide whether
+		// the batch was usable. Throwing before the cleanup would leak the
+		// siblings that did start.
 		await Promise.all(
 			children.map(async (child) => {
 				child.kill("SIGKILL");
@@ -108,7 +124,9 @@ export async function withDeadPids<T>(
 			}),
 		);
 		if (pids.some((pid) => pid === undefined)) {
-			throw new Error("failed to spawn a probe process");
+			throw new Error(
+				"owned-pids: failed to spawn a probe process while building a dead-PID batch",
+			);
 		}
 		deadPids.push(...(pids as number[]));
 	}
@@ -153,10 +171,14 @@ export async function withLivePids<T>(
 	try {
 		const pids = children.map((child) => child.pid);
 		if (pids.some((pid) => pid === undefined)) {
-			throw new Error("failed to spawn a probe process");
+			throw new Error(
+				"owned-pids: failed to spawn a probe process while building a live-PID set",
+			);
 		}
 		return await run(pids as number[]);
 	} finally {
+		// Same contract as the dead-PID batch: a child that failed to spawn settles
+		// on `error`, so this cleanup cannot hang on it.
 		await Promise.all(
 			children.map(async (child) => {
 				child.kill("SIGKILL");

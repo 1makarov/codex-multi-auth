@@ -3934,7 +3934,15 @@ function parseProcessStartTimeOutput(out) {
 // already gone; callers must treat null as "identity unknown" and fall back
 // to bare liveness rather than declaring the process dead. Synchronous —
 // launcher/sweep use only; the helper's tick uses the async variant below.
+//
+// Windows short-circuits rather than spawning: there is no `ps` there, so the
+// probe could only ever fail, and it is not called once — the launcher probes
+// itself on every launch and the sweep probes up to `probeBudget` candidates.
+// Paying a process spawn per probe to learn nothing is the whole cost. Windows
+// therefore runs on bare liveness, and the 24h lifetime ceiling is what bounds
+// a leak there.
 function readProcessStartTimeMs(pid) {
+	if (process.platform === "win32") return null;
 	try {
 		return parseProcessStartTimeOutput(
 			execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
@@ -3951,8 +3959,13 @@ function readProcessStartTimeMs(pid) {
 
 // Async variant for the helper's status tick, which runs on the live rotation
 // proxy's event loop: a wedged `ps` must stall a background probe, never an
-// in-flight Responses stream. Same parse, same C locale, same null contract.
+// in-flight Responses stream. Same parse, same C locale, same null contract,
+// and the same Windows short-circuit.
 function readProcessStartTimeMsAsync(pid, onResult) {
+	if (process.platform === "win32") {
+		onResult(null);
+		return;
+	}
 	let child;
 	try {
 		child = execFile(
@@ -4053,6 +4066,28 @@ function resolveRuntimeRotationAppHelperTickMs(idleTimeoutMs, detachedIdleMs) {
 	const shortestWindowMs =
 		detachedIdleMs > 0 ? Math.min(idleTimeoutMs, detachedIdleMs) : idleTimeoutMs;
 	return Math.min(1_000, Math.max(50, Math.floor(shortestWindowMs / 2)));
+}
+
+// `lastIdentityVerdict` starts optimistic, so the first tick reports the owner
+// alive while the async `ps` probe is still in flight, and a helper adopted by
+// a recycled owner PID keeps refreshing its activity clock until the first
+// recheck lands. Against the 12h default that is deliberate and harmless. It
+// stops being harmless the moment the windows are compressed: a 60s recheck
+// pinned against a 250ms idle override — how the lifecycle tests run — is
+// longer than the entire window under test, so whether the verdict ever flips
+// comes down to probe timing. Scaling the recheck to the shortest window that
+// can fire makes the flip a property of the code rather than a race, and
+// production is untouched because both defaults are hours.
+function resolveRuntimeRotationAppHelperOwnerRecheckMs(
+	idleTimeoutMs,
+	detachedIdleMs,
+) {
+	const shortestWindowMs =
+		detachedIdleMs > 0 ? Math.min(idleTimeoutMs, detachedIdleMs) : idleTimeoutMs;
+	return Math.min(
+		APP_RUNTIME_HELPER_OWNER_IDENTITY_RECHECK_MS,
+		Math.max(50, Math.floor(shortestWindowMs / 4)),
+	);
 }
 
 function resolveRuntimeRotationAppHelperDetachedIdleMs(env = process.env) {
@@ -4368,6 +4403,7 @@ async function runRuntimeRotationAppHelper(identityToken = "") {
 	const isOwnerAlive = createRuntimeRotationAppHelperOwnerLivenessCheck(
 		ownerPid,
 		resolveRuntimeRotationAppHelperOwnerStartTimeMs(),
+		resolveRuntimeRotationAppHelperOwnerRecheckMs(idleTimeoutMs, detachedIdleMs),
 	);
 	let lastActivityAt = startedAt;
 	let lastRequestCount = 0;

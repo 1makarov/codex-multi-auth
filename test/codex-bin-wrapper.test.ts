@@ -23,6 +23,7 @@ import {
 	resolve,
 } from "node:path";
 import process from "node:process";
+import { withDeadPid } from "./helpers/owned-pids.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -3088,117 +3089,125 @@ describe("codex bin wrapper", () => {
 		);
 	});
 
-	it("keeps app helpers alive when owner liveness probes return EPERM", async () => {
-		const fixtureRoot = createWrapperFixture();
-		createRuntimeRotationProxyFixtureModule(fixtureRoot);
-		const originalHome = join(fixtureRoot, "codex-home");
-		const multiAuthDir = join(fixtureRoot, "multi-auth");
-		const markerPath = join(fixtureRoot, "proxy-marker.txt");
-		const preloadPath = join(fixtureRoot, "owner-eperm-preload.mjs");
-		mkdirSync(originalHome, { recursive: true });
-		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
-		writeFileSync(
-			preloadPath,
-			[
-				"const originalKill = process.kill.bind(process);",
-				"process.kill = (pid, signal) => {",
-				"  if (signal === 0 && String(pid) === process.env.CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID) {",
-				'    const error = new Error("operation not permitted");',
-				'    error.code = "EPERM";',
-				"    throw error;",
-				"  }",
-				"  return originalKill(pid, signal);",
-				"};",
-			].join("\n"),
-			"utf8",
-		);
+	// Skipped on Windows because the fixture cannot construct the state it is
+	// about: the owner start time comes from `ps`, which does not exist there,
+	// so the env var is empty, the identity branch never engages, and the test
+	// would silently exercise bare liveness under a name claiming otherwise.
+	// The Windows bare-liveness path has its own coverage below.
+	it.skipIf(process.platform === "win32")(
+		"keeps app helpers alive when owner liveness probes return EPERM",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			const preloadPath = join(fixtureRoot, "owner-eperm-preload.mjs");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+			writeFileSync(
+				preloadPath,
+				[
+					"const originalKill = process.kill.bind(process);",
+					"process.kill = (pid, signal) => {",
+					"  if (signal === 0 && String(pid) === process.env.CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID) {",
+					'    const error = new Error("operation not permitted");',
+					'    error.code = "EPERM";',
+					"    throw error;",
+					"  }",
+					"  return originalKill(pid, signal);",
+					"};",
+				].join("\n"),
+				"utf8",
+			);
 
-		const helper = spawn(
-			process.execPath,
-			[join(fixtureRoot, "scripts", "codex.js"), "--codex-multi-auth-runtime-app-helper"],
-			{
-				env: buildWrapperEnv({
-					CODEX_HOME: originalHome,
-					CODEX_MULTI_AUTH_DIR: multiAuthDir,
-					CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
-					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
-					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
-					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
-					// Production launchers always pass the owner's start time, so
-					// EPERM tolerance must hold on the identity branch, not just the
-					// bare-liveness fallback — and a *matching* identity is what keeps
-					// a live owner's helper alive (the false-positive direction).
-					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: String(
-						readOwnProcessStartTimeMs() ?? "",
-					),
-					CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
-					NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}`,
-				}),
-				stdio: ["ignore", "pipe", "pipe"],
-			},
-		);
-		let stdout = "";
-		let stderr = "";
-		const closed = new Promise<void>((resolve) => {
-			helper.once("close", () => resolve());
-		});
-		helper.stdout?.setEncoding("utf8");
-		helper.stderr?.setEncoding("utf8");
-		helper.stdout?.on("data", (chunk: string) => {
-			stdout += chunk;
-		});
-		helper.stderr?.on("data", (chunk: string) => {
-			stderr += chunk;
-		});
-
-		try {
-			const ready = await new Promise<{ statusPath: string }>((resolve, reject) => {
-				const timeout = setTimeout(() => {
-					reject(new Error(`helper did not become ready\n${stdout}\n${stderr}`));
-				}, 5_000);
-				helper.stdout?.on("data", () => {
-					const newlineIndex = stdout.indexOf("\n");
-					if (newlineIndex < 0) return;
-					try {
-						const message = JSON.parse(stdout.slice(0, newlineIndex)) as {
-							type?: string;
-							statusPath?: string;
-						};
-						if (message.type === "ready" && message.statusPath) {
-							clearTimeout(timeout);
-							resolve({ statusPath: message.statusPath });
-						}
-					} catch (error) {
-						clearTimeout(timeout);
-						reject(error);
-					}
-				});
-				helper.once("close", () => {
-					clearTimeout(timeout);
-					reject(new Error(`helper exited before ready\n${stdout}\n${stderr}`));
-				});
+			const helper = spawn(
+				process.execPath,
+				[join(fixtureRoot, "scripts", "codex.js"), "--codex-multi-auth-runtime-app-helper"],
+				{
+					env: buildWrapperEnv({
+						CODEX_HOME: originalHome,
+						CODEX_MULTI_AUTH_DIR: multiAuthDir,
+						CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+						CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+						CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+						CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+						// Production launchers always pass the owner's start time, so
+						// EPERM tolerance must hold on the identity branch, not just the
+						// bare-liveness fallback — and a *matching* identity is what keeps
+						// a live owner's helper alive (the false-positive direction).
+						CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: String(
+							readOwnProcessStartTimeMs() ?? "",
+						),
+						CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+						NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}`,
+					}),
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			);
+			let stdout = "";
+			let stderr = "";
+			const closed = new Promise<void>((resolve) => {
+				helper.once("close", () => resolve());
+			});
+			helper.stdout?.setEncoding("utf8");
+			helper.stderr?.setEncoding("utf8");
+			helper.stdout?.on("data", (chunk: string) => {
+				stdout += chunk;
+			});
+			helper.stderr?.on("data", (chunk: string) => {
+				stderr += chunk;
 			});
 
-			await sleep(750);
+			try {
+				const ready = await new Promise<{ statusPath: string }>((resolve, reject) => {
+					const timeout = setTimeout(() => {
+						reject(new Error(`helper did not become ready\n${stdout}\n${stderr}`));
+					}, 5_000);
+					helper.stdout?.on("data", () => {
+						const newlineIndex = stdout.indexOf("\n");
+						if (newlineIndex < 0) return;
+						try {
+							const message = JSON.parse(stdout.slice(0, newlineIndex)) as {
+								type?: string;
+								statusPath?: string;
+							};
+							if (message.type === "ready" && message.statusPath) {
+								clearTimeout(timeout);
+								resolve({ statusPath: message.statusPath });
+							}
+						} catch (error) {
+							clearTimeout(timeout);
+							reject(error);
+						}
+					});
+					helper.once("close", () => {
+						clearTimeout(timeout);
+						reject(new Error(`helper exited before ready\n${stdout}\n${stderr}`));
+					});
+				});
 
-			expect(helper.pid).toBeTruthy();
-			expect(isProcessAlive(helper.pid ?? -1)).toBe(true);
-			const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
-				state: string;
-			};
-			expect(status.state).toBe("running");
-			expect(readFileSync(markerPath, "utf8")).toBe("start:http://127.0.0.1:4567\n");
-		} finally {
-			if (helper.pid && isProcessAlive(helper.pid)) {
-				helper.kill("SIGTERM");
-			}
-			await Promise.race([closed, sleep(2_000)]);
-			if (helper.pid && isProcessAlive(helper.pid)) {
-				helper.kill("SIGKILL");
+				await sleep(750);
+
+				expect(helper.pid).toBeTruthy();
+				expect(isProcessAlive(helper.pid ?? -1)).toBe(true);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("running");
+				expect(readFileSync(markerPath, "utf8")).toBe("start:http://127.0.0.1:4567\n");
+			} finally {
+				if (helper.pid && isProcessAlive(helper.pid)) {
+					helper.kill("SIGTERM");
+				}
 				await Promise.race([closed, sleep(2_000)]);
+				if (helper.pid && isProcessAlive(helper.pid)) {
+					helper.kill("SIGKILL");
+					await Promise.race([closed, sleep(2_000)]);
+				}
 			}
-		}
-	});
+		},
+	);
 
 	// Spawns a helper directly (the EPERM harness above) with the given env and
 	// waits for its ready line; the caller owns assertions and shutdown.
@@ -3440,41 +3449,36 @@ describe("codex bin wrapper", () => {
 		mkdirSync(originalHome, { recursive: true });
 		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
 
-		// A PID this test owned and then killed, so "dead" is a fact rather than
-		// a sentinel integer that different platforms classify differently.
-		const sleeper = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
-			stdio: "ignore",
+		// A PID this test owned and then killed, so "dead" is a fact rather than a
+		// sentinel integer that different platforms classify differently.
+		// `withDeadPid` is the shared version of exactly this — it waits on the
+		// child's `exit` event instead of polling liveness, and re-checks the PID
+		// was not recycled before handing it over — so the hand-rolled copy that
+		// used to live here is gone.
+		await withDeadPid(async (deadOwnerPid) => {
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(deadOwnerPid),
+				// Left unset on purpose: this is the degraded bare-liveness path.
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: undefined,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				await Promise.race([closed, sleep(5_000)]);
+				expect(isProcessAlive(ready.pid)).toBe(false);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("owner-gone");
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
 		});
-		const deadOwnerPid = sleeper.pid;
-		expect(deadOwnerPid).toBeTruthy();
-		sleeper.kill("SIGKILL");
-		for (let attempt = 0; attempt < 50 && isProcessAlive(Number(deadOwnerPid)); attempt += 1) {
-			await sleep(20);
-		}
-		expect(isProcessAlive(Number(deadOwnerPid))).toBe(false);
-
-		const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
-			CODEX_HOME: originalHome,
-			CODEX_MULTI_AUTH_DIR: multiAuthDir,
-			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
-			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
-			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
-			CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
-			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(deadOwnerPid),
-			// Left unset on purpose: this is the degraded bare-liveness path.
-			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: undefined,
-			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
-		});
-		try {
-			await Promise.race([closed, sleep(5_000)]);
-			expect(isProcessAlive(ready.pid)).toBe(false);
-			const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
-				state: string;
-			};
-			expect(status.state).toBe("owner-gone");
-		} finally {
-			await stopDirectAppHelper(helper, closed);
-		}
 	});
 
 	// The detached window reaps strays, not handoffs. A consumer holding a
@@ -3941,6 +3945,48 @@ describe("codex bin wrapper", () => {
 		},
 	);
 
+	// The retry budget is finite, so a file that stays locked has to be survivable
+	// rather than fatal: the sweep runs on the launcher's critical path, and a
+	// helper launch must not fail because a stale file from some other helper
+	// could not be deleted. The file simply waits for the next sweep.
+	it("leaves a permanently locked metadata file behind without failing the launch", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(multiAuthDir, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		const staleStatusPath = join(
+			multiAuthDir,
+			"runtime-rotation-app-helper.99999995.json",
+		);
+		writeFileSync(staleStatusPath, '{"pid":99999995,"state":"running"}\n', "utf8");
+
+		// Far more failures than `withSynchronousFileOperationRetry`'s budget, so
+		// every attempt on this file throws EBUSY and the retry never succeeds.
+		const result = runWrapper(fixtureRoot, ["app", "."], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+			...FAULT_INJECTION_ON,
+			CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES: "999",
+			OPENAI_API_KEY: undefined,
+		});
+
+		// The launch succeeded...
+		expect(result.status).toBe(0);
+		// ...and the file it could not delete is still there for the next sweep,
+		// rather than the error having escaped into the launcher.
+		expect(existsSync(staleStatusPath)).toBe(true);
+	});
+
 	// Owner files have no post-mortem value and go with the helper; stale
 	// per-PID metadata from killed helpers — and a legacy shared status file
 	// whose recorded PID is dead — is swept when the next launcher starts a
@@ -3982,7 +4028,9 @@ describe("codex bin wrapper", () => {
 		});
 		expect(result.status).toBe(0);
 
-		// The launcher's sweep ran before its helper spawned.
+		// The launcher swept — after spawning its own helper, so the sweep never
+		// sits in front of `codex app` startup, and before the launch handshake,
+		// so it is complete by the time the wrapper exits.
 		expect(existsSync(staleStatusPath)).toBe(false);
 		expect(existsSync(staleOwnerPath)).toBe(false);
 		expect(existsSync(legacyStatusPath)).toBe(false);

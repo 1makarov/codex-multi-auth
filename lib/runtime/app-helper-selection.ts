@@ -37,7 +37,7 @@ export interface RuntimeHelperSelectable {
 export const RUNTIME_HELPER_STATUS_STALE_MS = 10 * 60 * 1000;
 
 /** Tolerance for clock skew between the writing helper and the reader. */
-const RUNTIME_HELPER_CLOCK_TOLERANCE_MS = 60 * 1000;
+export const RUNTIME_HELPER_CLOCK_TOLERANCE_MS = 60 * 1000;
 
 /**
  * A PID is a positive integer or it is nothing. Both readers used to accept any

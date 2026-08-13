@@ -17,11 +17,17 @@ import {
 	stopDetachedProcess,
 	stopRuntimeRotationAppHelperProcess,
 	stopRuntimeRotationRouterProcess,
+	UNBIND_HELPER_CONCURRENCY,
 	unbindCodexAppRuntimeRotation,
 } from "../lib/runtime/app-bind.js";
 import { tomlStringLiteral } from "../lib/runtime/config-toml.js";
 import { withFileOperationRetry } from "../lib/fs-retry.js";
-import { withDeadPid, withLivePid } from "./helpers/owned-pids.js";
+import {
+	withDeadPid,
+	withDeadPids,
+	withLivePid,
+	withLivePids,
+} from "./helpers/owned-pids.js";
 import {
 	APP_RUNTIME_HELPER_OWNER_FILE,
 	APP_RUNTIME_HELPER_STATUS_FILE,
@@ -1193,50 +1199,123 @@ describe("Codex app runtime rotation bind", () => {
 				startedAt: Date.now(),
 				scriptPath: join(root, "runtime-helper.mjs"),
 			})}\n`;
-		await withDeadPid(async (firstDeadPid) => {
-			await withDeadPid(async (secondDeadPid) => {
-				await withDeadPid(async (legacyDeadPid) => {
-					const deadPids = [firstDeadPid, secondDeadPid];
-					const perPidPaths = deadPids.map((pid) =>
-						legacyPath.replace(/\.json$/i, `.${pid}.json`),
-					);
-					for (const [index, path] of perPidPaths.entries()) {
-						await writeFile(path, record(deadPids[index] ?? 0), "utf8");
-					}
-					await writeFile(legacyPath, record(legacyDeadPid), "utf8");
-					// An owner file beside a dead per-PID record goes with it — and
-					// its identity token deliberately disagrees with the status
-					// record's, because a dead PID means neither file describes
-					// anything that can still be running (#666). Gating this removal
-					// on token agreement is what stranded owner files forever.
-					const ownerPath = resolveRuntimeHelperOwnerPath(
-						{ home: root, env },
-						firstDeadPid,
-					);
-					await writeFile(
-						ownerPath,
-						`${JSON.stringify({
-							version: 1,
-							kind: "codex-app-runtime-rotation-helper-owner",
-							identityToken: "does-not-matter-for-dead-pid",
-							launcherPid: 1,
-							createdAt: Date.now(),
-						})}\n`,
-						"utf8",
-					);
+		await withDeadPids(
+			3,
+			async ([firstDeadPid, secondDeadPid, legacyDeadPid]) => {
+				const deadPids = [firstDeadPid ?? 0, secondDeadPid ?? 0];
+				const perPidPaths = deadPids.map((pid) =>
+					legacyPath.replace(/\.json$/i, `.${pid}.json`),
+				);
+				for (const [index, path] of perPidPaths.entries()) {
+					await writeFile(path, record(deadPids[index] ?? 0), "utf8");
+				}
+				await writeFile(legacyPath, record(legacyDeadPid ?? 0), "utf8");
+				// An owner file beside a dead per-PID record goes with it — and its
+				// identity token deliberately disagrees with the status record's,
+				// because a dead PID means neither file describes anything that can
+				// still be running (#666). Gating this removal on token agreement is
+				// what stranded owner files forever.
+				const ownerPath = resolveRuntimeHelperOwnerPath(
+					{ home: root, env },
+					deadPids[0] ?? 0,
+				);
+				await writeFile(
+					ownerPath,
+					`${JSON.stringify({
+						version: 1,
+						kind: "codex-app-runtime-rotation-helper-owner",
+						identityToken: "does-not-matter-for-dead-pid",
+						launcherPid: 1,
+						createdAt: Date.now(),
+					})}\n`,
+					"utf8",
+				);
 
-					await unbindCodexAppRuntimeRotation({
-						platform: process.platform,
-						home: root,
-						env,
-					});
-
-					for (const path of [...perPidPaths, legacyPath]) {
-						expect(existsSync(path)).toBe(false);
-					}
-					expect(existsSync(ownerPath)).toBe(false);
+				await unbindCodexAppRuntimeRotation({
+					platform: process.platform,
+					home: root,
+					env,
 				});
+
+				for (const path of [...perPidPaths, legacyPath]) {
+					expect(existsSync(path)).toBe(false);
+				}
+				expect(existsSync(ownerPath)).toBe(false);
+			},
+		);
+	});
+
+	it("processes every helper record without exceeding the unbind concurrency bound", async () => {
+		// The pool exists so unbind costs roughly one stop window instead of N of
+		// them — on the machine from #663 there were 183 records — while not
+		// signalling every stale helper at once. Every other fixture here has a
+		// handful of records, so any width (1, 8, Infinity) behaves identically
+		// and the bound ships unobserved.
+		//
+		// Live PIDs with agreeing owner tokens, because only that combination
+		// reaches the stop path — and `verifyProcessIdentity` is the one seam on
+		// it, so it is where the pool's real width is visible. Returning false
+		// means nothing is ever signalled: these are the test's own children.
+		const root = await createTempRoot("codex-app-bind-helper-pool-");
+		const env = {
+			CODEX_MULTI_AUTH_DIR: join(root, "multi-auth"),
+			CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME: join(root, "codex-home"),
+		};
+		const legacyPath = resolveRuntimeHelperStatusPath({ home: root, env });
+		await mkdir(dirname(legacyPath), { recursive: true });
+		const recordCount = UNBIND_HELPER_CONCURRENCY * 2;
+		await withLivePids(recordCount, async (livePids) => {
+			for (const pid of livePids) {
+				await writeFile(
+					legacyPath.replace(/\.json$/i, `.${pid}.json`),
+					`${JSON.stringify({
+						version: 1,
+						kind: "codex-app-runtime-rotation-helper",
+						state: "running",
+						pid,
+						startedAt: Date.now(),
+						scriptPath: join(root, "runtime-helper.mjs"),
+						identityToken: `token-${pid}`,
+					})}\n`,
+					"utf8",
+				);
+				await writeFile(
+					resolveRuntimeHelperOwnerPath({ home: root, env }, pid),
+					`${JSON.stringify({
+						version: 1,
+						kind: "codex-app-runtime-rotation-helper-owner",
+						identityToken: `token-${pid}`,
+						launcherPid: 1,
+						createdAt: Date.now(),
+					})}\n`,
+					"utf8",
+				);
+			}
+
+			let inFlight = 0;
+			let peakInFlight = 0;
+			let verified = 0;
+			await unbindCodexAppRuntimeRotation({
+				platform: process.platform,
+				home: root,
+				env,
+				verifyProcessIdentity: async () => {
+					inFlight += 1;
+					verified += 1;
+					peakInFlight = Math.max(peakInFlight, inFlight);
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					inFlight -= 1;
+					return false;
+				},
 			});
+
+			// Every record reached the stop path — a pool that dropped items after
+			// the first batch would fail here, not on the bound.
+			expect(verified).toBe(recordCount);
+			// More than one at a time, so the work really is parallel...
+			expect(peakInFlight).toBeGreaterThan(1);
+			// ...and never more than the bound, so it is really bounded.
+			expect(peakInFlight).toBeLessThanOrEqual(UNBIND_HELPER_CONCURRENCY);
 		});
 	});
 

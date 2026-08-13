@@ -1267,6 +1267,14 @@ function resolveRuntimeHelperOwnerPath(
 	);
 }
 
+/**
+ * How many helper records unbind processes at once. Exported so a regression
+ * test can observe the bound rather than only its effects — with a handful of
+ * records any width behaves identically, so an edit to `Infinity` would
+ * otherwise ship green.
+ */
+export const UNBIND_HELPER_CONCURRENCY = 8;
+
 interface HelperCleanupDecision {
 	statusPath: string;
 	ownerPath: string | null;
@@ -1294,8 +1302,15 @@ async function mapWithConcurrency<T, R>(
 			for (;;) {
 				const index = next;
 				next += 1;
+				// Only running past the end retires a runner. Folding the
+				// `undefined` check into the same `return` would make a sparse
+				// array or a `(T | undefined)[]` silently drop every item after
+				// the first hole — on a cleanup path whose failure mode is
+				// "helpers left running while the user is told the app was
+				// unbound".
+				if (index >= items.length) return;
 				const item = items[index];
-				if (index >= items.length || item === undefined) return;
+				if (item === undefined) continue;
 				results[index] = await worker(item, index);
 			}
 		},
@@ -1577,7 +1592,7 @@ async function unbindCodexAppRuntimeRotationLocked(
 	// signal sequences.
 	const helperResults = await mapWithConcurrency(
 		helperStatusPaths,
-		8,
+		UNBIND_HELPER_CONCURRENCY,
 		async (helperStatusPath): Promise<HelperCleanupDecision | null> => {
 			const helperRead = await readRuntimeHelperStatus(helperStatusPath);
 			if (helperRead.kind !== "valid") return null;
@@ -1677,7 +1692,21 @@ async function unbindCodexAppRuntimeRotationLocked(
 		helperDirEntries,
 	)) {
 		if (consideredOwnerPaths.has(owner.path)) continue;
-		if (isProcessAlive(owner.pid)) continue;
+		if (isProcessAlive(owner.pid)) {
+			// An owner file with no status record whose PID is nonetheless live
+			// is the one shape this pass cannot reclaim. Either a helper is
+			// starting right now and has not published yet, or — the case that
+			// accumulates — the PID was recycled by an unrelated process after
+			// the status file was already gone. Telling those apart needs the
+			// recorded-start-time comparison the launcher-side sweep does, which
+			// unbind has no equivalent of; that is a scope decision, but it
+			// should not be a silent one. Every other preserve in this function
+			// warns, so this one does too.
+			options.log?.(
+				`Warning: runtime app helper owner metadata (pid ${owner.pid}) has no status record but its PID is live; preserving`,
+			);
+			continue;
+		}
 		helperCleanupPaths.push(owner.path);
 	}
 	await removeAppBindStartup(state ?? paths);

@@ -77,32 +77,74 @@ describe("owned-pids", () => {
 		}
 	}, 60_000);
 
-	it("settles rather than hanging when a child never spawns", async () => {
-		// A child that fails to spawn emits `error` and never `exit`. The batched
-		// helpers await a whole batch concurrently, so waiting on `exit` alone
-		// meant one failed spawn stalled every sibling and hung the run instead of
-		// failing it. This asserts the settle, with a timeout well under vitest's
-		// so a regression reads as a failure here rather than as a stuck suite.
-		const child = spawn(
-			"definitely-not-a-real-binary-2f8c1d",
-			["--nope"],
-			{ stdio: ["pipe", "ignore", "ignore"] },
-		);
-		const settled = await Promise.race([
-			new Promise<string>((resolve) => {
-				let done = false;
-				const finish = (label: string) => () => {
-					if (done) return;
-					done = true;
-					resolve(label);
-				};
-				child.once("exit", finish("exit"));
-				child.once("error", finish("error"));
-			}),
-			new Promise<string>((resolve) => setTimeout(() => resolve("timeout"), 5_000)),
-		]);
-		// The premise of the fix: this child signals via `error`, not `exit`.
-		expect(settled).toBe("error");
-		child.stdin?.destroy();
-	}, 30_000);
+	// A child that fails to spawn emits `error` and never `exit`, so waiting on
+	// `exit` alone left the promise pending forever — and because a batch is
+	// awaited concurrently, one failed spawn stalled every sibling and hung the
+	// run rather than failing it.
+	//
+	// These drive the helpers themselves through a substituted spawn factory.
+	// Asserting on a child the test spawns directly would only demonstrate what
+	// Node does, and would keep passing with the handling in `waitForExit`
+	// deleted — the failure it is supposed to catch.
+	describe("a child that never spawns", () => {
+		const spawnFailingChild = () =>
+			spawn("definitely-not-a-real-binary-2f8c1d", ["--nope"], {
+				stdio: ["pipe", "ignore", "ignore"],
+			});
+
+		// Bounded well inside vitest's own timeout, so a regression reads as this
+		// assertion failing rather than as a suite that sits there until the
+		// runner gives up.
+		async function settlesWithin<T>(
+			work: Promise<T>,
+			budgetMs: number,
+		): Promise<string> {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			try {
+				return await Promise.race([
+					work.then(
+						() => "resolved",
+						(error: unknown) =>
+							`rejected: ${error instanceof Error ? error.message : String(error)}`,
+					),
+					new Promise<string>((resolve) => {
+						timer = setTimeout(() => resolve("HUNG"), budgetMs);
+					}),
+				]);
+			} finally {
+				if (timer !== undefined) clearTimeout(timer);
+			}
+		}
+
+		it("makes withDeadPids reject instead of hanging", async () => {
+			const outcome = await settlesWithin(
+				withDeadPids(4, () => "unreachable", {
+					spawnChild: spawnFailingChild,
+				}),
+				5_000,
+			);
+			expect(outcome).not.toBe("HUNG");
+			expect(outcome).toContain("failed to spawn");
+		}, 30_000);
+
+		it("makes withLivePids reject instead of hanging", async () => {
+			const outcome = await settlesWithin(
+				withLivePids(4, () => "unreachable", {
+					spawnChild: spawnFailingChild,
+				}),
+				5_000,
+			);
+			expect(outcome).not.toBe("HUNG");
+			expect(outcome).toContain("failed to spawn");
+		}, 30_000);
+
+		it("makes withDeadPid reject instead of hanging", async () => {
+			const outcome = await settlesWithin(
+				withDeadPid(() => "unreachable", { spawnChild: spawnFailingChild }),
+				5_000,
+			);
+			expect(outcome).not.toBe("HUNG");
+			expect(outcome).toContain("failed to spawn");
+		}, 30_000);
+	});
 });

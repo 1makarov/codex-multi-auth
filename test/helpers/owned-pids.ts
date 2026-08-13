@@ -26,6 +26,21 @@ function spawnIdleChild(): ChildProcess {
 	});
 }
 
+export interface OwnedPidOptions {
+	/**
+	 * Test-only seam for how a probe child is created.
+	 *
+	 * The failure these helpers have to survive is a child that never spawns:
+	 * it emits `error` and never `exit`, and because a batch is awaited
+	 * concurrently, one of them stalls every sibling. That path cannot be
+	 * reached by spawning a working binary, and asserting on a child the test
+	 * spawned itself only proves what Node does — it would keep passing with
+	 * the handling here deleted. Substituting the factory is what makes the
+	 * helpers' own behaviour observable.
+	 */
+	spawnChild?: () => ChildProcess;
+}
+
 async function waitForExit(child: ChildProcess): Promise<void> {
 	if (child.exitCode === null && child.signalCode === null) {
 		await new Promise<void>((resolve) => {
@@ -50,6 +65,24 @@ async function waitForExit(child: ChildProcess): Promise<void> {
 	// these are named-pipe handles — the scarcer resource. Close it explicitly
 	// so the lifetime is the helper's, not the collector's.
 	child.stdin?.destroy();
+}
+
+/**
+ * Signal a probe child, tolerating one that has nothing to signal.
+ *
+ * A child that never spawned has no process behind it, and `kill` throws
+ * rather than no-opping — `EINVAL` on Windows. Left unguarded that throw
+ * escapes the cleanup loop *before* the batch helpers can report why the
+ * batch was unusable, so the caller sees `kill EINVAL` instead of "failed to
+ * spawn", and on a partial failure the real diagnosis is masked entirely.
+ * `waitForExit` still settles such a child on its `error` event.
+ */
+function killChild(child: ChildProcess): void {
+	try {
+		child.kill("SIGKILL");
+	} catch {
+		// Nothing to signal; the `error` event is what settles this child.
+	}
 }
 
 function isPidAlive(pid: number): boolean {
@@ -79,11 +112,18 @@ function isPidAlive(pid: number): boolean {
  */
 export async function withDeadPid<T>(
 	run: (pid: number) => Promise<T> | T,
+	options: OwnedPidOptions = {},
 ): Promise<T> {
-	const child = spawnIdleChild();
+	const child = (options.spawnChild ?? spawnIdleChild)();
 	const pid = child.pid;
-	if (pid === undefined) throw new Error("failed to spawn a probe process");
-	child.kill("SIGKILL");
+	if (pid === undefined) {
+		killChild(child);
+		await waitForExit(child);
+		throw new Error(
+			"owned-pids: failed to spawn a probe process while building a dead PID",
+		);
+	}
+	killChild(child);
 	await waitForExit(child);
 	if (isPidAlive(pid)) {
 		throw new Error(
@@ -101,7 +141,9 @@ export async function withDeadPid<T>(
 export async function withDeadPids<T>(
 	count: number,
 	run: (pids: number[]) => Promise<T> | T,
+	options: OwnedPidOptions = {},
 ): Promise<T> {
+	const spawnChild = options.spawnChild ?? spawnIdleChild;
 	// Spawned and reaped in batches rather than all at once. The stress fixtures
 	// ask for hundreds, and launching that many processes simultaneously can hit
 	// a process-table or fd limit and fail the spawn — which would surface as a
@@ -111,7 +153,7 @@ export async function withDeadPids<T>(
 	const deadPids: number[] = [];
 	for (let offset = 0; offset < count; offset += batchSize) {
 		const size = Math.min(batchSize, count - offset);
-		const children = Array.from({ length: size }, () => spawnIdleChild());
+		const children = Array.from({ length: size }, () => spawnChild());
 		const pids = children.map((child) => child.pid);
 		// Reap the whole batch first — including any child that failed to spawn,
 		// which `waitForExit` now settles on `error` — and only then decide whether
@@ -119,7 +161,7 @@ export async function withDeadPids<T>(
 		// siblings that did start.
 		await Promise.all(
 			children.map(async (child) => {
-				child.kill("SIGKILL");
+				killChild(child);
 				await waitForExit(child);
 			}),
 		);
@@ -146,14 +188,21 @@ export async function withDeadPids<T>(
  */
 export async function withLivePid<T>(
 	run: (pid: number) => Promise<T> | T,
+	options: OwnedPidOptions = {},
 ): Promise<T> {
-	const child = spawnIdleChild();
+	const child = (options.spawnChild ?? spawnIdleChild)();
 	const pid = child.pid;
-	if (pid === undefined) throw new Error("failed to spawn a probe process");
+	if (pid === undefined) {
+		killChild(child);
+		await waitForExit(child);
+		throw new Error(
+			"owned-pids: failed to spawn a probe process while building a live PID",
+		);
+	}
 	try {
 		return await run(pid);
 	} finally {
-		child.kill("SIGKILL");
+		killChild(child);
 		await waitForExit(child);
 	}
 }
@@ -166,8 +215,10 @@ export async function withLivePid<T>(
 export async function withLivePids<T>(
 	count: number,
 	run: (pids: number[]) => Promise<T> | T,
+	options: OwnedPidOptions = {},
 ): Promise<T> {
-	const children = Array.from({ length: count }, () => spawnIdleChild());
+	const spawnChild = options.spawnChild ?? spawnIdleChild;
+	const children = Array.from({ length: count }, () => spawnChild());
 	try {
 		const pids = children.map((child) => child.pid);
 		if (pids.some((pid) => pid === undefined)) {
@@ -178,10 +229,11 @@ export async function withLivePids<T>(
 		return await run(pids as number[]);
 	} finally {
 		// Same contract as the dead-PID batch: a child that failed to spawn settles
-		// on `error`, so this cleanup cannot hang on it.
+		// on `error` and is not signalled, so this cleanup can neither hang on it
+		// nor throw out of the `finally`.
 		await Promise.all(
 			children.map(async (child) => {
-				child.kill("SIGKILL");
+				killChild(child);
 				await waitForExit(child);
 			}),
 		);

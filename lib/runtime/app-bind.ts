@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync } from "node:fs";
-import { mkdir, open, readFile, rename, rm, unlink } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import process from "node:process";
@@ -10,7 +10,8 @@ import { withFileOperationRetry } from "../fs-retry.js";
 import { getCodexMultiAuthDir } from "../runtime-paths.js";
 import {
 	APP_RUNTIME_HELPER_OWNER_FILE,
-	APP_RUNTIME_HELPER_STATUS_FILE,
+	listRuntimeHelperOwnerPaths,
+	listRuntimeHelperStatusPaths,
 } from "../runtime-constants.js";
 import {
 	configHasRuntimeRotationProvider,
@@ -1266,6 +1267,58 @@ function resolveRuntimeHelperOwnerPath(
 	);
 }
 
+/**
+ * How many helper records unbind processes at once. Exported so a regression
+ * test can observe the bound rather than only its effects — with a handful of
+ * records any width behaves identically, so an edit to `Infinity` would
+ * otherwise ship green.
+ */
+export const UNBIND_HELPER_CONCURRENCY = 8;
+
+interface HelperCleanupDecision {
+	statusPath: string;
+	ownerPath: string | null;
+	removeHelperStatus: boolean;
+	removeHelperOwner: boolean;
+}
+
+/**
+ * `Promise.all` over `items` with at most `limit` in flight, preserving input
+ * order in the result. Used where the per-item work is independent but not
+ * free — a helper stop pays a SIGTERM, a graceful wait and possibly a SIGKILL —
+ * so serialising it multiplies a single stop window by the number of stale
+ * helpers, and unbounded parallelism signals every one of them at once.
+ */
+async function mapWithConcurrency<T, R>(
+	items: readonly T[],
+	limit: number,
+	worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	const results: R[] = new Array(items.length);
+	let next = 0;
+	const runners = Array.from(
+		{ length: Math.max(1, Math.min(limit, items.length)) },
+		async () => {
+			for (;;) {
+				const index = next;
+				next += 1;
+				// Only running past the end retires a runner. Folding the
+				// `undefined` check into the same `return` would make a sparse
+				// array or a `(T | undefined)[]` silently drop every item after
+				// the first hole — on a cleanup path whose failure mode is
+				// "helpers left running while the user is told the app was
+				// unbound".
+				if (index >= items.length) return;
+				const item = items[index];
+				if (item === undefined) continue;
+				results[index] = await worker(item, index);
+			}
+		},
+	);
+	await Promise.all(runners);
+	return results;
+}
+
 export async function stopRuntimeRotationAppHelperProcess(
 	helper: RuntimeRotationAppHelperStatus,
 	options: DetachedProcessStopOptions & { platform?: NodeJS.Platform } = {},
@@ -1499,19 +1552,56 @@ async function unbindCodexAppRuntimeRotationLocked(
 		);
 	}
 
-	const helperStatusPath = join(
-		dirname(paths.bindDir),
-		APP_RUNTIME_HELPER_STATUS_FILE,
+	// Helpers publish per-PID status files (`runtime-rotation-app-helper.<pid>.json`);
+	// the un-suffixed name is the legacy shared path from before that change,
+	// still checked so a pre-upgrade helper is torn down too. Every candidate
+	// walks the same per-helper logic the single file used to get: stopping is
+	// gated on ownership verification (status/owner identity-token agreement
+	// plus process identity), so unbind reaps each helper it can prove is one
+	// of ours and preserves — with a warning — anything it cannot.
+	const helperBaseDir = dirname(paths.bindDir);
+	let helperDirEntries: string[] = [];
+	try {
+		helperDirEntries = await withFileOperationRetry(() =>
+			readdir(helperBaseDir),
+		);
+	} catch (error) {
+		// Degrading to legacy-only cleanup while reporting success would leave
+		// every per-PID helper running with the user told the app was unbound —
+		// say so. ENOENT just means no helper ever ran.
+		const code =
+			error && typeof error === "object" && "code" in error
+				? String((error as { code?: unknown }).code)
+				: "unknown";
+		if (code !== "ENOENT") {
+			options.log?.(
+				`Warning: could not enumerate runtime app helper status files (${code}); only the legacy helper path is checked`,
+			);
+		}
+		helperDirEntries = [];
+	}
+	const helperStatusPaths = listRuntimeHelperStatusPaths(
+		helperBaseDir,
+		helperDirEntries,
 	);
-	const helperRead = await readRuntimeHelperStatus(helperStatusPath);
-	let removeHelperStatus = false;
-	let removeHelperOwner = false;
-	let helperOwnerPath: string | null = null;
-	if (helperRead.kind === "valid") {
-		const helper = helperRead.status;
-		if (helper.kind === "codex-app-runtime-rotation-helper") {
-			helperOwnerPath = resolveRuntimeHelperOwnerPath(
-				dirname(paths.bindDir),
+	// Each candidate is independent — a read, a liveness check, and at most one
+	// SIGTERM/graceful-wait/SIGKILL sequence — and on the machine from #663 there
+	// were 183 of them. Run them in a bounded pool rather than one after another,
+	// so unbind costs roughly one stop window instead of N of them; the bound
+	// keeps a machine full of stale helpers from being hit with 183 concurrent
+	// signal sequences.
+	const helperResults = await mapWithConcurrency(
+		helperStatusPaths,
+		UNBIND_HELPER_CONCURRENCY,
+		async (helperStatusPath): Promise<HelperCleanupDecision | null> => {
+			const helperRead = await readRuntimeHelperStatus(helperStatusPath);
+			if (helperRead.kind !== "valid") return null;
+			const helper = helperRead.status;
+			if (helper.kind !== "codex-app-runtime-rotation-helper") return null;
+			let removeHelperStatus = false;
+			let removeHelperOwner = false;
+			const helperOwnerPath = resolveRuntimeHelperOwnerPath(
+				helperBaseDir,
 				helper.pid,
 			);
 			const helperOwner = helperOwnerPath
@@ -1529,9 +1619,15 @@ async function unbindCodexAppRuntimeRotationLocked(
 				} else {
 					const wasAlive = isProcessAlive(helper.pid);
 					if (!wasAlive) {
+						// Decisive, and deliberately not gated on ownership (#666): a
+						// dead PID means both files describe a process that no longer
+						// exists, so keeping the owner file preserves nothing. It used
+						// to be gated, which deleted the status file and stranded the
+						// owner file — and because unbind then enumerated status paths
+						// only, nothing ever rediscovered it. This matches what the
+						// launcher-side sweep already does with a dead PID.
 						removeHelperStatus = true;
-						removeHelperOwner =
-							helperOwnershipMatches && helperOwnerPath !== null;
+						removeHelperOwner = helperOwnerPath !== null;
 					} else if (!helperOwnershipMatches) {
 						options.log?.(
 							"Warning: runtime app helper ownership metadata does not match; preserving status",
@@ -1547,8 +1643,7 @@ async function unbindCodexAppRuntimeRotationLocked(
 						});
 						const stillAlive = isProcessAlive(helper.pid);
 						removeHelperStatus = stopped && !stillAlive;
-						removeHelperOwner =
-							removeHelperStatus && helperOwnerPath !== null;
+						removeHelperOwner = removeHelperStatus && helperOwnerPath !== null;
 						if (!removeHelperStatus) {
 							options.log?.(
 								`Warning: runtime app helper (pid ${helper.pid}) did not stop; preserving status`,
@@ -1560,14 +1655,59 @@ async function unbindCodexAppRuntimeRotationLocked(
 				// A non-running, owned record is removable only when its PID is
 				// absent or no longer alive. This avoids deleting a status file
 				// while a helper is still serving despite a stale state value.
-				removeHelperStatus =
-					helper.pid === null || !isProcessAlive(helper.pid);
-				removeHelperOwner =
-					removeHelperStatus &&
-					helperOwnershipMatches &&
-					helperOwnerPath !== null;
+				// Ownership does not gate the owner file here either, for the same
+				// reason as above: the PID is gone, so neither file describes
+				// anything that can still be running.
+				removeHelperStatus = helper.pid === null || !isProcessAlive(helper.pid);
+				removeHelperOwner = removeHelperStatus && helperOwnerPath !== null;
 			}
+			return {
+				statusPath: helperStatusPath,
+				ownerPath: helperOwnerPath,
+				removeHelperStatus,
+				removeHelperOwner,
+			};
+		},
+	);
+	const helperCleanupPaths: string[] = [];
+	// Owner paths this pass already reasoned about, whether or not it decided to
+	// remove them — a preserved live helper's owner file must not then be swept
+	// by the orphan pass below.
+	const consideredOwnerPaths = new Set<string>();
+	for (const result of helperResults) {
+		if (!result) continue;
+		if (result.ownerPath !== null) consideredOwnerPaths.add(result.ownerPath);
+		if (result.removeHelperStatus) helperCleanupPaths.push(result.statusPath);
+		if (result.removeHelperOwner && result.ownerPath !== null) {
+			helperCleanupPaths.push(result.ownerPath);
 		}
+	}
+	// Owner files with no status record left to pair them with. Before #666 these
+	// were unreachable: every earlier pass walked status paths only, so an owner
+	// file that outlived its status file was never looked at again. A dead PID is
+	// the whole test — a live PID's owner file belongs to a helper that is still
+	// running, and was already considered above.
+	for (const owner of listRuntimeHelperOwnerPaths(
+		helperBaseDir,
+		helperDirEntries,
+	)) {
+		if (consideredOwnerPaths.has(owner.path)) continue;
+		if (isProcessAlive(owner.pid)) {
+			// An owner file with no status record whose PID is nonetheless live
+			// is the one shape this pass cannot reclaim. Either a helper is
+			// starting right now and has not published yet, or — the case that
+			// accumulates — the PID was recycled by an unrelated process after
+			// the status file was already gone. Telling those apart needs the
+			// recorded-start-time comparison the launcher-side sweep does, which
+			// unbind has no equivalent of; that is a scope decision, but it
+			// should not be a silent one. Every other preserve in this function
+			// warns, so this one does too.
+			options.log?.(
+				`Warning: runtime app helper owner metadata (pid ${owner.pid}) has no status record but its PID is live; preserving`,
+			);
+			continue;
+		}
+		helperCleanupPaths.push(owner.path);
 	}
 	await removeAppBindStartup(state ?? paths);
 
@@ -1617,8 +1757,7 @@ async function unbindCodexAppRuntimeRotationLocked(
 		paths.backupPath,
 		paths.statusPath,
 		state?.logPath ?? paths.logPath,
-		...(removeHelperStatus ? [helperStatusPath] : []),
-		...(removeHelperOwner && helperOwnerPath ? [helperOwnerPath] : []),
+		...helperCleanupPaths,
 	];
 	for (const candidate of cleanupCandidates) {
 		try {

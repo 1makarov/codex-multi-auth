@@ -1,5 +1,4 @@
-import { existsSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import {
 	AccountManager,
 	formatAccountLabel,
@@ -31,7 +30,7 @@ import {
 	type AppBindResult,
 	type AppBindStatus,
 } from "../../runtime/app-bind.js";
-import { APP_RUNTIME_HELPER_STATUS_FILE } from "../../runtime-constants.js";
+import { listRuntimeHelperStatusPaths } from "../../runtime-constants.js";
 import {
 	findQuotaCacheEntryForAccount,
 	isQuotaCacheEntryExhausted,
@@ -46,6 +45,12 @@ import {
 	resolveAccountCurrentMarkers,
 	resolveRuntimeCurrentAccount,
 } from "../../runtime/runtime-current-account.js";
+import {
+	isLiveRuntimeHelper,
+	liveRuntimeHelpers,
+	readRuntimeHelperPid,
+	selectRuntimeHelperStatus,
+} from "../../runtime/app-helper-selection.js";
 import { isRateLimitedMarker } from "../rate-limit-markers.js";
 import type { PluginConfig } from "../../types.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "../../storage.js";
@@ -57,6 +62,9 @@ interface AppRuntimeHelperStatus {
 	kind: string | null;
 	state: string | null;
 	pid: number | null;
+	// Parsed so liveness can be identity-checked rather than trusting
+	// `kill(pid, 0)` alone; see app-helper-selection.ts.
+	startedAt: number | null;
 	idleExpiresAt: number | null;
 	totalRequests: number | null;
 	rotations: number | null;
@@ -515,8 +523,9 @@ function readOptionalString(record: Record<string, unknown>, key: string): strin
 
 const MAX_STATUS_FILE_BYTES = 1024 * 1024; // 1 MB sanity cap
 
-function readAppRuntimeHelperStatus(): AppRuntimeHelperStatus | null {
-	const statusPath = join(getCodexMultiAuthDir(), APP_RUNTIME_HELPER_STATUS_FILE);
+function readAppRuntimeHelperStatusFile(
+	statusPath: string,
+): AppRuntimeHelperStatus | null {
 	if (!existsSync(statusPath)) return null;
 	try {
 		const stat = statSync(statusPath);
@@ -530,7 +539,8 @@ function readAppRuntimeHelperStatus(): AppRuntimeHelperStatus | null {
 		return {
 			state: readOptionalString(parsed, "state"),
 			kind: readOptionalString(parsed, "kind"),
-			pid: readOptionalNumber(parsed, "pid"),
+			pid: readRuntimeHelperPid(parsed.pid),
+			startedAt: readOptionalNumber(parsed, "startedAt"),
 			idleExpiresAt: readOptionalNumber(parsed, "idleExpiresAt"),
 			totalRequests: readOptionalNumber(parsed, "totalRequests"),
 			rotations: readOptionalNumber(parsed, "rotations"),
@@ -546,16 +556,29 @@ function readAppRuntimeHelperStatus(): AppRuntimeHelperStatus | null {
 	}
 }
 
-function isProcessAlive(pid: number | null): boolean {
-	if (!pid) return false;
+// One directory scan feeds both the status line and the live-helper count so
+// the two cannot observe different moments; path discovery is shared with
+// every other reader via listRuntimeHelperStatusPaths in runtime-constants.
+function readAppRuntimeHelperStatuses(): AppRuntimeHelperStatus[] {
+	const multiAuthDir = getCodexMultiAuthDir();
+	let entries: string[] = [];
 	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		const code =
-			error && typeof error === "object" && "code" in error ? error.code : null;
-		return code === "EPERM";
+		entries = readdirSync(multiAuthDir);
+	} catch {
+		entries = [];
 	}
+	return listRuntimeHelperStatusPaths(multiAuthDir, entries)
+		.map(readAppRuntimeHelperStatusFile)
+		.filter(
+			(status): status is AppRuntimeHelperStatus =>
+				status !== null && status.kind === "codex-app-runtime-rotation-helper",
+		);
+}
+
+function readAppRuntimeHelperStatus(
+	now: number = Date.now(),
+): AppRuntimeHelperStatus | null {
+	return selectRuntimeHelperStatus(readAppRuntimeHelperStatuses(), now);
 }
 
 function formatHelperLastAccount(status: AppRuntimeHelperStatus): string | null {
@@ -575,14 +598,20 @@ function formatHelperLastAccount(status: AppRuntimeHelperStatus): string | null 
 
 function formatAppRuntimeHelperStatus(
 	now: number,
-	status = readAppRuntimeHelperStatus(),
+	status = readAppRuntimeHelperStatus(now),
+	liveHelperCount = status ? 1 : 0,
 ): string {
 	if (!status) return "Codex app helper: not running";
 	if (status.kind !== "codex-app-runtime-rotation-helper") {
 		return "Codex app helper: not running";
 	}
-	const alive = isProcessAlive(status.pid);
-	if (!alive || status.state === "stopped" || status.state === "idle-timeout") {
+	// Only "running" is running: "stopped", "idle-timeout", "max-lifetime",
+	// "owner-gone", "error", and anything a future helper invents are all
+	// terminal, and a live kill(pid, 0) on a terminal record proves nothing —
+	// the PID may be recycled, which is the exact gate this fix stopped
+	// trusting. `isLiveRuntimeHelper` folds both conditions together, and is
+	// the same predicate the selection above and the account marker below use.
+	if (!isLiveRuntimeHelper(status, now)) {
 		return "Codex app helper: not running";
 	}
 	const parts = [`running${status.pid ? ` pid=${status.pid}` : ""}`];
@@ -592,6 +621,12 @@ function formatAppRuntimeHelperStatus(
 	if (lastAccount) parts.push(`lastAccount=${lastAccount}`);
 	if (status.idleExpiresAt !== null && status.idleExpiresAt > now) {
 		parts.push(`idle-expires=${formatWaitTime(status.idleExpiresAt - now)}`);
+	}
+	// The line shows the most recently active helper; with per-account
+	// app-servers several can be live at once, so say so instead of implying
+	// this one is the only one.
+	if (liveHelperCount > 1) {
+		parts.push(`(+${liveHelperCount - 1} more running)`);
 	}
 	return `Codex app helper: ${parts.join(", ")}`;
 }
@@ -647,8 +682,19 @@ async function printRotationStatus(deps: RotationCommandDeps): Promise<number> {
 		`Stored setting: ${config.codexRuntimeRotationProxy === true ? "enabled" : "disabled"}`,
 	);
 	logInfo(`Env override: ${formatEnvOverride()}`);
-	const helperStatus = readAppRuntimeHelperStatus();
-	logInfo(formatAppRuntimeHelperStatus(now, helperStatus));
+	// One scan and one selection feed the status line, the live count and the
+	// account marker below. Selecting twice re-ran the liveness probes at a
+	// later instant, so the helper named on the line and the helper whose
+	// account is marked `current` could be different processes (#667).
+	const helperStatuses = readAppRuntimeHelperStatuses();
+	const selectedHelperStatus = selectRuntimeHelperStatus(helperStatuses, now);
+	logInfo(
+		formatAppRuntimeHelperStatus(
+			now,
+			selectedHelperStatus,
+			liveRuntimeHelpers(helperStatuses, now).length,
+		),
+	);
 	const appBindStatus = await printCodexAppBindStatus(deps);
 	logInfo(`Storage: ${storagePath}`);
 
@@ -671,7 +717,10 @@ async function printRotationStatus(deps: RotationCommandDeps): Promise<number> {
 		{
 			runtimeSnapshot,
 			appBindStatus: appBindStatus?.running ? appBindStatus.router : null,
-			appHelperStatus: appRuntimeHelperStatusToRuntimeSignal(helperStatus),
+			appHelperStatus: appRuntimeHelperStatusToRuntimeSignal(
+				selectedHelperStatus,
+				now,
+			),
 		},
 		{ now },
 	);

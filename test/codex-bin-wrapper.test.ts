@@ -23,6 +23,7 @@ import {
 	resolve,
 } from "node:path";
 import process from "node:process";
+import { withDeadPid, withDeadPids } from "./helpers/owned-pids.js";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -332,9 +333,33 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			"  return value.length > 0 ? value : null;",
 			"}",
 			"",
+			// Opt-in: a request counter that climbs on its own for the first N ms
+			// and then stops, standing in for a detached consumer that keeps using
+			// its proxy and later goes away. Static counters cannot express
+			// "traffic is still arriving", which is exactly what the detached
+			// reaper reads.
+			// Garbage readings have to be expressible: a proxy that answers `-1`,
+			// `NaN`, or `Infinity` must degrade to "nothing attached", never to
+			// "someone is attached forever".
+			"function readProxyOpenConnections() {",
+			"  const raw = (process.env.CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS ?? '').trim().toLowerCase();",
+			"  if (raw === '') return 0;",
+			"  if (raw === 'nan') return Number.NaN;",
+			"  if (raw === 'infinity') return Number.POSITIVE_INFINITY;",
+			"  const parsed = Number.parseInt(raw, 10);",
+			"  return Number.isNaN(parsed) ? 0 : parsed;",
+			"}",
+			"",
+			"const proxyStartedAt = Date.now();",
+			"function rampedRequestCount() {",
+			"  const rampMs = readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_REQUEST_RAMP_MS');",
+			"  if (rampMs === null) return null;",
+			"  return Math.floor(Math.min(Date.now() - proxyStartedAt, rampMs) / 100);",
+			"}",
+			"",
 			"function buildStatus() {",
 			"  return {",
-			"    totalRequests: readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_REQUESTS') ?? 0,",
+			"    totalRequests: rampedRequestCount() ?? readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_REQUESTS') ?? 0,",
 			"    upstreamRequests: 0,",
 			"    retries: 0,",
 			"    rotations: readOptionalNumberEnv('CODEX_MULTI_AUTH_TEST_PROXY_ROTATIONS') ?? 0,",
@@ -397,6 +422,11 @@ function createRuntimeRotationProxyFixtureModule(fixtureRoot: string): string {
 			"        await new Promise(() => {});",
 			"      }",
 			"    },",
+			// Opt-in: report open client connections, which the real proxy reads off
+			// its live socket set. The detached reap treats a connected consumer as
+			// proof the handoff was real, so a test needs to be able to say "someone
+			// is attached" without standing up a real client.
+			"    getOpenConnectionCount: () => readProxyOpenConnections(),",
 			"    getStatus: () => buildStatus(),",
 			"  };",
 			"}",
@@ -525,10 +555,19 @@ function createPathDiscoveredNativeCodexFixture(rootDir: string): {
 	};
 }
 
+// The wrapper is published, so its fault injectors stay inert unless this
+// switch is set alongside the counter (#668). Every injection helper below
+// carries it, and `runWrapper` never sets it on its own — which is what lets
+// the "production ignores the counter" test simply omit it.
+const FAULT_INJECTION_ON = {
+	CODEX_MULTI_AUTH_TEST_FAULT_INJECTION: "1",
+} as const;
+
 function injectShadowCleanupBusyFailures(
 	failuresBeforeSuccess = 2,
 ): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_CLEANUP_BUSY_FAILURES: String(failuresBeforeSuccess),
 	};
 }
@@ -537,6 +576,7 @@ function injectShadowPreflightReadBusyFailures(
 	failuresBeforeSuccess = 2,
 ): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_PREFLIGHT_READ_BUSY_FAILURES: String(
 			failuresBeforeSuccess,
 		),
@@ -547,6 +587,7 @@ function injectShadowSyncMetadataBusyFailures(
 	failuresBeforeSuccess = 10,
 ): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_SYNC_METADATA_BUSY_FAILURES: String(
 			failuresBeforeSuccess,
 		),
@@ -555,6 +596,7 @@ function injectShadowSyncMetadataBusyFailures(
 
 function injectShadowLockRecreatedStaleCount(count = 2): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_LOCK_RECREATE_STALE_COUNT: String(count),
 	};
 }
@@ -563,6 +605,7 @@ function injectShadowLockOwnerWriteFailures(
 	failuresBeforeSuccess = 1,
 ): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_LOCK_OWNER_WRITE_FAILURES: String(
 			failuresBeforeSuccess,
 		),
@@ -687,6 +730,19 @@ function expectWrapperReturned(
 		result.error,
 		`wrapper never returned within ${WRAPPER_SHUTDOWN_TIMEOUT_MS}ms: ${what}`,
 	).toBeUndefined();
+}
+
+// Mirrors the wrapper's own owner-identity capture: kernel start time via
+// `ps -o lstart=` under the C locale, parsed to epoch ms.
+function readOwnProcessStartTimeMs(): number | null {
+	const result = spawnSync("ps", ["-o", "lstart=", "-p", String(process.pid)], {
+		encoding: "utf8",
+		env: { ...process.env, LC_ALL: "C" },
+	});
+	const out = (result.stdout ?? "").trim();
+	if (!out) return null;
+	const parsed = Date.parse(out);
+	return Number.isFinite(parsed) ? parsed : null;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -2776,6 +2832,7 @@ describe("codex bin wrapper", () => {
 			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "1000",
 			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
 			CODEX_MULTI_AUTH_TEST_FORCE_APP_SERVER_SHIM_COPY: "1",
+			...FAULT_INJECTION_ON,
 			CODEX_MULTI_AUTH_TEST_APP_SERVER_SHIM_FILE_CLEANUP_BUSY_FAILURES: "2",
 			CODEX_MULTI_AUTH_TEST_APP_SERVER_SHIM_COPY_BUSY_FAILURES: "2",
 			CODEX_MULTI_AUTH_TEST_PROXY_LAST_ACCOUNT_INDEX: "1",
@@ -2832,9 +2889,13 @@ describe("codex bin wrapper", () => {
 		expect(readFileSync(markerPath, "utf8")).toBe(
 			"start:http://127.0.0.1:4567\nclose\n",
 		);
-		const helperStatus = JSON.parse(
-			readFileSync(join(multiAuthDir, "runtime-rotation-app-helper.json"), "utf8"),
-		) as {
+		// Status is published per helper PID; exactly one helper ran here.
+		const helperStatusFiles = readdirSync(multiAuthDir).filter((name) =>
+			/^runtime-rotation-app-helper\.\d+\.json$/.test(name),
+		);
+		expect(helperStatusFiles).toHaveLength(1);
+		const helperStatusPath = join(multiAuthDir, helperStatusFiles[0] ?? "");
+		const helperStatus = JSON.parse(readFileSync(helperStatusPath, "utf8")) as {
 			state: string;
 			totalRequests: number;
 			lastAccountIndex: number | null;
@@ -2850,10 +2911,7 @@ describe("codex bin wrapper", () => {
 		expect(helperStatus.lastAccountId).toBe("acc_second");
 		expect(helperStatus.lastAccountUpdatedAt).toBe(12345);
 		if (process.platform !== "win32") {
-			expect(
-				statSync(join(multiAuthDir, "runtime-rotation-app-helper.json")).mode &
-					0o777,
-			).toBe(0o600);
+			expect(statSync(helperStatusPath).mode & 0o777).toBe(0o600);
 		}
 		if (shadowHomeMatch?.[1]) {
 			expect(existsSync(shadowHomeMatch[1])).toBe(false);
@@ -3031,45 +3089,142 @@ describe("codex bin wrapper", () => {
 		);
 	});
 
-	it("keeps app helpers alive when owner liveness probes return EPERM", async () => {
-		const fixtureRoot = createWrapperFixture();
-		createRuntimeRotationProxyFixtureModule(fixtureRoot);
-		const originalHome = join(fixtureRoot, "codex-home");
-		const multiAuthDir = join(fixtureRoot, "multi-auth");
-		const markerPath = join(fixtureRoot, "proxy-marker.txt");
-		const preloadPath = join(fixtureRoot, "owner-eperm-preload.mjs");
-		mkdirSync(originalHome, { recursive: true });
-		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
-		writeFileSync(
-			preloadPath,
-			[
-				"const originalKill = process.kill.bind(process);",
-				"process.kill = (pid, signal) => {",
-				"  if (signal === 0 && String(pid) === process.env.CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID) {",
-				'    const error = new Error("operation not permitted");',
-				'    error.code = "EPERM";',
-				"    throw error;",
-				"  }",
-				"  return originalKill(pid, signal);",
-				"};",
-			].join("\n"),
-			"utf8",
-		);
+	// Skipped on Windows because the fixture cannot construct the state it is
+	// about: the owner start time comes from `ps`, which does not exist there,
+	// so the env var is empty, the identity branch never engages, and the test
+	// would silently exercise bare liveness under a name claiming otherwise.
+	// The Windows bare-liveness path has its own coverage below.
+	it.skipIf(process.platform === "win32")(
+		"keeps app helpers alive when owner liveness probes return EPERM",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			const preloadPath = join(fixtureRoot, "owner-eperm-preload.mjs");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+			writeFileSync(
+				preloadPath,
+				[
+					"const originalKill = process.kill.bind(process);",
+					"process.kill = (pid, signal) => {",
+					"  if (signal === 0 && String(pid) === process.env.CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID) {",
+					'    const error = new Error("operation not permitted");',
+					'    error.code = "EPERM";',
+					"    throw error;",
+					"  }",
+					"  return originalKill(pid, signal);",
+					"};",
+				].join("\n"),
+				"utf8",
+			);
 
+			const helper = spawn(
+				process.execPath,
+				[join(fixtureRoot, "scripts", "codex.js"), "--codex-multi-auth-runtime-app-helper"],
+				{
+					env: buildWrapperEnv({
+						CODEX_HOME: originalHome,
+						CODEX_MULTI_AUTH_DIR: multiAuthDir,
+						CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+						CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+						CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+						CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+						// Production launchers always pass the owner's start time, so
+						// EPERM tolerance must hold on the identity branch, not just the
+						// bare-liveness fallback — and a *matching* identity is what keeps
+						// a live owner's helper alive (the false-positive direction).
+						CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: String(
+							readOwnProcessStartTimeMs() ?? "",
+						),
+						CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+						NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}`,
+					}),
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			);
+			let stdout = "";
+			let stderr = "";
+			const closed = new Promise<void>((resolve) => {
+				helper.once("close", () => resolve());
+			});
+			helper.stdout?.setEncoding("utf8");
+			helper.stderr?.setEncoding("utf8");
+			helper.stdout?.on("data", (chunk: string) => {
+				stdout += chunk;
+			});
+			helper.stderr?.on("data", (chunk: string) => {
+				stderr += chunk;
+			});
+
+			try {
+				const ready = await new Promise<{ statusPath: string }>((resolve, reject) => {
+					const timeout = setTimeout(() => {
+						reject(new Error(`helper did not become ready\n${stdout}\n${stderr}`));
+					}, 5_000);
+					helper.stdout?.on("data", () => {
+						const newlineIndex = stdout.indexOf("\n");
+						if (newlineIndex < 0) return;
+						try {
+							const message = JSON.parse(stdout.slice(0, newlineIndex)) as {
+								type?: string;
+								statusPath?: string;
+							};
+							if (message.type === "ready" && message.statusPath) {
+								clearTimeout(timeout);
+								resolve({ statusPath: message.statusPath });
+							}
+						} catch (error) {
+							clearTimeout(timeout);
+							reject(error);
+						}
+					});
+					helper.once("close", () => {
+						clearTimeout(timeout);
+						reject(new Error(`helper exited before ready\n${stdout}\n${stderr}`));
+					});
+				});
+
+				await sleep(750);
+
+				expect(helper.pid).toBeTruthy();
+				expect(isProcessAlive(helper.pid ?? -1)).toBe(true);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("running");
+				expect(readFileSync(markerPath, "utf8")).toBe("start:http://127.0.0.1:4567\n");
+			} finally {
+				if (helper.pid && isProcessAlive(helper.pid)) {
+					helper.kill("SIGTERM");
+				}
+				await Promise.race([closed, sleep(2_000)]);
+				if (helper.pid && isProcessAlive(helper.pid)) {
+					helper.kill("SIGKILL");
+					await Promise.race([closed, sleep(2_000)]);
+				}
+			}
+		},
+	);
+
+	// Spawns a helper directly (the EPERM harness above) with the given env and
+	// waits for its ready line; the caller owns assertions and shutdown.
+	async function spawnDirectAppHelper(
+		fixtureRoot: string,
+		env: Record<string, string | undefined>,
+	): Promise<{
+		helper: ReturnType<typeof spawn>;
+		ready: { statusPath: string; pid: number };
+		closed: Promise<void>;
+		output: () => string;
+	}> {
 		const helper = spawn(
 			process.execPath,
 			[join(fixtureRoot, "scripts", "codex.js"), "--codex-multi-auth-runtime-app-helper"],
 			{
-				env: buildWrapperEnv({
-					CODEX_HOME: originalHome,
-					CODEX_MULTI_AUTH_DIR: multiAuthDir,
-					CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
-					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
-					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
-					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
-					CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
-					NODE_OPTIONS: `--import=${pathToFileURL(preloadPath).href}`,
-				}),
+				env: buildWrapperEnv(env),
 				stdio: ["ignore", "pipe", "pipe"],
 			},
 		);
@@ -3086,11 +3241,31 @@ describe("codex bin wrapper", () => {
 		helper.stderr?.on("data", (chunk: string) => {
 			stderr += chunk;
 		});
-
-		try {
-			const ready = await new Promise<{ statusPath: string }>((resolve, reject) => {
+		// A rejection here throws before the caller reaches its try/finally, so
+		// nothing would ever call `stopDirectAppHelper` — the harness for a leak
+		// fix would leak a helper per failure, each holding a 1s status tick and,
+		// on the long-idle fixtures, a ref'd handle for a minute. Kill on the way
+		// out instead. (`close`-before-ready is already terminal.)
+		const rejectAndReap = (
+			reject: (error: Error) => void,
+			error: Error,
+		): void => {
+			if (helper.pid && isProcessAlive(helper.pid)) {
+				try {
+					helper.kill("SIGKILL");
+				} catch {
+					// Best-effort: the helper may have exited between the check and here.
+				}
+			}
+			reject(error);
+		};
+		const ready = await new Promise<{ statusPath: string; pid: number }>(
+			(resolve, reject) => {
 				const timeout = setTimeout(() => {
-					reject(new Error(`helper did not become ready\n${stdout}\n${stderr}`));
+					rejectAndReap(
+						reject,
+						new Error(`helper did not become ready\n${stdout}\n${stderr}`),
+					);
 				}, 5_000);
 				helper.stdout?.on("data", () => {
 					const newlineIndex = stdout.indexOf("\n");
@@ -3099,42 +3274,814 @@ describe("codex bin wrapper", () => {
 						const message = JSON.parse(stdout.slice(0, newlineIndex)) as {
 							type?: string;
 							statusPath?: string;
+							pid?: number;
 						};
-						if (message.type === "ready" && message.statusPath) {
+						if (message.type === "ready" && message.statusPath && message.pid) {
 							clearTimeout(timeout);
-							resolve({ statusPath: message.statusPath });
+							resolve({ statusPath: message.statusPath, pid: message.pid });
 						}
 					} catch (error) {
 						clearTimeout(timeout);
-						reject(error);
+						rejectAndReap(
+							reject,
+							error instanceof Error ? error : new Error(String(error)),
+						);
 					}
 				});
 				helper.once("close", () => {
 					clearTimeout(timeout);
 					reject(new Error(`helper exited before ready\n${stdout}\n${stderr}`));
 				});
-			});
+			},
+		);
+		return { helper, ready, closed, output: () => `${stdout}\n${stderr}` };
+	}
 
-			await sleep(750);
+	async function stopDirectAppHelper(
+		helper: ReturnType<typeof spawn>,
+		closed: Promise<void>,
+	): Promise<void> {
+		if (helper.pid && isProcessAlive(helper.pid)) {
+			helper.kill("SIGTERM");
+		}
+		await Promise.race([closed, sleep(2_000)]);
+		if (helper.pid && isProcessAlive(helper.pid)) {
+			helper.kill("SIGKILL");
+			await Promise.race([closed, sleep(2_000)]);
+		}
+	}
 
-			expect(helper.pid).toBeTruthy();
-			expect(isProcessAlive(helper.pid ?? -1)).toBe(true);
+	// The idle reaper's owner check is PID *plus* the owner's process start
+	// time. A recycled PID — a live process holding the dead launcher's integer
+	// — must not push the idle deadline forward: one false "alive" per window
+	// is a ratchet the helper never recovers from, which is how helpers were
+	// observed running 33 hours past a 12-hour timeout. Simulated here by
+	// pointing the helper at a genuinely live process (this test) with a start
+	// time that cannot match. Fails against the bare kill(pid, 0) check.
+	// POSIX-only: on Windows there is no `ps`, identity is unknowable, and the
+	// designed degradation is bare liveness — the companion test below.
+	it.skipIf(process.platform === "win32")("idles out when the owner PID is alive but its identity does not match", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+		});
+		try {
+			await Promise.race([closed, sleep(5_000)]);
+			expect(isProcessAlive(ready.pid)).toBe(false);
 			const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
 				state: string;
 			};
-			expect(status.state).toBe("running");
-			expect(readFileSync(markerPath, "utf8")).toBe("start:http://127.0.0.1:4567\n");
+			expect(status.state).toBe("idle-timeout");
 		} finally {
-			if (helper.pid && isProcessAlive(helper.pid)) {
-				helper.kill("SIGTERM");
-			}
-			await Promise.race([closed, sleep(2_000)]);
-			if (helper.pid && isProcessAlive(helper.pid)) {
-				helper.kill("SIGKILL");
-				await Promise.race([closed, sleep(2_000)]);
-			}
+			await stopDirectAppHelper(helper, closed);
 		}
 	});
+
+	// The designed Windows degradation: with no `ps`, owner identity is
+	// unknowable, and an unknowable identity must never kill a helper whose
+	// owner PID is genuinely alive — bare liveness keeps it running.
+	it.runIf(process.platform === "win32")(
+		"keeps the helper alive when owner identity is unavailable",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				// A start time that cannot match: with no way to read the real one,
+				// the check must degrade to bare liveness, not declare death.
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				await sleep(1_000);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The detach grace hands a helper off to nobody whenever a launcher merely
+	// exits quickly — every short forwarded command strands one — and before
+	// this window those helpers held the full idle timeout (12h by default)
+	// with a dead owner, no traffic, and nothing connected. A stranded helper
+	// is garbage the moment the detached window elapses. Owner death is
+	// simulated the same way as the ratchet test: a live PID whose identity
+	// cannot match, which the liveness check correctly reads as dead.
+	it.skipIf(process.platform === "win32")(
+		"reaps a stranded helper on the detached window instead of the full idle timeout",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				// Idle can never fire inside this test; only the detached window can,
+				// which is the whole point — before it existed, this helper lived on.
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			});
+			try {
+				await Promise.race([closed, sleep(5_000)]);
+				expect(isProcessAlive(ready.pid)).toBe(false);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+					idleExpiresAt: number;
+					updatedAt: number;
+				};
+				expect(status.state).toBe("owner-gone");
+				// The reported deadline is the one actually enforced: `rotation
+				// status` must not advertise the 60s idle window to a helper the
+				// detached window is about to reap.
+				expect(status.idleExpiresAt - status.updatedAt).toBeLessThan(60_000);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The companion that runs everywhere, Windows included. The tests above
+	// simulate owner death with an unmatchable start time, which only POSIX can
+	// evaluate — with no `ps`, identity is unknowable and the check degrades to
+	// bare liveness. A *genuinely* dead owner PID is readable on every
+	// platform through that same bare check, so the reap itself is covered on
+	// win32 even though the identity flavor of it cannot be.
+	it("reaps a stranded helper whose owner PID is genuinely dead", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		// A PID this test owned and then killed, so "dead" is a fact rather than a
+		// sentinel integer that different platforms classify differently.
+		// `withDeadPid` is the shared version of exactly this — it waits on the
+		// child's `exit` event instead of polling liveness, and re-checks the PID
+		// was not recycled before handing it over — so the hand-rolled copy that
+		// used to live here is gone.
+		await withDeadPid(async (deadOwnerPid) => {
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(deadOwnerPid),
+				// Left unset on purpose: this is the degraded bare-liveness path.
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: undefined,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				await Promise.race([closed, sleep(5_000)]);
+				expect(isProcessAlive(ready.pid)).toBe(false);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("owner-gone");
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		});
+	});
+
+	// The detached window reaps strays, not handoffs. A consumer holding a
+	// connection is the evidence that the detach was real — `codex app` hands
+	// the desktop app a proxy and exits — so an attached helper keeps the full
+	// idle timeout no matter how long its launcher has been gone.
+	it.skipIf(process.platform === "win32")(
+		"keeps a stranded helper alive while a client connection is open",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "200",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS: "1",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				// Many detached windows' worth of ticks with a socket held open.
+				await sleep(1_500);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The detached window reaps helpers that were *stranded*, never helpers that
+	// were handed off, and having served a request is the durable proof of a
+	// handoff. An open socket is not: the proxy leaves `keepAliveTimeout` at
+	// Node's 5s default, so a `codex app` session that is merely idle between
+	// turns holds no socket within seconds of its last turn. Reaping on the
+	// socket check alone would therefore kill the live proxy under a desktop app
+	// whose user simply stopped typing for the length of the detached window,
+	// and the next message would get ECONNREFUSED against a dead localhost port
+	// with nothing left to restart it.
+	//
+	// Every helper in the #663 report had `totalRequests: 0` — the leak is
+	// entirely a never-served phenomenon — so the narrower gate closes the leak
+	// without putting live sessions at risk. A served-then-abandoned helper falls
+	// back to the idle timeout and the lifetime ceiling, exactly as it did before
+	// the detached window existed.
+	it.skipIf(process.platform === "win32")(
+		"keeps a helper that has served traffic alive after its traffic stops",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				// Traffic climbs for 300ms and then freezes: one served request is
+				// all it takes, and the counter is frozen for many detached windows
+				// afterwards with no socket held.
+				CODEX_MULTI_AUTH_TEST_PROXY_REQUEST_RAMP_MS: "300",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				// Several detached windows past the end of the ramp.
+				await sleep(2_500);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("running");
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The other half of the same rule: a helper whose owner is gone and which
+	// never served anything is a stray, and the detached window still takes it.
+	it.skipIf(process.platform === "win32")(
+		"still reaps a stranded helper that never served a request",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				await Promise.race([closed, sleep(5_000)]);
+				expect(isProcessAlive(ready.pid)).toBe(false);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("owner-gone");
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// "No owner PID was recorded" and "the owner is confirmed dead" are different
+	// facts. Collapsing them into one falsy verdict started the detached clock on
+	// the first tick for anyone invoking the helper directly — the documented
+	// reproduction in #663 — or running one spawned by a pre-upgrade launcher
+	// that sets no owner PID, and reaped it silently.
+	it.skipIf(process.platform === "win32")(
+		"does not start the detached clock for a helper launched without an owner PID",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				// Deliberately no CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID.
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				// Many detached windows with no owner and no traffic: the idle
+				// timeout is the only clock that may apply, and it is 60s away.
+				await sleep(2_500);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("running");
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// Only a positive socket count is evidence of a consumer. A proxy that
+	// answers with garbage must not be able to pin a stranded helper alive
+	// forever — that is the leak wearing a different hat.
+	for (const [label, reading] of [
+		["a negative count", "-1"],
+		["NaN", "nan"],
+		["Infinity", "infinity"],
+	] as const) {
+		it.skipIf(process.platform === "win32")(
+			`treats ${label} from the proxy as nothing attached and still reaps`,
+			async () => {
+				const fixtureRoot = createWrapperFixture();
+				createRuntimeRotationProxyFixtureModule(fixtureRoot);
+				const originalHome = join(fixtureRoot, "codex-home");
+				const multiAuthDir = join(fixtureRoot, "multi-auth");
+				mkdirSync(originalHome, { recursive: true });
+				writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+				const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+					CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_DIR: multiAuthDir,
+					CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+					CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+					CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+					CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS: reading,
+					CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+				});
+				try {
+					await Promise.race([closed, sleep(5_000)]);
+					expect(isProcessAlive(ready.pid)).toBe(false);
+					const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+						state: string;
+					};
+					expect(status.state).toBe("owner-gone");
+				} finally {
+					await stopDirectAppHelper(helper, closed);
+				}
+			},
+		);
+	}
+
+	// The escape hatch is a real escape hatch: 0 restores the pre-fix behavior
+	// for anyone who was depending on a stranded helper outliving its launcher
+	// without holding a connection.
+	it.skipIf(process.platform === "win32")(
+		"keeps a stranded helper on the full idle timeout when the detached window is disabled",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "0",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				await sleep(1_500);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The absolute lifetime ceiling is unconditional on activity: it exists for
+	// exactly the case where activity accounting is wrong, so a genuinely live
+	// owner must not extend a helper past it.
+	it("stops at the max-lifetime ceiling even while its owner is alive", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			// Idle can never fire inside this test; only the ceiling can.
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+			CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS: "400",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+		});
+		try {
+			await Promise.race([closed, sleep(5_000)]);
+			expect(isProcessAlive(ready.pid)).toBe(false);
+			const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+				state: string;
+			};
+			expect(status.state).toBe("max-lifetime");
+		} finally {
+			await stopDirectAppHelper(helper, closed);
+		}
+	});
+
+	// N helpers, N status files: each helper publishes
+	// `runtime-rotation-app-helper.<pid>.json` and never the shared legacy
+	// path, so concurrent helpers stop last-writer-winning one file and every
+	// reader can see every helper.
+	it("publishes one status file per helper PID instead of one shared file", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const commonEnv = {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+		};
+		const first = await spawnDirectAppHelper(fixtureRoot, {
+			...commonEnv,
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker-1.txt"),
+		});
+		try {
+			const second = await spawnDirectAppHelper(fixtureRoot, {
+				...commonEnv,
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker-2.txt"),
+			});
+			try {
+				expect(first.ready.statusPath).not.toBe(second.ready.statusPath);
+				expect(first.ready.statusPath).toContain(`.${first.ready.pid}.`);
+				expect(second.ready.statusPath).toContain(`.${second.ready.pid}.`);
+				const firstStatus = JSON.parse(
+					readFileSync(first.ready.statusPath, "utf8"),
+				) as { pid: number; state: string };
+				const secondStatus = JSON.parse(
+					readFileSync(second.ready.statusPath, "utf8"),
+				) as { pid: number; state: string };
+				expect(firstStatus.pid).toBe(first.ready.pid);
+				expect(secondStatus.pid).toBe(second.ready.pid);
+				expect(firstStatus.state).toBe("running");
+				expect(secondStatus.state).toBe("running");
+				expect(
+					existsSync(join(multiAuthDir, "runtime-rotation-app-helper.json")),
+				).toBe(false);
+			} finally {
+				await stopDirectAppHelper(second.helper, second.closed);
+			}
+		} finally {
+			await stopDirectAppHelper(first.helper, first.closed);
+		}
+	});
+
+	// One of the four defects was helpers rewriting status at 1 Hz; publishing
+	// is now change-token + heartbeat. A quiet helper's status file must not
+	// churn between ticks, or N helpers reintroduce the write storm silently.
+	it("does not rewrite an unchanged status file on every tick", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+		const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			// Long idle: the 1s tick keeps running, but with no traffic and a
+			// 60s heartbeat nothing about the payload changes between ticks.
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+			CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+		});
+		try {
+			const firstMtime = statSync(ready.statusPath).mtimeMs;
+			// Several ticks pass (tick interval is 1s at this idle timeout).
+			await sleep(2_600);
+			expect(statSync(ready.statusPath).mtimeMs).toBe(firstMtime);
+		} finally {
+			await stopDirectAppHelper(helper, closed);
+		}
+	});
+
+	// Windows can hold transient locks on files another process just closed;
+	// metadata deletions retry instead of silently leaving the stale file the
+	// sweep exists to remove.
+	it("retries transient lock failures while sweeping helper metadata", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(multiAuthDir, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		const staleStatusPaths = [
+			join(multiAuthDir, "runtime-rotation-app-helper.99999996.json"),
+			join(multiAuthDir, "runtime-rotation-app-helper.99999997.json"),
+		];
+		for (const [index, path] of staleStatusPaths.entries()) {
+			writeFileSync(
+				path,
+				`{"pid":9999999${6 + index},"state":"running"}\n`,
+				"utf8",
+			);
+		}
+
+		const result = runWrapper(fixtureRoot, ["app", "."], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+			// The failure counter is process-wide: two simulated EBUSY throws land
+			// on the deletions in whatever order the sweep visits the two files.
+			// `withSynchronousFileOperationRetry` allows four attempts per call, so
+			// even the worst split (one file eating both failures) succeeds on that
+			// file's third attempt — the outcome is order-independent as long as
+			// the retry budget stays at three attempts or more. If that budget ever
+			// shrinks below three, this test fails and the sweep would silently
+			// leave stale metadata behind on transient Windows locks.
+			...FAULT_INJECTION_ON,
+			CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES: "2",
+			OPENAI_API_KEY: undefined,
+		});
+		expect(result.status).toBe(0);
+		for (const path of staleStatusPaths) {
+			expect(existsSync(path)).toBe(false);
+		}
+	});
+
+	// `package.json` publishes `scripts/codex.js`, so this injector runs in every
+	// user's install. Two things keep it inert there: the counter does nothing
+	// without an explicit opt-in switch, and the value is parsed strictly —
+	// `Number.parseInt` reads "2abc" as 2 and "1e3" as 1, which is how a value
+	// that was never meant to be a count arms a fault injector (#668). Either
+	// leak would silently defeat the first N metadata deletions of every sweep,
+	// which is the exact accumulation the sweep exists to prevent.
+	it.each([
+		["without the opt-in switch", { CODEX_MULTI_AUTH_TEST_FAULT_INJECTION: undefined }],
+		["with a non-numeric counter", { ...FAULT_INJECTION_ON }],
+	] as const)(
+		"ignores the metadata-cleanup fault injector %s",
+		async (label, gateEnv) => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			mkdirSync(multiAuthDir, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+			const staleStatusPath = join(
+				multiAuthDir,
+				"runtime-rotation-app-helper.99999996.json",
+			);
+			writeFileSync(staleStatusPath, '{"pid":99999996,"state":"running"}\n', "utf8");
+
+			// A counter big enough to exhaust the retry budget several times over,
+			// so if it were ever honoured the sweep could not recover.
+			const result = runWrapper(fixtureRoot, ["app", "."], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+				...gateEnv,
+				CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES:
+					label === "with a non-numeric counter" ? "99abc" : "99",
+				OPENAI_API_KEY: undefined,
+			});
+
+			expect(result.status).toBe(0);
+			expect(existsSync(staleStatusPath)).toBe(false);
+		},
+	);
+
+	// The retry budget is finite, so a file that stays locked has to be survivable
+	// rather than fatal: the sweep runs on the launcher's critical path, and a
+	// helper launch must not fail because a stale file from some other helper
+	// could not be deleted. The file simply waits for the next sweep.
+	it("leaves a permanently locked metadata file behind without failing the launch", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(multiAuthDir, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		const staleStatusPath = join(
+			multiAuthDir,
+			"runtime-rotation-app-helper.99999995.json",
+		);
+		writeFileSync(staleStatusPath, '{"pid":99999995,"state":"running"}\n', "utf8");
+
+		// Far more failures than `withSynchronousFileOperationRetry`'s budget, so
+		// every attempt on this file throws EBUSY and the retry never succeeds.
+		const result = runWrapper(fixtureRoot, ["app", "."], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+			...FAULT_INJECTION_ON,
+			CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES: "999",
+			OPENAI_API_KEY: undefined,
+		});
+
+		// The launch succeeded...
+		expect(result.status).toBe(0);
+		// ...and the file it could not delete is still there for the next sweep,
+		// rather than the error having escaped into the launcher.
+		expect(existsSync(staleStatusPath)).toBe(true);
+	});
+
+	// Owner files have no post-mortem value and go with the helper; stale
+	// per-PID metadata from killed helpers — and a legacy shared status file
+	// whose recorded PID is dead — is swept when the next launcher starts a
+	// helper, which is what keeps 579-files-vs-183-helpers from recurring.
+	it("removes its owner file on exit and sweeps dead helpers' metadata on the next launch", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const multiAuthDir = join(fixtureRoot, "multi-auth");
+		mkdirSync(originalHome, { recursive: true });
+		mkdirSync(multiAuthDir, { recursive: true });
+		writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+		// Metadata for a helper PID that cannot be alive, plus a legacy shared
+		// status file recording the same dead PID: all three must be swept.
+		const staleStatusPath = join(
+			multiAuthDir,
+			"runtime-rotation-app-helper.99999999.json",
+		);
+		const staleOwnerPath = join(
+			multiAuthDir,
+			"runtime-rotation-app-helper-owner.99999999.json",
+		);
+		const legacyStatusPath = join(multiAuthDir, "runtime-rotation-app-helper.json");
+		writeFileSync(staleStatusPath, '{"pid":99999999,"state":"running"}\n', "utf8");
+		writeFileSync(staleOwnerPath, '{"launcherPid":1,"identityToken":"x"}\n', "utf8");
+		writeFileSync(legacyStatusPath, '{"pid":99999999,"state":"running"}\n', "utf8");
+
+		const result = runWrapper(fixtureRoot, ["app", "."], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_DIR: multiAuthDir,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+			OPENAI_API_KEY: undefined,
+		});
+		expect(result.status).toBe(0);
+
+		// The launcher swept — after spawning its own helper, so the sweep never
+		// sits in front of `codex app` startup, and before the launch handshake,
+		// so it is complete by the time the wrapper exits.
+		expect(existsSync(staleStatusPath)).toBe(false);
+		expect(existsSync(staleOwnerPath)).toBe(false);
+		expect(existsSync(legacyStatusPath)).toBe(false);
+
+		// The launcher's own helper detached (grace window), then idles out with
+		// its owner gone; on exit it removes its owner file and leaves only its
+		// terminal status stamp.
+		const ownerPattern = /^runtime-rotation-app-helper-owner\.(\d+)\.json$/;
+		const statusPattern = /^runtime-rotation-app-helper\.(\d+)\.json$/;
+		const deadline = Date.now() + 5_000;
+		let ownerFiles: string[] = [];
+		let statusFiles: string[] = [];
+		let sawHelperMetadata = false;
+		for (;;) {
+			ownerFiles = readdirSync(multiAuthDir).filter((name) =>
+				ownerPattern.test(name),
+			);
+			statusFiles = readdirSync(multiAuthDir).filter((name) =>
+				statusPattern.test(name),
+			);
+			if (ownerFiles.length > 0 || statusFiles.length > 0) {
+				sawHelperMetadata = true;
+			}
+			const statuses = statusFiles.map(
+				(name) =>
+					JSON.parse(readFileSync(join(multiAuthDir, name), "utf8")) as {
+						state: string;
+					},
+			);
+			if (
+				sawHelperMetadata &&
+				ownerFiles.length === 0 &&
+				statuses.length > 0 &&
+				statuses.every((status) => status.state !== "running")
+			) {
+				break;
+			}
+			if (Date.now() >= deadline) {
+				throw new Error(
+					`helper metadata did not settle: owners=${JSON.stringify(ownerFiles)} statuses=${JSON.stringify(statusFiles)}`,
+				);
+			}
+			await sleep(50);
+		}
+		expect(ownerFiles).toHaveLength(0);
+		expect(statusFiles).toHaveLength(1);
+		const finalStatus = JSON.parse(
+			readFileSync(join(multiAuthDir, statusFiles[0] ?? ""), "utf8"),
+		) as { state: string };
+		expect(finalStatus.state).toBe("idle-timeout");
+	}, 15_000);
 
 	it("stops failed app helpers before unsupported-model retries", async () => {
 		const fixtureRoot = createWrapperFixture();
@@ -3275,8 +4222,11 @@ describe("codex bin wrapper", () => {
 
 		const marker = readFileSync(markerPath, "utf8");
 		expect(marker).toContain(`real-home-env:${originalHome}\n`);
+		// Status is per helper PID; the shared legacy path is no longer written.
 		expect(
-			existsSync(join(originalHome, "multi-auth", "runtime-rotation-app-helper.json")),
+			readdirSync(join(originalHome, "multi-auth")).some((name) =>
+				/^runtime-rotation-app-helper\.\d+\.json$/.test(name),
+			),
 		).toBe(true);
 		const compatibilityHomeMatch = marker.match(/^codex-home-env:(.+)$/m);
 		expect(compatibilityHomeMatch?.[1]).toBeTruthy();
@@ -6743,4 +7693,436 @@ describe("codex bin wrapper", () => {
 			);
 		}
 	});
+
+	// ------------------------------------------------------------------
+	// Stress: the runtime behaviour, at the scale and duration #663 described.
+	// The tests above pin one helper at a time over a few hundred milliseconds.
+	// These drive many helpers, many launch cycles, and a directory already full
+	// of stale metadata — the state the reporting machine was actually in.
+	// POSIX-only for the same reason as the rest of the lifecycle suite.
+	// ------------------------------------------------------------------
+
+	function countHelperMetadata(multiAuthDir: string): {
+		status: number;
+		owner: number;
+	} {
+		let entries: string[] = [];
+		try {
+			entries = readdirSync(multiAuthDir);
+		} catch (error) {
+			// Only "the directory does not exist yet" is a legitimate zero. Any
+			// other readdir failure — a permissions change, a path that is not a
+			// directory — would otherwise be reported as a clean sweep, and the
+			// bounded-metadata test below asserts upper bounds that a false zero
+			// satisfies perfectly.
+			const code =
+				error && typeof error === "object" && "code" in error
+					? String((error as { code?: unknown }).code)
+					: "unknown";
+			if (code !== "ENOENT") throw error;
+			return { status: 0, owner: 0 };
+		}
+		return {
+			status: entries.filter((n) =>
+				/^runtime-rotation-app-helper\.\d+\.json$/.test(n),
+			).length,
+			owner: entries.filter((n) =>
+				/^runtime-rotation-app-helper-owner\.\d+\.json$/.test(n),
+			).length,
+		};
+	}
+
+	it.skipIf(process.platform === "win32")(
+		"stress: metadata stays bounded across many launch/exit cycles",
+		async () => {
+			// The reported accumulation was 10-28 helpers/hour under ordinary use,
+			// ending at 183 live helpers and 701 owner files. One launch proves
+			// nothing about that; the property is that repeating the cycle does not
+			// grow the directory without bound. Each launch sweeps what the previous
+			// one left, so the count must plateau rather than climb with the cycle
+			// count.
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			mkdirSync(multiAuthDir, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			// Before measuring accumulation, prove the fixture actually produces
+			// helpers. Every assertion below is an upper bound, so a launch path
+			// that silently never publishes metadata — a wrong env gate, a proxy
+			// fixture that never engages, `app .` short-circuiting on the fake bin
+			// — would leave every count at zero and pass the whole test while
+			// demonstrating nothing about the leak it exists to guard.
+			const probe = runWrapper(fixtureRoot, ["app", "."], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				// Long enough that the helper is unambiguously still alive when the
+				// probe looks for it.
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "30000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "0",
+				OPENAI_API_KEY: undefined,
+			});
+			expect(probe.status).toBe(0);
+			const probeCounts = countHelperMetadata(multiAuthDir);
+			expect(probeCounts.status).toBeGreaterThan(0);
+			expect(probeCounts.owner).toBeGreaterThan(0);
+			// Tear that one down before the accumulation loop starts, so it cannot
+			// be mistaken for a leaked helper later.
+			const probeEntries = readdirSync(multiAuthDir).filter((name) =>
+				name.startsWith("runtime-rotation-app-helper"),
+			);
+			for (const name of probeEntries) {
+				const match = /\.(\d+)\.json$/.exec(name);
+				const pid = match?.[1] ? Number.parseInt(match[1], 10) : null;
+				if (pid !== null && isProcessAlive(pid)) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {
+						// Already gone.
+					}
+				}
+				rmSync(join(multiAuthDir, name), { force: true });
+			}
+			await sleep(200);
+
+			const cycles = 30;
+			const counts: number[] = [];
+			let sawHelperDuringLoop = false;
+			for (let cycle = 0; cycle < cycles; cycle += 1) {
+				const result = runWrapper(fixtureRoot, ["app", "."], {
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+					CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_DIR: multiAuthDir,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+					// Short enough that each helper is gone well before the next
+					// launch sweeps for it.
+					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+					CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "150",
+					OPENAI_API_KEY: undefined,
+				});
+				expect(result.status).toBe(0);
+				await sleep(120);
+				const sample = countHelperMetadata(multiAuthDir);
+				if (sample.owner > 0 || sample.status > 0) sawHelperDuringLoop = true;
+				counts.push(sample.owner);
+			}
+
+			// Give the last cycle's helper time to exit and one more launch to sweep
+			// after it.
+			await sleep(1_000);
+			runWrapper(fixtureRoot, ["app", "."], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "150",
+				OPENAI_API_KEY: undefined,
+			});
+			await sleep(1_000);
+
+			const final = countHelperMetadata(multiAuthDir);
+			const peak = Math.max(...counts);
+			// The loop has to have observed at least one helper at some point,
+			// otherwise the upper bounds below are vacuous.
+			expect(sawHelperDuringLoop).toBe(true);
+			// The pre-fix behaviour was one owner file per launch, kept forever, so
+			// the count climbed with the cycle count. A few concurrent files are
+			// expected — each helper outlives the launch that spawned it by its
+			// idle window, so a sample can catch the previous cycle's helper still
+			// running — but the number must be a function of that overlap, not of
+			// how many times the loop ran. A ceiling well under `cycles` is what
+			// separates the two; `< cycles` alone would only fail at the exact
+			// worst case.
+			expect(peak).toBeLessThan(10);
+			expect(final.owner).toBeLessThan(5);
+			expect(final.status).toBeLessThan(5);
+		},
+		240_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"stress: concurrent helpers keep separate status files and are all discoverable",
+		async () => {
+			// Defect 3 in #663: one shared status path, N writers at 1 Hz, last
+			// writer wins. Per-PID files are the fix; this asserts N concurrent
+			// helpers really do produce N distinct records, each naming its own PID,
+			// with none overwriting another.
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const helperCount = 10;
+			const spawned = await Promise.all(
+				Array.from({ length: helperCount }, (_unused, index) =>
+					spawnDirectAppHelper(fixtureRoot, {
+						CODEX_HOME: originalHome,
+						CODEX_MULTI_AUTH_DIR: multiAuthDir,
+						CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+						CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+						CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+						CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "0",
+						CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+						CODEX_MULTI_AUTH_TEST_PROXY_LAST_ACCOUNT_ID: `acc_${index}`,
+						CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(
+							fixtureRoot,
+							`marker-${index}.txt`,
+						),
+					}),
+				),
+			);
+			try {
+				// Several publish ticks, so any trampling has had time to happen.
+				await sleep(1_500);
+
+				const pids = spawned.map((s) => s.ready.pid);
+				expect(new Set(pids).size).toBe(helperCount);
+
+				for (const { ready } of spawned) {
+					expect(existsSync(ready.statusPath)).toBe(true);
+					const record = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+						pid: number;
+						state: string;
+					};
+					// Each file describes its own helper, not whichever wrote last.
+					expect(record.pid).toBe(ready.pid);
+					expect(record.state).toBe("running");
+				}
+				// And every one of them is still alive: nothing reaped a sibling.
+				for (const pid of pids) {
+					expect(isProcessAlive(pid)).toBe(true);
+				}
+
+				const counts = countHelperMetadata(multiAuthDir);
+				expect(counts.status).toBe(helperCount);
+			} finally {
+				await Promise.all(
+					spawned.map(({ helper, closed }) =>
+						stopDirectAppHelper(helper, closed),
+					),
+				);
+			}
+		},
+		180_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"stress: the reap matrix reaps exactly the stranded helpers and no others",
+		async () => {
+			// The whole lifecycle contract in one run, with every configuration live
+			// at the same time so a rule that fires on the wrong one is visible as a
+			// divergence rather than as a single red test.
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			await withDeadPid(async (deadOwnerPid) => {
+				const base = {
+					CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_DIR: multiAuthDir,
+					CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+					CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				};
+				const cases: Array<{
+					label: string;
+					survives: boolean;
+					env: Record<string, string | undefined>;
+				}> = [
+					{
+						label: "owner alive, never served",
+						survives: true,
+						env: {
+							...base,
+							CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+						},
+					},
+					{
+						label: "owner dead, never served",
+						survives: false,
+						env: {
+							...base,
+							CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(deadOwnerPid),
+						},
+					},
+					{
+						label: "owner dead, served traffic",
+						survives: true,
+						env: {
+							...base,
+							CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(deadOwnerPid),
+							CODEX_MULTI_AUTH_TEST_PROXY_REQUEST_RAMP_MS: "200",
+						},
+					},
+					{
+						label: "no owner recorded, never served",
+						survives: true,
+						env: { ...base },
+					},
+					{
+						label: "owner dead, socket held",
+						survives: true,
+						env: {
+							...base,
+							CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(deadOwnerPid),
+							CODEX_MULTI_AUTH_TEST_PROXY_OPEN_CONNECTIONS: "1",
+						},
+					},
+				];
+
+				const running = await Promise.all(
+					cases.map((testCase, index) =>
+						spawnDirectAppHelper(fixtureRoot, {
+							...testCase.env,
+							CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(
+								fixtureRoot,
+								`matrix-${index}.txt`,
+							),
+						}),
+					),
+				);
+				try {
+					// Many detached windows: anything that is going to be reaped has
+					// been, and anything that survives this has survived on a rule.
+					await sleep(4_000);
+
+					// Zipped off `running`, not indexed with a fallback: passing `0` to
+					// `isProcessAlive` would probe the caller's own process group on
+					// POSIX and answer true, so a missing helper would read as alive —
+					// and four of these five cases expect exactly that.
+					expect(running).toHaveLength(cases.length);
+					const actual = running.map(({ ready }, index) => {
+						const testCase = cases[index];
+						expect(testCase).toBeDefined();
+						return {
+							label: testCase?.label ?? `case-${index}`,
+							expected: testCase?.survives ?? false,
+							alive: isProcessAlive(ready.pid),
+							statusPath: ready.statusPath,
+						};
+					});
+					// Compared as a whole so a failure names every divergence at once.
+					expect(actual.map((a) => `${a.label}=${a.alive}`)).toEqual(
+						actual.map((a) => `${a.label}=${a.expected}`),
+					);
+
+					// The one that died did so for the stated reason. Looked up by
+					// label and asserted unconditionally: hardcoding an index meant
+					// reordering `cases` would silently assert `owner-gone` against a
+					// helper that was supposed to survive, and a guard around it would
+					// let the only assertion that proves *why* it died skip itself.
+					const reaped = actual.find(
+						(a) => a.label === "owner dead, never served",
+					);
+					expect(reaped).toBeDefined();
+					expect(reaped?.alive).toBe(false);
+					const status = JSON.parse(
+						readFileSync(reaped?.statusPath ?? "", "utf8"),
+					) as { state: string };
+					expect(status.state).toBe("owner-gone");
+				} finally {
+					await Promise.all(
+						running.map(({ helper, closed }) =>
+							stopDirectAppHelper(helper, closed),
+						),
+					);
+				}
+			});
+		},
+		180_000,
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"stress: a launcher sweeps a directory already holding hundreds of stale files",
+		async () => {
+			// 701 orphaned owner files was the reported end state. The sweep has a
+			// probe budget and a retry ladder, both of which could in principle turn
+			// a big directory into a slow or incomplete launch. Assert it reclaims
+			// the lot and the launch still succeeds.
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			mkdirSync(multiAuthDir, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+
+			const staleCount = 350;
+			await withDeadPids(staleCount, async (deadPids) => {
+				for (const pid of deadPids) {
+					writeFileSync(
+						join(multiAuthDir, `runtime-rotation-app-helper.${pid}.json`),
+						`${JSON.stringify({ pid, state: "running", startedAt: Date.now() })}\n`,
+						"utf8",
+					);
+					writeFileSync(
+						join(multiAuthDir, `runtime-rotation-app-helper-owner.${pid}.json`),
+						`${JSON.stringify({ identityToken: "x", createdAt: Date.now() })}\n`,
+						"utf8",
+					);
+				}
+				const before = countHelperMetadata(multiAuthDir);
+				expect(before.status).toBe(staleCount);
+				expect(before.owner).toBe(staleCount);
+
+				const startedAt = Date.now();
+				const result = runWrapper(fixtureRoot, ["app", "."], {
+					CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+					CODEX_HOME: originalHome,
+					CODEX_MULTI_AUTH_DIR: multiAuthDir,
+					CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+					CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+					CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "150",
+					OPENAI_API_KEY: undefined,
+				});
+				const elapsedMs = Date.now() - startedAt;
+
+				expect(result.status).toBe(0);
+				await sleep(600);
+				const after = countHelperMetadata(multiAuthDir);
+				// Everything stale is gone; only this launch's own helper may remain.
+				expect(after.status).toBeLessThan(3);
+				expect(after.owner).toBeLessThan(3);
+				// The launch handshake has a 15s bound; a sweep that pushed past it
+				// would fail the launch, not just be slow.
+				expect(elapsedMs).toBeLessThan(60_000);
+			});
+		},
+		240_000,
+	);
 });

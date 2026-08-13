@@ -136,7 +136,8 @@ npm run vendor:verify    # vendored dependency provenance check
 - Global accounts: `~/.codex/multi-auth/openai-codex-accounts.json`.
 - Official Codex state: `~/.codex/auth.json`, `~/.codex/accounts.json`, `~/.codex/config.toml`.
 - Runtime observability: `~/.codex/multi-auth/runtime-observability.json`.
-- App helper status: `~/.codex/multi-auth/runtime-rotation-app-helper.json`.
+- App helper status: `~/.codex/multi-auth/runtime-rotation-app-helper.<pid>.json` (per helper; legacy un-suffixed file still read).
+- App helper owner identity: `~/.codex/multi-auth/runtime-rotation-app-helper-owner.<pid>.json` (per helper; removed on exit, swept once the helper PID is dead).
 - App bind state/logs: `~/.codex/multi-auth/app-bind/`.
 - Prompt templates sync from Codex CLI GitHub releases with ETag caching.
 - Historical audit evidence under `docs/audits/evidence/` is snapshot evidence, not current architecture guidance.

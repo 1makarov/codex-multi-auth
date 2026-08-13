@@ -220,7 +220,7 @@ Common operator overrides (aligned with [../configuration.md](../configuration.m
 - `CODEX_MULTI_AUTH_FORCE_ACCOUNT` — force one account for a single forwarded `codex-multi-auth-codex` run (selector: index/email/id); `--account` wins when both are set
 - `CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS`
 - `CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS` — absolute ceiling on a helper's life regardless of activity (default 24h; `0` disables)
-- `CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS` — idle window once the helper's launcher is gone and nothing is connected (default 15m; `0` keeps the full idle timeout)
+- `CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS` — idle window once the helper's launcher is confirmed gone, nothing is connected, and the helper has never served a request (default 15m; `0` keeps the full idle timeout)
 - `CODEX_MULTI_AUTH_APP_BIND_INSTALL`
 - `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL`
 - `CODEX_TUI_V2`

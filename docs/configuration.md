@@ -74,7 +74,7 @@ These are safe for most operators and frequently used in day-to-day workflows.
 | `CODEX_MULTI_AUTH_FORCE_ACCOUNT=<index\|email\|id>` | Force one account for a single forwarded `codex-multi-auth-codex` run (equivalent to the `--account` flag, which wins when both are set). Ephemeral and fail-hard; requires the runtime rotation proxy. See [Force an account for one invocation](reference/commands.md#force-an-account-for-one-invocation) |
 | `CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS=<ms>` | Override idle shutdown for the wrapper-launched Codex app helper |
 | `CODEX_MULTI_AUTH_APP_ROTATION_MAX_LIFETIME_MS=<ms>` | Absolute ceiling on a runtime helper's life regardless of activity (default 24h; `0` disables) |
-| `CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS=<ms>` | Idle window that applies once a helper's launcher is gone and nothing is connected (default 15m; `0` restores the full idle timeout) |
+| `CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS=<ms>` | Idle window that applies once a helper's launcher is gone, nothing is connected, and the helper has never served a request (default 15m; `0` restores the full idle timeout) |
 | `CODEX_MULTI_AUTH_APP_BIND=0/1` | Alias-style opt-out for first-run packaged Codex app bind (see also `CODEX_MULTI_AUTH_APP_BIND_INSTALL`) |
 | `CODEX_MULTI_AUTH_APP_BIND_INSTALL=0/1` | Opt out/in of packaged Codex app bind self-heal on first durable CLI run or rotation enable |
 | `CODEX_MULTI_AUTH_APP_LAUNCHER_INSTALL=0/1` | Opt out/in of supported user-level launcher routing on first durable CLI run or rotation enable |

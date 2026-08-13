@@ -554,10 +554,19 @@ function createPathDiscoveredNativeCodexFixture(rootDir: string): {
 	};
 }
 
+// The wrapper is published, so its fault injectors stay inert unless this
+// switch is set alongside the counter (#668). Every injection helper below
+// carries it, and `runWrapper` never sets it on its own — which is what lets
+// the "production ignores the counter" test simply omit it.
+const FAULT_INJECTION_ON = {
+	CODEX_MULTI_AUTH_TEST_FAULT_INJECTION: "1",
+} as const;
+
 function injectShadowCleanupBusyFailures(
 	failuresBeforeSuccess = 2,
 ): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_CLEANUP_BUSY_FAILURES: String(failuresBeforeSuccess),
 	};
 }
@@ -566,6 +575,7 @@ function injectShadowPreflightReadBusyFailures(
 	failuresBeforeSuccess = 2,
 ): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_PREFLIGHT_READ_BUSY_FAILURES: String(
 			failuresBeforeSuccess,
 		),
@@ -576,6 +586,7 @@ function injectShadowSyncMetadataBusyFailures(
 	failuresBeforeSuccess = 10,
 ): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_SYNC_METADATA_BUSY_FAILURES: String(
 			failuresBeforeSuccess,
 		),
@@ -584,6 +595,7 @@ function injectShadowSyncMetadataBusyFailures(
 
 function injectShadowLockRecreatedStaleCount(count = 2): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_LOCK_RECREATE_STALE_COUNT: String(count),
 	};
 }
@@ -592,6 +604,7 @@ function injectShadowLockOwnerWriteFailures(
 	failuresBeforeSuccess = 1,
 ): NodeJS.ProcessEnv {
 	return {
+		...FAULT_INJECTION_ON,
 		CODEX_MULTI_AUTH_TEST_SHADOW_LOCK_OWNER_WRITE_FAILURES: String(
 			failuresBeforeSuccess,
 		),
@@ -2818,6 +2831,7 @@ describe("codex bin wrapper", () => {
 			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "1000",
 			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
 			CODEX_MULTI_AUTH_TEST_FORCE_APP_SERVER_SHIM_COPY: "1",
+			...FAULT_INJECTION_ON,
 			CODEX_MULTI_AUTH_TEST_APP_SERVER_SHIM_FILE_CLEANUP_BUSY_FAILURES: "2",
 			CODEX_MULTI_AUTH_TEST_APP_SERVER_SHIM_COPY_BUSY_FAILURES: "2",
 			CODEX_MULTI_AUTH_TEST_PROXY_LAST_ACCOUNT_INDEX: "1",
@@ -3499,13 +3513,23 @@ describe("codex bin wrapper", () => {
 		},
 	);
 
-	// Connections are one kind of evidence; traffic is the other. A detached
-	// consumer that reconnects per request — no socket held between them —
-	// must keep its helper alive on the requests alone, and must lose it once
-	// the requests stop. Both halves in one run: the fixture's counter climbs
-	// for 1.2s and then freezes.
+	// The detached window reaps helpers that were *stranded*, never helpers that
+	// were handed off, and having served a request is the durable proof of a
+	// handoff. An open socket is not: the proxy leaves `keepAliveTimeout` at
+	// Node's 5s default, so a `codex app` session that is merely idle between
+	// turns holds no socket within seconds of its last turn. Reaping on the
+	// socket check alone would therefore kill the live proxy under a desktop app
+	// whose user simply stopped typing for the length of the detached window,
+	// and the next message would get ECONNREFUSED against a dead localhost port
+	// with nothing left to restart it.
+	//
+	// Every helper in the #663 report had `totalRequests: 0` — the leak is
+	// entirely a never-served phenomenon — so the narrower gate closes the leak
+	// without putting live sessions at risk. A served-then-abandoned helper falls
+	// back to the idle timeout and the lifetime ceiling, exactly as it did before
+	// the detached window existed.
 	it.skipIf(process.platform === "win32")(
-		"lets traffic after the owner's death carry a stranded helper, and reaps it once traffic stops",
+		"keeps a helper that has served traffic alive after its traffic stops",
 		async () => {
 			const fixtureRoot = createWrapperFixture();
 			createRuntimeRotationProxyFixtureModule(fixtureRoot);
@@ -3523,21 +3547,96 @@ describe("codex bin wrapper", () => {
 				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
 				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
 				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
-				CODEX_MULTI_AUTH_TEST_PROXY_REQUEST_RAMP_MS: "1200",
+				// Traffic climbs for 300ms and then freezes: one served request is
+				// all it takes, and the counter is frozen for many detached windows
+				// afterwards with no socket held.
+				CODEX_MULTI_AUTH_TEST_PROXY_REQUEST_RAMP_MS: "300",
 				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
 			});
 			try {
-				// Two detached windows into the ramp, traffic alone is holding it up.
-				await sleep(1_000);
+				// Several detached windows past the end of the ramp.
+				await sleep(2_500);
 				expect(isProcessAlive(ready.pid)).toBe(true);
-				// Traffic stops at 1.2s; the window then runs out with nothing
-				// connected and nothing arriving.
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("running");
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// The other half of the same rule: a helper whose owner is gone and which
+	// never served anything is a stray, and the detached window still takes it.
+	it.skipIf(process.platform === "win32")(
+		"still reaps a stranded helper that never served a request",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID: String(process.pid),
+				CODEX_MULTI_AUTH_APP_ROTATION_OWNER_START_TIME_MS: "12345",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
 				await Promise.race([closed, sleep(5_000)]);
 				expect(isProcessAlive(ready.pid)).toBe(false);
 				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
 					state: string;
 				};
 				expect(status.state).toBe("owner-gone");
+			} finally {
+				await stopDirectAppHelper(helper, closed);
+			}
+		},
+	);
+
+	// "No owner PID was recorded" and "the owner is confirmed dead" are different
+	// facts. Collapsing them into one falsy verdict started the detached clock on
+	// the first tick for anyone invoking the helper directly — the documented
+	// reproduction in #663 — or running one spawned by a pre-upgrade launcher
+	// that sets no owner PID, and reaped it silently.
+	it.skipIf(process.platform === "win32")(
+		"does not start the detached clock for a helper launched without an owner PID",
+		async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+
+			const { helper, ready, closed } = await spawnDirectAppHelper(fixtureRoot, {
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_REAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "60000",
+				CODEX_MULTI_AUTH_APP_ROTATION_DETACHED_IDLE_MS: "400",
+				// Deliberately no CODEX_MULTI_AUTH_APP_ROTATION_OWNER_PID.
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: join(fixtureRoot, "marker.txt"),
+			});
+			try {
+				// Many detached windows with no owner and no traffic: the idle
+				// timeout is the only clock that may apply, and it is 60s away.
+				await sleep(2_500);
+				expect(isProcessAlive(ready.pid)).toBe(true);
+				const status = JSON.parse(readFileSync(ready.statusPath, "utf8")) as {
+					state: string;
+				};
+				expect(status.state).toBe("running");
 			} finally {
 				await stopDirectAppHelper(helper, closed);
 			}
@@ -3783,6 +3882,7 @@ describe("codex bin wrapper", () => {
 			// the retry budget stays at three attempts or more. If that budget ever
 			// shrinks below three, this test fails and the sweep would silently
 			// leave stale metadata behind on transient Windows locks.
+			...FAULT_INJECTION_ON,
 			CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES: "2",
 			OPENAI_API_KEY: undefined,
 		});
@@ -3791,6 +3891,55 @@ describe("codex bin wrapper", () => {
 			expect(existsSync(path)).toBe(false);
 		}
 	});
+
+	// `package.json` publishes `scripts/codex.js`, so this injector runs in every
+	// user's install. Two things keep it inert there: the counter does nothing
+	// without an explicit opt-in switch, and the value is parsed strictly —
+	// `Number.parseInt` reads "2abc" as 2 and "1e3" as 1, which is how a value
+	// that was never meant to be a count arms a fault injector (#668). Either
+	// leak would silently defeat the first N metadata deletions of every sweep,
+	// which is the exact accumulation the sweep exists to prevent.
+	it.each([
+		["without the opt-in switch", { CODEX_MULTI_AUTH_TEST_FAULT_INJECTION: undefined }],
+		["with a non-numeric counter", { ...FAULT_INJECTION_ON }],
+	] as const)(
+		"ignores the metadata-cleanup fault injector %s",
+		async (label, gateEnv) => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const multiAuthDir = join(fixtureRoot, "multi-auth");
+			mkdirSync(originalHome, { recursive: true });
+			mkdirSync(multiAuthDir, { recursive: true });
+			writeFileSync(join(originalHome, "config.toml"), 'model_provider = "openai"\n', "utf8");
+			const staleStatusPath = join(
+				multiAuthDir,
+				"runtime-rotation-app-helper.99999996.json",
+			);
+			writeFileSync(staleStatusPath, '{"pid":99999996,"state":"running"}\n', "utf8");
+
+			// A counter big enough to exhaust the retry budget several times over,
+			// so if it were ever honoured the sweep could not recover.
+			const result = runWrapper(fixtureRoot, ["app", "."], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_DIR: multiAuthDir,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "250",
+				...gateEnv,
+				CODEX_MULTI_AUTH_TEST_HELPER_METADATA_CLEANUP_BUSY_FAILURES:
+					label === "with a non-numeric counter" ? "99abc" : "99",
+				OPENAI_API_KEY: undefined,
+			});
+
+			expect(result.status).toBe(0);
+			expect(existsSync(staleStatusPath)).toBe(false);
+		},
+	);
 
 	// Owner files have no post-mortem value and go with the helper; stale
 	// per-PID metadata from killed helpers — and a legacy shared status file

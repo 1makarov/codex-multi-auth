@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
+import { createHash } from "node:crypto";
 import {
 	createState,
 	parseAuthorizationInput,
@@ -214,6 +215,14 @@ describe("Auth Module", () => {
 
 			expect(flow.pkce).toHaveProperty("challenge");
 			expect(flow.pkce).toHaveProperty("verifier");
+			expect(flow.pkce.verifier.length).toBeGreaterThanOrEqual(43);
+			expect(flow.pkce.verifier.length).toBeLessThanOrEqual(128);
+			expect(flow.pkce.verifier).toMatch(/^[A-Za-z0-9_-]+$/);
+			expect(flow.pkce.challenge).toBe(
+				createHash("sha256")
+					.update(flow.pkce.verifier)
+					.digest("base64url"),
+			);
 			expect(flow.state).toMatch(/^[a-f0-9]{32}$/);
 		});
 

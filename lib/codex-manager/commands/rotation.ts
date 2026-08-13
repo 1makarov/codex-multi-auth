@@ -45,6 +45,12 @@ import {
 	resolveAccountCurrentMarkers,
 	resolveRuntimeCurrentAccount,
 } from "../../runtime/runtime-current-account.js";
+import {
+	isLiveRuntimeHelper,
+	liveRuntimeHelpers,
+	readRuntimeHelperPid,
+	selectRuntimeHelperStatus,
+} from "../../runtime/app-helper-selection.js";
 import { isRateLimitedMarker } from "../rate-limit-markers.js";
 import type { PluginConfig } from "../../types.js";
 import type { AccountMetadataV3, AccountStorageV3 } from "../../storage.js";
@@ -56,6 +62,9 @@ interface AppRuntimeHelperStatus {
 	kind: string | null;
 	state: string | null;
 	pid: number | null;
+	// Parsed so liveness can be identity-checked rather than trusting
+	// `kill(pid, 0)` alone; see app-helper-selection.ts.
+	startedAt: number | null;
 	idleExpiresAt: number | null;
 	totalRequests: number | null;
 	rotations: number | null;
@@ -530,7 +539,8 @@ function readAppRuntimeHelperStatusFile(
 		return {
 			state: readOptionalString(parsed, "state"),
 			kind: readOptionalString(parsed, "kind"),
-			pid: readOptionalNumber(parsed, "pid"),
+			pid: readRuntimeHelperPid(parsed.pid),
+			startedAt: readOptionalNumber(parsed, "startedAt"),
 			idleExpiresAt: readOptionalNumber(parsed, "idleExpiresAt"),
 			totalRequests: readOptionalNumber(parsed, "totalRequests"),
 			rotations: readOptionalNumber(parsed, "rotations"),
@@ -565,41 +575,10 @@ function readAppRuntimeHelperStatuses(): AppRuntimeHelperStatus[] {
 		);
 }
 
-function liveAppRuntimeHelpers(
-	statuses: AppRuntimeHelperStatus[],
-): AppRuntimeHelperStatus[] {
-	return statuses.filter(
-		(status) => status.state === "running" && isProcessAlive(status.pid),
-	);
-}
-
-function selectAppRuntimeHelperStatus(
-	statuses: AppRuntimeHelperStatus[],
+function readAppRuntimeHelperStatus(
+	now: number = Date.now(),
 ): AppRuntimeHelperStatus | null {
-	if (statuses.length === 0) return null;
-	const byRecency = (
-		left: AppRuntimeHelperStatus,
-		right: AppRuntimeHelperStatus,
-	) => (right.updatedAt ?? 0) - (left.updatedAt ?? 0);
-	const live = liveAppRuntimeHelpers(statuses).sort(byRecency);
-	if (live.length > 0) return live[0] ?? null;
-	return [...statuses].sort(byRecency)[0] ?? null;
-}
-
-function readAppRuntimeHelperStatus(): AppRuntimeHelperStatus | null {
-	return selectAppRuntimeHelperStatus(readAppRuntimeHelperStatuses());
-}
-
-function isProcessAlive(pid: number | null): boolean {
-	if (!pid) return false;
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		const code =
-			error && typeof error === "object" && "code" in error ? error.code : null;
-		return code === "EPERM";
-	}
+	return selectRuntimeHelperStatus(readAppRuntimeHelperStatuses(), now);
 }
 
 function formatHelperLastAccount(status: AppRuntimeHelperStatus): string | null {
@@ -619,20 +598,20 @@ function formatHelperLastAccount(status: AppRuntimeHelperStatus): string | null 
 
 function formatAppRuntimeHelperStatus(
 	now: number,
-	status = readAppRuntimeHelperStatus(),
+	status = readAppRuntimeHelperStatus(now),
 	liveHelperCount = status ? 1 : 0,
 ): string {
 	if (!status) return "Codex app helper: not running";
 	if (status.kind !== "codex-app-runtime-rotation-helper") {
 		return "Codex app helper: not running";
 	}
-	const alive = isProcessAlive(status.pid);
 	// Only "running" is running: "stopped", "idle-timeout", "max-lifetime",
 	// "owner-gone", "error", and anything a future helper invents are all
 	// terminal, and a live kill(pid, 0) on a terminal record proves nothing —
 	// the PID may be recycled, which is the exact gate this fix stopped
-	// trusting.
-	if (!alive || status.state !== "running") {
+	// trusting. `isLiveRuntimeHelper` folds both conditions together, and is
+	// the same predicate the selection above and the account marker below use.
+	if (!isLiveRuntimeHelper(status, now)) {
 		return "Codex app helper: not running";
 	}
 	const parts = [`running${status.pid ? ` pid=${status.pid}` : ""}`];
@@ -703,14 +682,17 @@ async function printRotationStatus(deps: RotationCommandDeps): Promise<number> {
 		`Stored setting: ${config.codexRuntimeRotationProxy === true ? "enabled" : "disabled"}`,
 	);
 	logInfo(`Env override: ${formatEnvOverride()}`);
-	// One scan feeds both the selected helper and the live count, so the line
-	// cannot pair one instant's helper with another instant's count.
+	// One scan and one selection feed the status line, the live count and the
+	// account marker below. Selecting twice re-ran the liveness probes at a
+	// later instant, so the helper named on the line and the helper whose
+	// account is marked `current` could be different processes (#667).
 	const helperStatuses = readAppRuntimeHelperStatuses();
+	const selectedHelperStatus = selectRuntimeHelperStatus(helperStatuses, now);
 	logInfo(
 		formatAppRuntimeHelperStatus(
 			now,
-			selectAppRuntimeHelperStatus(helperStatuses),
-			liveAppRuntimeHelpers(helperStatuses).length,
+			selectedHelperStatus,
+			liveRuntimeHelpers(helperStatuses, now).length,
 		),
 	);
 	const appBindStatus = await printCodexAppBindStatus(deps);
@@ -736,7 +718,8 @@ async function printRotationStatus(deps: RotationCommandDeps): Promise<number> {
 			runtimeSnapshot,
 			appBindStatus: appBindStatus?.running ? appBindStatus.router : null,
 			appHelperStatus: appRuntimeHelperStatusToRuntimeSignal(
-				selectAppRuntimeHelperStatus(helperStatuses),
+				selectedHelperStatus,
+				now,
 			),
 		},
 		{ now },

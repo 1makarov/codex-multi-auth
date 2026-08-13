@@ -9,6 +9,7 @@ import type { AppBindResult, AppBindStatus } from "../lib/runtime/app-bind.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 import type { PluginConfig } from "../lib/types.js";
 import { withFileOperationRetry } from "../scripts/install-codex-auth-utils.js";
+import { withDeadPid, withLivePid } from "./helpers/owned-pids.js";
 
 const originalRuntimeRotationProxyEnv =
 	process.env.CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY;
@@ -454,53 +455,65 @@ describe("codex-multi-auth rotation command", () => {
 		// A live per-PID helper (this test's own PID is alive), a second live
 		// helper record on the legacy shared path, and a dead per-PID record
 		// that must count for nothing.
-		await writeFile(
-			join(root, `runtime-rotation-app-helper.${process.pid}.json`),
-			`${JSON.stringify({
-				version: 1,
-				kind: "codex-app-runtime-rotation-helper",
-				state: "running",
-				pid: process.pid,
-				totalRequests: 7,
-				rotations: 2,
-				idleExpiresAt: now + 60_000,
-				updatedAt: now,
-			})}\n`,
-			"utf8",
-		);
-		await writeFile(
-			join(root, "runtime-rotation-app-helper.json"),
-			`${JSON.stringify({
-				version: 1,
-				kind: "codex-app-runtime-rotation-helper",
-				state: "running",
-				pid: process.ppid,
-				totalRequests: 1,
-				rotations: 0,
-				updatedAt: now - 5_000,
-			})}\n`,
-			"utf8",
-		);
-		await writeFile(
-			join(root, "runtime-rotation-app-helper.99999999.json"),
-			`${JSON.stringify({
-				version: 1,
-				kind: "codex-app-runtime-rotation-helper",
-				state: "running",
-				pid: 99999999,
-				updatedAt: now,
-			})}\n`,
-			"utf8",
-		);
-		const { deps, infos } = createDeps({ storage: null });
+		//
+		// Both the second live PID and the dead PID belong to processes this test
+		// owns. The second one used to be `process.ppid` — the vitest pool
+		// process, which the test neither controls nor keeps alive, so whether
+		// the count read `(+1 more running)` or `(+0 more running)` depended on
+		// the pool implementation and on that process surviving the run (#668).
+		await withLivePid(async (secondLivePid) => {
+			await withDeadPid(async (deadPid) => {
+				await writeFile(
+					join(root, `runtime-rotation-app-helper.${process.pid}.json`),
+					`${JSON.stringify({
+						version: 1,
+						kind: "codex-app-runtime-rotation-helper",
+						state: "running",
+						pid: process.pid,
+						totalRequests: 7,
+						rotations: 2,
+						idleExpiresAt: now + 60_000,
+						updatedAt: now,
+					})}\n`,
+					"utf8",
+				);
+				await writeFile(
+					join(root, "runtime-rotation-app-helper.json"),
+					`${JSON.stringify({
+						version: 1,
+						kind: "codex-app-runtime-rotation-helper",
+						state: "running",
+						pid: secondLivePid,
+						totalRequests: 1,
+						rotations: 0,
+						updatedAt: now - 5_000,
+					})}\n`,
+					"utf8",
+				);
+				await writeFile(
+					join(root, `runtime-rotation-app-helper.${deadPid}.json`),
+					`${JSON.stringify({
+						version: 1,
+						kind: "codex-app-runtime-rotation-helper",
+						state: "running",
+						pid: deadPid,
+						updatedAt: now,
+					})}\n`,
+					"utf8",
+				);
+				const { deps, infos } = createDeps({ storage: null });
 
-		await expect(runRotationCommand(["status"], deps)).resolves.toBe(0);
+				await expect(runRotationCommand(["status"], deps)).resolves.toBe(0);
 
-		const output = infos.join("\n");
-		// Newest live helper wins the line; the dead PID is not counted.
-		expect(output).toContain(`Codex app helper: running pid=${process.pid}`);
-		expect(output).toContain("requests=7");
-		expect(output).toContain("(+1 more running)");
+				const output = infos.join("\n");
+				// Newest live helper wins the line; the dead PID is not counted.
+				expect(output).toContain(
+					`Codex app helper: running pid=${process.pid}`,
+				);
+				expect(output).toContain("requests=7");
+				expect(output).toContain("(+1 more running)");
+			});
+		});
 	});
 
 	it("treats a max-lifetime helper record as not running even when its PID is alive", async () => {

@@ -90,24 +90,28 @@ export async function withDeadPids<T>(
 	count: number,
 	run: (pids: number[]) => Promise<T> | T,
 ): Promise<T> {
-	const children = Array.from({ length: count }, () => spawnIdleChild());
-	const pids = children.map((child) => child.pid);
-	if (pids.some((pid) => pid === undefined)) {
+	// Spawned and reaped in batches rather than all at once. The stress fixtures
+	// ask for hundreds, and launching that many processes simultaneously can hit
+	// a process-table or fd limit and fail the spawn — which would surface as a
+	// fixture error indistinguishable from the bug under test. Batching keeps the
+	// instantaneous footprint small while still yielding `count` distinct PIDs.
+	const batchSize = 32;
+	const deadPids: number[] = [];
+	for (let offset = 0; offset < count; offset += batchSize) {
+		const size = Math.min(batchSize, count - offset);
+		const children = Array.from({ length: size }, () => spawnIdleChild());
+		const pids = children.map((child) => child.pid);
 		await Promise.all(
 			children.map(async (child) => {
 				child.kill("SIGKILL");
 				await waitForExit(child);
 			}),
 		);
-		throw new Error("failed to spawn a probe process");
+		if (pids.some((pid) => pid === undefined)) {
+			throw new Error("failed to spawn a probe process");
+		}
+		deadPids.push(...(pids as number[]));
 	}
-	await Promise.all(
-		children.map(async (child) => {
-			child.kill("SIGKILL");
-			await waitForExit(child);
-		}),
-	);
-	const deadPids = pids as number[];
 	const recycled = deadPids.filter((pid) => isPidAlive(pid));
 	if (recycled.length > 0) {
 		throw new Error(

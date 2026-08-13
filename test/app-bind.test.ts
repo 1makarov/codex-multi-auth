@@ -21,6 +21,7 @@ import {
 } from "../lib/runtime/app-bind.js";
 import { tomlStringLiteral } from "../lib/runtime/config-toml.js";
 import { withFileOperationRetry } from "../lib/fs-retry.js";
+import { withDeadPid, withLivePid } from "./helpers/owned-pids.js";
 import {
 	APP_RUNTIME_HELPER_OWNER_FILE,
 	APP_RUNTIME_HELPER_STATUS_FILE,
@@ -1109,25 +1110,32 @@ describe("Codex app runtime rotation bind", () => {
 			CODEX_MULTI_AUTH_DIR: join(root, "multi-auth"),
 			CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME: join(root, "codex-home"),
 		};
-		const statusPath = await writeRuntimeHelperStatus(
-			{ home: root, env },
-			{
-				version: 1,
-				kind: "codex-app-runtime-rotation-helper",
-				state: "running",
-				pid: 2_147_483_647,
-				startedAt: Date.now(),
-				scriptPath: join(root, "runtime-helper.mjs"),
-			},
-		);
+		// A PID this test started and killed, rather than an integer above the
+		// platform's PID ceiling. Out-of-range PIDs classify as dead only because
+		// every liveness check here treats every errno but EPERM as dead — true
+		// today, but a property the fixture never stated and does not control
+		// (#668). "Has already exited" should be a fact.
+		await withDeadPid(async (deadPid) => {
+			const statusPath = await writeRuntimeHelperStatus(
+				{ home: root, env },
+				{
+					version: 1,
+					kind: "codex-app-runtime-rotation-helper",
+					state: "running",
+					pid: deadPid,
+					startedAt: Date.now(),
+					scriptPath: join(root, "runtime-helper.mjs"),
+				},
+			);
 
-		await unbindCodexAppRuntimeRotation({
-			platform: process.platform,
-			home: root,
-			env,
+			await unbindCodexAppRuntimeRotation({
+				platform: process.platform,
+				home: root,
+				env,
+			});
+
+			expect(existsSync(statusPath)).toBe(false);
 		});
-
-		expect(existsSync(statusPath)).toBe(false);
 	});
 
 	it("removes dead helpers recorded in per-PID status files on unbind", async () => {
@@ -1140,29 +1148,30 @@ describe("Codex app runtime rotation bind", () => {
 			CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME: join(root, "codex-home"),
 		};
 		const legacyPath = resolveRuntimeHelperStatusPath({ home: root, env });
-		const deadPid = 2_147_483_646;
-		const perPidPath = legacyPath.replace(/\.json$/i, `.${deadPid}.json`);
-		await mkdir(dirname(perPidPath), { recursive: true });
-		await writeFile(
-			perPidPath,
-			`${JSON.stringify({
-				version: 1,
-				kind: "codex-app-runtime-rotation-helper",
-				state: "running",
-				pid: deadPid,
-				startedAt: Date.now(),
-				scriptPath: join(root, "runtime-helper.mjs"),
-			})}\n`,
-			"utf8",
-		);
+		await withDeadPid(async (deadPid) => {
+			const perPidPath = legacyPath.replace(/\.json$/i, `.${deadPid}.json`);
+			await mkdir(dirname(perPidPath), { recursive: true });
+			await writeFile(
+				perPidPath,
+				`${JSON.stringify({
+					version: 1,
+					kind: "codex-app-runtime-rotation-helper",
+					state: "running",
+					pid: deadPid,
+					startedAt: Date.now(),
+					scriptPath: join(root, "runtime-helper.mjs"),
+				})}\n`,
+				"utf8",
+			);
 
-		await unbindCodexAppRuntimeRotation({
-			platform: process.platform,
-			home: root,
-			env,
+			await unbindCodexAppRuntimeRotation({
+				platform: process.platform,
+				home: root,
+				env,
+			});
+
+			expect(existsSync(perPidPath)).toBe(false);
 		});
-
-		expect(existsSync(perPidPath)).toBe(false);
 	});
 
 	it("removes every dead helper record — per-PID and legacy — in one unbind", async () => {
@@ -1184,41 +1193,153 @@ describe("Codex app runtime rotation bind", () => {
 				startedAt: Date.now(),
 				scriptPath: join(root, "runtime-helper.mjs"),
 			})}\n`;
-		const deadPids = [2_147_483_646, 2_147_483_645];
-		const perPidPaths = deadPids.map((pid) =>
-			legacyPath.replace(/\.json$/i, `.${pid}.json`),
-		);
-		for (const [index, path] of perPidPaths.entries()) {
-			await writeFile(path, record(deadPids[index] ?? 0), "utf8");
-		}
-		await writeFile(legacyPath, record(2_147_483_644), "utf8");
-		// An owner file beside a dead per-PID record goes with it.
-		const ownerPath = join(
-			dirname(legacyPath),
-			`runtime-rotation-app-helper-owner.${deadPids[0]}.json`,
-		);
-		await writeFile(
-			ownerPath,
-			`${JSON.stringify({
-				version: 1,
-				kind: "codex-app-runtime-rotation-helper-owner",
-				identityToken: "does-not-matter-for-dead-pid",
-				launcherPid: 1,
-				createdAt: Date.now(),
-			})}\n`,
-			"utf8",
-		);
+		await withDeadPid(async (firstDeadPid) => {
+			await withDeadPid(async (secondDeadPid) => {
+				await withDeadPid(async (legacyDeadPid) => {
+					const deadPids = [firstDeadPid, secondDeadPid];
+					const perPidPaths = deadPids.map((pid) =>
+						legacyPath.replace(/\.json$/i, `.${pid}.json`),
+					);
+					for (const [index, path] of perPidPaths.entries()) {
+						await writeFile(path, record(deadPids[index] ?? 0), "utf8");
+					}
+					await writeFile(legacyPath, record(legacyDeadPid), "utf8");
+					// An owner file beside a dead per-PID record goes with it — and
+					// its identity token deliberately disagrees with the status
+					// record's, because a dead PID means neither file describes
+					// anything that can still be running (#666). Gating this removal
+					// on token agreement is what stranded owner files forever.
+					const ownerPath = resolveRuntimeHelperOwnerPath(
+						{ home: root, env },
+						firstDeadPid,
+					);
+					await writeFile(
+						ownerPath,
+						`${JSON.stringify({
+							version: 1,
+							kind: "codex-app-runtime-rotation-helper-owner",
+							identityToken: "does-not-matter-for-dead-pid",
+							launcherPid: 1,
+							createdAt: Date.now(),
+						})}\n`,
+						"utf8",
+					);
 
-		await unbindCodexAppRuntimeRotation({
-			platform: process.platform,
-			home: root,
-			env,
+					await unbindCodexAppRuntimeRotation({
+						platform: process.platform,
+						home: root,
+						env,
+					});
+
+					for (const path of [...perPidPaths, legacyPath]) {
+						expect(existsSync(path)).toBe(false);
+					}
+					expect(existsSync(ownerPath)).toBe(false);
+				});
+			});
 		});
+	});
 
-		for (const path of [...perPidPaths, legacyPath]) {
-			expect(existsSync(path)).toBe(false);
-		}
-		expect(existsSync(ownerPath)).toBe(false);
+	it("removes both files when a dead helper's status and owner tokens disagree", async () => {
+		// #666: the dead-PID branch removed the status file but gated the owner
+		// file on `helperOwnershipMatches`. A token mismatch therefore deleted the
+		// status record and kept `runtime-rotation-app-helper-owner.<pid>.json` —
+		// and because unbind then enumerated status paths only, nothing ever
+		// rediscovered that owner file again.
+		const root = await createTempRoot("codex-app-bind-helper-mismatch-");
+		const env = {
+			CODEX_MULTI_AUTH_DIR: join(root, "multi-auth"),
+			CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME: join(root, "codex-home"),
+		};
+		const legacyPath = resolveRuntimeHelperStatusPath({ home: root, env });
+		await mkdir(dirname(legacyPath), { recursive: true });
+		await withDeadPid(async (deadPid) => {
+			const perPidPath = legacyPath.replace(/\.json$/i, `.${deadPid}.json`);
+			await writeFile(
+				perPidPath,
+				`${JSON.stringify({
+					version: 1,
+					kind: "codex-app-runtime-rotation-helper",
+					state: "running",
+					pid: deadPid,
+					startedAt: Date.now(),
+					scriptPath: join(root, "runtime-helper.mjs"),
+					identityToken: "token-from-the-status-file",
+				})}\n`,
+				"utf8",
+			);
+			const ownerPath = resolveRuntimeHelperOwnerPath(
+				{ home: root, env },
+				deadPid,
+			);
+			await writeFile(
+				ownerPath,
+				`${JSON.stringify({
+					version: 1,
+					kind: "codex-app-runtime-rotation-helper-owner",
+					identityToken: "a-different-token-entirely",
+					launcherPid: 1,
+					createdAt: Date.now(),
+				})}\n`,
+				"utf8",
+			);
+
+			await unbindCodexAppRuntimeRotation({
+				platform: process.platform,
+				home: root,
+				env,
+			});
+
+			expect(existsSync(perPidPath)).toBe(false);
+			expect(existsSync(ownerPath)).toBe(false);
+		});
+	});
+
+	it("reclaims an orphaned owner file that has no status record left", async () => {
+		// #666: the accumulation this fixes. An owner file whose status file is
+		// already gone was unreachable — every pass walked status paths only — so
+		// on a machine that stopped launching helpers it stayed under the
+		// multi-auth root forever. Enumerating owner files is what reclaims it.
+		const root = await createTempRoot("codex-app-bind-helper-orphan-");
+		const env = {
+			CODEX_MULTI_AUTH_DIR: join(root, "multi-auth"),
+			CODEX_MULTI_AUTH_APP_BIND_CODEX_HOME: join(root, "codex-home"),
+		};
+		const legacyPath = resolveRuntimeHelperStatusPath({ home: root, env });
+		await mkdir(dirname(legacyPath), { recursive: true });
+		await withDeadPid(async (deadPid) => {
+			await withLivePid(async (livePid) => {
+				const orphanOwnerPath = resolveRuntimeHelperOwnerPath(
+					{ home: root, env },
+					deadPid,
+				);
+				const ownerContent = (pid: number) =>
+					`${JSON.stringify({
+						version: 1,
+						kind: "codex-app-runtime-rotation-helper-owner",
+						identityToken: `token-${pid}`,
+						launcherPid: 1,
+						createdAt: Date.now(),
+					})}\n`;
+				await writeFile(orphanOwnerPath, ownerContent(deadPid), "utf8");
+				// A live helper's owner file is not an orphan and must survive, even
+				// though it too has no status record in this fixture.
+				const liveOwnerPath = resolveRuntimeHelperOwnerPath(
+					{ home: root, env },
+					livePid,
+				);
+				await writeFile(liveOwnerPath, ownerContent(livePid), "utf8");
+
+				await unbindCodexAppRuntimeRotation({
+					platform: process.platform,
+					home: root,
+					env,
+				});
+
+				expect(existsSync(orphanOwnerPath)).toBe(false);
+				expect(existsSync(liveOwnerPath)).toBe(true);
+			});
+		});
 	});
 
 	it("preserves a running per-PID helper whose ownership cannot be verified", async () => {

@@ -1585,13 +1585,26 @@ async function handleRequestInner(
 			// recovery — and with several overlapping records the account stays
 			// skipped until the LAST one expires, so the latest bound is the one
 			// worth advertising.
-			const pinnedResetAtMs =
+			const pinnedStateRecoveryAtMs =
 				pinnedAccount === null
 					? null
 					: getAccountRecoveryTimeForFamily(
 							pinnedAccount,
 							state.now(),
 							context.family,
+						);
+			// An open circuit outlives the short failure cooldowns that tripped
+			// it; its deadline lives in the breaker, not the account record.
+			const pinnedCircuitRecoveryAtMs =
+				pinnedAccount === null
+					? null
+					: accountManager.getCircuitRecoveryTime(pinnedAccount, state.now());
+			const pinnedResetAtMs =
+				pinnedStateRecoveryAtMs === null && pinnedCircuitRecoveryAtMs === null
+					? null
+					: Math.max(
+							pinnedStateRecoveryAtMs ?? 0,
+							pinnedCircuitRecoveryAtMs ?? 0,
 						);
 			const errorBody = buildPinnedUnavailableErrorBody(
 				pinnedIndex,

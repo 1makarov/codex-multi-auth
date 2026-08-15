@@ -387,6 +387,84 @@ describe("forecast helpers", () => {
 		expect(result.reasons).toContain("runtime skip: rate-limited");
 	});
 
+	it("gates availability on the requested family's record, not the codex family", () => {
+		const now = 1_700_000_000_000;
+		const account = {
+			refreshToken: "refresh-1",
+			addedAt: now - 10_000,
+			lastUsed: now - 10_000,
+			rateLimitResetTimes: { "gpt-5.2": now + 30_000 },
+		};
+
+		const general = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account,
+			family: "gpt-5.2",
+		});
+		expect(general.availability).toBe("delayed");
+		expect(general.waitMs).toBe(30_000);
+		expect(
+			general.reasons.some((reason) => reason.startsWith("rate limit resets in")),
+		).toBe(true);
+
+		const codex = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account,
+			family: "codex",
+		});
+		expect(codex.availability).toBe("ready");
+	});
+
+	it("keeps a rate-limited overlay alive when the record matches the requested family", () => {
+		const now = 1_700_000_000_000;
+		const result = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account: {
+				refreshToken: "refresh-1",
+				addedAt: now - 10_000,
+				lastUsed: now - 10_000,
+				rateLimitResetTimes: { "gpt-5.2": now + 30_000 },
+			},
+			runtimeOverlay: {
+				lastPoolExhaustionSkipReasons: { "0": "rate-limited" },
+			},
+			family: "gpt-5.2",
+		});
+
+		// Before family threading this overlay was cross-checked against the
+		// codex family, judged stale, and dropped - the account read "ready"
+		// while the runtime proxy refused every request for the family.
+		expect(result.availability).toBe("unavailable");
+		expect(result.reasons).toContain("runtime skip: rate-limited");
+	});
+
+	it("drops a rate-limited overlay backed only by another family's record", () => {
+		const now = 1_700_000_000_000;
+		const result = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account: {
+				refreshToken: "refresh-1",
+				addedAt: now - 10_000,
+				lastUsed: now - 10_000,
+				rateLimitResetTimes: { "gpt-5.2": now + 30_000 },
+			},
+			runtimeOverlay: {
+				lastPoolExhaustionSkipReasons: { "0": "rate-limited" },
+			},
+			family: "codex",
+		});
+
+		expect(result.availability).toBe("ready");
+	});
+
 	it("ignores a stale cooling-down overlay when cooldown has elapsed on disk", () => {
 		const now = 1_700_000_000_000;
 		const result = evaluateForecastAccount({

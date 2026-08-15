@@ -10,6 +10,7 @@ import {
 	isQuotaCacheEntryExhausted,
 	quotaUsedPercentIsExhausted,
 } from "./quota-readiness.js";
+import type { ModelFamily } from "./request/helpers/model-map.js";
 import { getRateLimitResetTimeForFamily } from "./runtime/account-status.js";
 import type { AccountMetadataV3 } from "./storage.js";
 import type { TokenFailure } from "./types.js";
@@ -27,6 +28,12 @@ export interface ForecastAccountInput {
 	quotaCache?: QuotaCacheData | null;
 	allAccounts?: readonly AccountMetadataV3[];
 	runtimeOverlay?: RuntimeForecastOverlay | null;
+	/**
+	 * Prompt family whose per-family rate-limit records gate this forecast.
+	 * Callers with a model in hand resolve it via getModelProfile; the codex
+	 * default preserves the historical behavior for model-less surfaces.
+	 */
+	family?: ModelFamily;
 }
 
 export interface RuntimeForecastOverlay {
@@ -245,7 +252,7 @@ export function evaluateForecastAccount(
 	const rateLimitResetAt = getRateLimitResetTimeForFamily(
 		account,
 		now,
-		"codex",
+		input.family ?? "codex",
 	);
 	if (typeof rateLimitResetAt === "number") {
 		const remaining = Math.max(0, rateLimitResetAt - now);
@@ -298,7 +305,10 @@ export function evaluateForecastAccount(
 	// drop the overlay reason when the condition it describes is no longer
 	// active. Each reason validates only against its own backing disk state
 	// ("rate-limited" -> rateLimitResetTimes, "cooling-down" -> coolingDownUntil)
-	// so we never substitute a misleading reason string. Non-time-bounded
+	// so we never substitute a misleading reason string. The rate-limited
+	// cross-check is family-aware through rateLimitResetAt above: a record for
+	// the forecast's own family keeps the reason, while a record for another
+	// family neither sustains it nor gates this model's availability. Non-time-bounded
 	// reasons ("circuit-open", "token-exhausted", "policy-blocked") have no disk
 	// expiry to check and are always applied.
 	const coolingDownActive =

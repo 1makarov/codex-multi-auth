@@ -474,6 +474,7 @@ export async function runReportCommand(
 					quotaCache,
 					allAccounts: storage.accounts,
 					runtimeOverlay: runtimeSnapshot,
+					family: getModelProfile(modelInspection.normalized).promptFamily,
 				})),
 			)
 		: [];

@@ -1,6 +1,9 @@
 import type { ForecastAccountResult } from "../../forecast.js";
 import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
-import { resolveNormalizedModel } from "../../request/helpers/model-map.js";
+import {
+	getModelProfile,
+	resolveNormalizedModel,
+} from "../../request/helpers/model-map.js";
 import type { AccountStorageV3 } from "../../storage.js";
 import type { TokenFailure, TokenResult } from "../../types.js";
 import { DEFAULT_LIVE_PROBE_MODEL } from "../quota-cache-helpers.js";
@@ -289,6 +292,7 @@ export async function runBestCommand(
 		now,
 		refreshFailure: refreshFailures.get(index),
 		liveQuota: liveQuotaByIndex.get(index),
+		family: getModelProfile(probeModel).promptFamily,
 	}));
 	const forecastResults = deps.evaluateForecastAccounts(forecastInputs);
 	const recommendation = deps.recommendForecastAccount(forecastResults);

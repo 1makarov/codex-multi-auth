@@ -14,7 +14,11 @@ import {
 } from "../forecast-report-shared.js";
 import type { QuotaCacheData } from "../../quota-cache.js";
 import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
-import { DEFAULT_PROBE_MODEL, resolveNormalizedModel } from "../../request/helpers/model-map.js";
+import {
+	DEFAULT_PROBE_MODEL,
+	getModelProfile,
+	resolveNormalizedModel,
+} from "../../request/helpers/model-map.js";
 import { type AccountMetadataV3, type AccountStorageV3 } from "../../storage.js";
 import type { TokenFailure, TokenResult } from "../../types.js";
 
@@ -368,6 +372,7 @@ export async function runForecastCommand(
 		quotaCache,
 		allAccounts: storage.accounts,
 		runtimeOverlay,
+		family: getModelProfile(requestedModel).promptFamily,
 	}));
 	const forecastResults = deps.evaluateForecastAccounts(forecastInputs);
 	const summary = deps.summarizeForecast(forecastResults);

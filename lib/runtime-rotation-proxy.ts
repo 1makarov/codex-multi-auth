@@ -72,6 +72,7 @@ import {
 	responseHeadersForClient,
 	withTimeout,
 } from "./request/stream-failover-runtime.js";
+import { getRateLimitResetTimeForFamily } from "./runtime/account-status.js";
 import { chooseAccount } from "./runtime/rotation-account-selection.js";
 import {
 	createRotationProxyState,
@@ -1573,9 +1574,40 @@ async function handleRequestInner(
 		// null reason indicates a forecast/runtime state desync (the pinned
 		// account was selected but no skip reason was recorded) — see #486.
 		if (isPinned) {
+			const pinnedAccount =
+				typeof pinnedIndex === "number"
+					? accountManager.getAccountByIndex(pinnedIndex)
+					: null;
+			const pinnedSkipReason =
+				typeof pinnedIndex === "number"
+					? accountSkipReasons.get(pinnedIndex) ?? null
+					: null;
+			// A rate-limited skip is bounded by the family record and a cooldown
+			// by coolingDownUntil; anything else has no known recovery moment.
+			const pinnedResetAtMs =
+				pinnedAccount === null || pinnedSkipReason === null
+					? null
+					: pinnedSkipReason === "rate-limited"
+						? getRateLimitResetTimeForFamily(
+								pinnedAccount,
+								state.now(),
+								context.family,
+							)
+						: pinnedSkipReason.startsWith("cooling-down") &&
+								typeof pinnedAccount.coolingDownUntil === "number" &&
+								pinnedAccount.coolingDownUntil > state.now()
+							? pinnedAccount.coolingDownUntil
+							: null;
 			const errorBody = buildPinnedUnavailableErrorBody(
 				pinnedIndex,
 				accountSkipReasons,
+				{
+					// typeof check so a forced index of 0 still reads as forced.
+					pinSource:
+						typeof state.forcedAccountIndex === "number" ? "forced" : "manual",
+					resetAtMs: pinnedResetAtMs,
+					now: state.now(),
+				},
 			);
 			if (errorBody.reason === null) {
 				state.status.lastError = `pinned-503 missing skip reason (pinnedIndex=${pinnedIndex})`;

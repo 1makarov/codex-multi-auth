@@ -1592,6 +1592,7 @@ async function handleRequestInner(
 							pinnedAccount,
 							state.now(),
 							context.family,
+							context.model,
 						);
 			// An open circuit outlives the short failure cooldowns that tripped
 			// it; its deadline lives in the breaker, not the account record.

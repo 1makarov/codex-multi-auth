@@ -39,12 +39,16 @@ export function getRateLimitResetTimeForFamily(
 }
 
 /**
- * The moment the account becomes usable again for `family`: the LATEST
- * matching rate-limit record plus any active cooldown. Distinct from
+ * The moment the account becomes usable again for a `family`/`model`
+ * request: the LATEST bound among the records that actually gate that
+ * request plus any active cooldown. Two deliberate differences from
  * getRateLimitResetTimeForFamily, whose earliest-reset answer feeds wait
- * displays: the account stays skipped while ANY matching record is active,
- * so a retry hint built from the earliest reset would send clients back
- * into a 503. Null when nothing bounds recovery.
+ * displays: the account stays skipped while ANY gating record is active,
+ * so the earliest reset would send clients back into a 503 — and only the
+ * keys selection consults (`family`, plus `family:<model>` when a model is
+ * known; see isRateLimitedForFamily) may contribute, because another
+ * model's record does not block this request and would overstate its
+ * recovery. Null when nothing bounds recovery.
  */
 export function getAccountRecoveryTimeForFamily(
 	account: {
@@ -53,6 +57,7 @@ export function getAccountRecoveryTimeForFamily(
 	},
 	now: number,
 	family: ModelFamily,
+	model?: string | null,
 ): number | null {
 	let latest: number | null = null;
 	const consider = (value: number | undefined): void => {
@@ -62,11 +67,8 @@ export function getAccountRecoveryTimeForFamily(
 	};
 	const times = account.rateLimitResetTimes;
 	if (times) {
-		const prefix = `${family}:`;
-		for (const [key, value] of Object.entries(times)) {
-			if (key !== family && !key.startsWith(prefix)) continue;
-			consider(value);
-		}
+		consider(times[family]);
+		if (model) consider(times[`${family}:${model}`]);
 	}
 	consider(account.coolingDownUntil);
 	return latest;

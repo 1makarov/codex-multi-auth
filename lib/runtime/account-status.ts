@@ -1,3 +1,4 @@
+import { getQuotaKey } from "../accounts/rate-limits.js";
 import type { ModelFamily } from "../prompts/codex.js";
 
 export function resolveActiveIndex(
@@ -67,8 +68,8 @@ export function getAccountRecoveryTimeForFamily(
 	};
 	const times = account.rateLimitResetTimes;
 	if (times) {
-		consider(times[family]);
-		if (model) consider(times[`${family}:${model}`]);
+		consider(times[getQuotaKey(family)]);
+		if (model) consider(times[getQuotaKey(family, model)]);
 	}
 	consider(account.coolingDownUntil);
 	return latest;

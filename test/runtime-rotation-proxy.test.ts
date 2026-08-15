@@ -935,6 +935,48 @@ describe("runtime rotation proxy", () => {
 		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
 	});
 
+	it("suppresses timed recovery when a permanent blocker holds the pinned account", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		const pinned = accountManager.getAccountByIndex(0);
+		if (!pinned) throw new Error("setup failed");
+		// Disabled outlives the record: after the rate limit expires the
+		// account is still unselectable, so no recovery time is honest.
+		pinned.enabled = false;
+		pinned.rateLimitResetTimes = { codex: now + 60_000 };
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			textEventStream("data: should-not-be-reached\n\n"),
+		);
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { forcedAccountIndex: 0 },
+		});
+
+		const response = await postResponses(proxy, {
+			model: "gpt-5-codex",
+			stream: true,
+			input: [{ type: "message", role: "user", content: "hi" }],
+		});
+
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(calls).toHaveLength(0);
+		const payload = (await response.json()) as {
+			error: {
+				code: string;
+				reason: string | null;
+				reset_at: string | null;
+				retry_after_ms: number | null;
+				message: string;
+			};
+		};
+		expect(payload.error.code).toBe("codex_pinned_account_unavailable");
+		expect(payload.error.reason).toBe("disabled");
+		expect(payload.error.reset_at).toBeNull();
+		expect(payload.error.retry_after_ms).toBeNull();
+		expect(payload.error.message).not.toContain("resets at");
+	});
+
 	it("reads the forced account from CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX env when no option is passed (#623)", async () => {
 		// This is the exact mechanism the pin uses to cross the launcher -> detached
 		// app-helper process boundary: no option, env only.

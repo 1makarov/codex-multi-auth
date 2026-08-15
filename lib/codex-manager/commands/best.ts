@@ -2,6 +2,7 @@ import type { ForecastAccountResult } from "../../forecast.js";
 import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
 import {
 	getModelProfile,
+	type ModelFamily,
 	resolveNormalizedModel,
 } from "../../request/helpers/model-map.js";
 import type { AccountStorageV3 } from "../../storage.js";
@@ -126,6 +127,7 @@ export interface BestCommandDeps {
 			now: number;
 			refreshFailure?: TokenFailure;
 			liveQuota?: CodexQuotaSnapshot;
+			family?: ModelFamily;
 		}>,
 	) => ForecastAccountResult[];
 	recommendForecastAccount: (results: ForecastAccountResult[]) => {

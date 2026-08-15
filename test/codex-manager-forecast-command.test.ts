@@ -5,7 +5,10 @@ import {
 } from "../lib/codex-manager/commands/forecast.js";
 import { CodexUnavailableError } from "../lib/errors.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../lib/quota-probe.js";
-import { DEFAULT_PROBE_MODEL } from "../lib/request/helpers/model-map.js";
+import {
+	DEFAULT_PROBE_MODEL,
+	getModelProfile,
+} from "../lib/request/helpers/model-map.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 
 function createStorage(): AccountStorageV3 {
@@ -166,6 +169,41 @@ describe("runForecastCommand", () => {
 		expect(result).toBe(0);
 		expect(deps.logInfo).toHaveBeenCalledWith(
 			expect.stringContaining('"command": "forecast"'),
+		);
+	});
+
+	it("threads the requested model's family into forecast evaluation", async () => {
+		const evaluateForecastAccounts = vi.fn((inputs) => {
+			void inputs;
+			return [
+				{
+					index: 0,
+					label: "1. forecast@example.com",
+					isCurrent: true,
+					availability: "ready",
+					riskScore: 0,
+					riskLevel: "low",
+					waitMs: 0,
+					reasons: [],
+				},
+			] as const;
+		});
+		const deps = createDeps({ evaluateForecastAccounts });
+
+		await expect(
+			runForecastCommand(["--json", "--model", "gpt-5.6-sol"], deps),
+		).resolves.toBe(0);
+		const explicit = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
+			| Array<{ family?: string }>
+			| undefined;
+		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6-sol").promptFamily);
+
+		await expect(runForecastCommand(["--json"], deps)).resolves.toBe(0);
+		const defaulted = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
+			| Array<{ family?: string }>
+			| undefined;
+		expect(defaulted?.[0]?.family).toBe(
+			getModelProfile(DEFAULT_PROBE_MODEL).promptFamily,
 		);
 	});
 

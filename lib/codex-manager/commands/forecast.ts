@@ -17,6 +17,7 @@ import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-
 import {
 	DEFAULT_PROBE_MODEL,
 	getModelProfile,
+	type ModelFamily,
 	resolveNormalizedModel,
 } from "../../request/helpers/model-map.js";
 import { type AccountMetadataV3, type AccountStorageV3 } from "../../storage.js";
@@ -89,6 +90,7 @@ export interface ForecastCommandDeps {
 			quotaCache?: QuotaCacheData | null;
 			allAccounts?: readonly AccountMetadataV3[];
 			runtimeOverlay?: RuntimeForecastOverlay | null;
+			family?: ModelFamily;
 		}>,
 	) => ForecastAccountResult[];
 	summarizeForecast: (results: ForecastAccountResult[]) => {

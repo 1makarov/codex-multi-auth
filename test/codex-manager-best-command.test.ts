@@ -6,6 +6,8 @@ import {
 } from "../lib/codex-manager/commands/best.js";
 import { CodexUnavailableError } from "../lib/errors.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../lib/quota-probe.js";
+import { DEFAULT_LIVE_PROBE_MODEL } from "../lib/codex-manager/quota-cache-helpers.js";
+import { getModelProfile } from "../lib/request/helpers/model-map.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 
 function createAccount(
@@ -135,6 +137,64 @@ describe("runBestCommand", () => {
 		expect(deps.logError).toHaveBeenCalledWith(
 			"--model requires --live for codex-multi-auth best",
 		);
+	});
+
+	it("threads the probe model's family into forecast evaluation", async () => {
+		const evaluateForecastAccounts = vi.fn((inputs) => {
+			void inputs;
+			return [
+				{
+					index: 0,
+					label: "1. best@example.com",
+					isCurrent: true,
+					availability: "ready",
+					riskScore: 0,
+					riskLevel: "low",
+					waitMs: 0,
+					reasons: [],
+				},
+			] as const;
+		});
+		const deps = createDeps({
+			evaluateForecastAccounts,
+			parseBestArgs: vi.fn(() => ({
+				ok: true as const,
+				options: {
+					live: false,
+					json: true,
+					model: DEFAULT_LIVE_PROBE_MODEL,
+					modelProvided: false,
+				} satisfies BestCliOptions,
+			})),
+		});
+
+		await expect(runBestCommand(["--json"], deps)).resolves.toBe(0);
+		const defaulted = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
+			| Array<{ family?: string }>
+			| undefined;
+		expect(defaulted?.[0]?.family).toBe(
+			getModelProfile(DEFAULT_LIVE_PROBE_MODEL).promptFamily,
+		);
+
+		const explicitDeps = createDeps({
+			evaluateForecastAccounts,
+			parseBestArgs: vi.fn(() => ({
+				ok: true as const,
+				options: {
+					live: true,
+					json: true,
+					model: "gpt-5.6-sol",
+					modelProvided: true,
+				} satisfies BestCliOptions,
+			})),
+		});
+		await expect(
+			runBestCommand(["--json", "--live", "--model", "gpt-5.6-sol"], explicitDeps),
+		).resolves.toBe(0);
+		const explicit = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
+			| Array<{ family?: string }>
+			| undefined;
+		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6-sol").promptFamily);
 	});
 
 	it("emits json output when no accounts are configured", async () => {

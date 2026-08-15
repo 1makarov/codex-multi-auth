@@ -93,6 +93,57 @@ describe("runReportCommand", () => {
 		expect(deps.logError).toHaveBeenCalledWith("Unknown option: --bogus");
 	});
 
+	it("gates the forecast on the requested model's family record", async () => {
+		const storage = createStorage([
+			{
+				email: "one@example.com",
+				refreshToken: "refresh-token-1",
+				accessToken: "access-token-1",
+				expiresAt: 10,
+				addedAt: 1,
+				lastUsed: 1,
+				enabled: true,
+				rateLimitResetTimes: { "gpt-5.2": 31_000 },
+			},
+		]);
+		const deps = createDeps({ loadAccounts: vi.fn(async () => storage) });
+
+		const readForecast = (): {
+			accounts: Array<{ availability: string; reasons: string[] }>;
+		} =>
+			(
+				JSON.parse(
+					String(
+						(deps.logInfo as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] ??
+							"{}",
+					),
+				) as {
+					forecast: {
+						accounts: Array<{ availability: string; reasons: string[] }>;
+					};
+				}
+			).forecast;
+
+		// The record is under the gpt-5.2 family, which gpt-5.6-sol belongs to.
+		await expect(
+			runReportCommand(["--json", "--model", "gpt-5.6-sol"], deps),
+		).resolves.toBe(0);
+		const general = readForecast();
+		expect(general.accounts[0]?.availability).toBe("delayed");
+		expect(
+			general.accounts[0]?.reasons.some((reason) =>
+				reason.startsWith("rate limit resets in"),
+			),
+		).toBe(true);
+
+		// A codex-family model is not gated by that record.
+		await expect(
+			runReportCommand(["--json", "--model", "gpt-5.3-codex"], deps),
+		).resolves.toBe(0);
+		const codex = readForecast();
+		expect(codex.accounts[0]?.availability).toBe("ready");
+	});
+
 	it("rejects a flag-like or whitespace-only --model value instead of consuming it", async () => {
 		// Split-arg form trims before validating, so "  -x" / "   " can't slip
 		// through and silently fall back to the default model.

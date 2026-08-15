@@ -38,6 +38,40 @@ export function getRateLimitResetTimeForFamily(
 	return minReset;
 }
 
+/**
+ * The moment the account becomes usable again for `family`: the LATEST
+ * matching rate-limit record plus any active cooldown. Distinct from
+ * getRateLimitResetTimeForFamily, whose earliest-reset answer feeds wait
+ * displays: the account stays skipped while ANY matching record is active,
+ * so a retry hint built from the earliest reset would send clients back
+ * into a 503. Null when nothing bounds recovery.
+ */
+export function getAccountRecoveryTimeForFamily(
+	account: {
+		rateLimitResetTimes?: Record<string, number | undefined>;
+		coolingDownUntil?: number;
+	},
+	now: number,
+	family: ModelFamily,
+): number | null {
+	let latest: number | null = null;
+	const consider = (value: number | undefined): void => {
+		if (typeof value !== "number" || !Number.isFinite(value)) return;
+		if (value <= now) return;
+		if (latest === null || value > latest) latest = value;
+	};
+	const times = account.rateLimitResetTimes;
+	if (times) {
+		const prefix = `${family}:`;
+		for (const [key, value] of Object.entries(times)) {
+			if (key !== family && !key.startsWith(prefix)) continue;
+			consider(value);
+		}
+	}
+	consider(account.coolingDownUntil);
+	return latest;
+}
+
 export function formatRateLimitEntry(
 	account: { rateLimitResetTimes?: Record<string, number | undefined> },
 	now: number,

@@ -799,6 +799,91 @@ describe("runtime rotation proxy", () => {
 		expect(calls).toHaveLength(0);
 	});
 
+	it("carries pin source and recovery metadata when the forced account 429s directly", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		const { calls, fetchImpl } = createRecordingFetch(
+			() =>
+				new Response('{"error":{"message":"rate limited"}}', {
+					status: HTTP_STATUS.TOO_MANY_REQUESTS,
+					headers: {
+						"content-type": "application/json",
+						"retry-after": "120",
+					},
+				}),
+		);
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { forcedAccountIndex: 0 },
+		});
+
+		const response = await postResponses(proxy, {
+			model: "gpt-5-codex",
+			stream: true,
+			input: [{ type: "message", role: "user", content: "hi" }],
+		});
+
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		// One direct attempt on the pin, then fail-hard — never a rotation.
+		expect(calls).toHaveLength(1);
+		const payload = (await response.json()) as {
+			error: {
+				code: string;
+				pin_source: string | null;
+				reason: string | null;
+				reset_at: string | null;
+				retry_after_ms: number | null;
+				message: string;
+			};
+		};
+		expect(payload.error.code).toBe("codex_pinned_account_unavailable");
+		expect(payload.error.pin_source).toBe("forced");
+		// The retry loop's selection verdict — recovery metadata must not
+		// depend on this string, only on the account's persisted state.
+		expect(payload.error.reason).toBe("already-attempted");
+		expect(payload.error.retry_after_ms).toBeGreaterThan(0);
+		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
+		expect(payload.error.message).toContain("the recorded limit resets at");
+		expect(payload.error.message).toContain("launcher");
+		expect(payload.error.message).not.toContain("unpin");
+	});
+
+	it("carries cooldown recovery metadata when the forced account fails with a network error", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		const { calls, fetchImpl } = createRecordingFetch(() => {
+			throw new TypeError("fetch failed");
+		});
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { forcedAccountIndex: 0 },
+		});
+
+		const response = await postResponses(proxy, {
+			model: "gpt-5-codex",
+			stream: true,
+			input: [{ type: "message", role: "user", content: "hi" }],
+		});
+
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(calls).toHaveLength(1);
+		const payload = (await response.json()) as {
+			error: {
+				code: string;
+				pin_source: string | null;
+				reset_at: string | null;
+				retry_after_ms: number | null;
+			};
+		};
+		expect(payload.error.code).toBe("codex_pinned_account_unavailable");
+		expect(payload.error.pin_source).toBe("forced");
+		// The network-error cooldown bounds recovery.
+		expect(payload.error.retry_after_ms).toBeGreaterThan(0);
+		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
+	});
+
 	it("reads the forced account from CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX env when no option is passed (#623)", async () => {
 		// This is the exact mechanism the pin uses to cross the launcher -> detached
 		// app-helper process boundary: no option, env only.

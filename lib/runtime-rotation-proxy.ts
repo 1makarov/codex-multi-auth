@@ -72,7 +72,7 @@ import {
 	responseHeadersForClient,
 	withTimeout,
 } from "./request/stream-failover-runtime.js";
-import { getRateLimitResetTimeForFamily } from "./runtime/account-status.js";
+import { getAccountRecoveryTimeForFamily } from "./runtime/account-status.js";
 import { chooseAccount } from "./runtime/rotation-account-selection.js";
 import {
 	createRotationProxyState,
@@ -1578,26 +1578,21 @@ async function handleRequestInner(
 				typeof pinnedIndex === "number"
 					? accountManager.getAccountByIndex(pinnedIndex)
 					: null;
-			const pinnedSkipReason =
-				typeof pinnedIndex === "number"
-					? accountSkipReasons.get(pinnedIndex) ?? null
-					: null;
-			// A rate-limited skip is bounded by the family record and a cooldown
-			// by coolingDownUntil; anything else has no known recovery moment.
+			// Recovery comes from the pinned account's persisted state, not the
+			// recorded skip reason: a direct 429/cooldown on the pinned account
+			// reaches this 503 as "already-attempted" (the retry loop's selection
+			// verdict) while the record it just wrote is what actually bounds
+			// recovery — and with several overlapping records the account stays
+			// skipped until the LAST one expires, so the latest bound is the one
+			// worth advertising.
 			const pinnedResetAtMs =
-				pinnedAccount === null || pinnedSkipReason === null
+				pinnedAccount === null
 					? null
-					: pinnedSkipReason === "rate-limited"
-						? getRateLimitResetTimeForFamily(
-								pinnedAccount,
-								state.now(),
-								context.family,
-							)
-						: pinnedSkipReason.startsWith("cooling-down") &&
-								typeof pinnedAccount.coolingDownUntil === "number" &&
-								pinnedAccount.coolingDownUntil > state.now()
-							? pinnedAccount.coolingDownUntil
-							: null;
+					: getAccountRecoveryTimeForFamily(
+							pinnedAccount,
+							state.now(),
+							context.family,
+						);
 			const errorBody = buildPinnedUnavailableErrorBody(
 				pinnedIndex,
 				accountSkipReasons,

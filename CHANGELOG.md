@@ -5,6 +5,30 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md).
 
+## [2.8.6] - 2026-08-16
+
+`forecast --model` reported an account `ready` while every request to it failed, and the pinned-account 503 told forced pins to run a command that clears nothing. [Full notes](docs/releases/v2.8.6.md).
+
+### Fixed
+
+- `forecast`, `best`, and `report` with `--model` check that model's prompt family instead of a hardwired `codex` family. An account held down by a live limit for the family you asked about no longer reports `ready` with no reasons ([#670](https://github.com/ndycode/codex-multi-auth/pull/670))
+- Those commands no longer report a delay caused by a rate limit on a *different* model in the same family — availability now uses exactly the two keys account selection consults ([#670](https://github.com/ndycode/codex-multi-auth/pull/670))
+- When a family-wide and a model-specific limit are both active, the reported wait is the later one rather than the earlier, so the stated time is actually usable ([#670](https://github.com/ndycode/codex-multi-auth/pull/670))
+- A recorded `rate-limited` state backed by a live limit for the requested family is no longer discarded as stale ([#670](https://github.com/ndycode/codex-multi-auth/pull/670))
+- The pinned-account 503 no longer advises `unpin` for a pin set by `--account` / `CODEX_MULTI_AUTH_FORCE_ACCOUNT`, which `unpin` cannot clear. Forced pins are told to relaunch ([#671](https://github.com/ndycode/codex-multi-auth/pull/671))
+- That 503 now reports when the account recovers, taking the latest of its rate limit, cooldown, and circuit-breaker deadline ([#671](https://github.com/ndycode/codex-multi-auth/pull/671))
+- A permanently blocked pin — disabled, no enabled workspace, invalidated token, policy block — reports no recovery time instead of a deadline that expires into another 503 ([#671](https://github.com/ndycode/codex-multi-auth/pull/671))
+- That suppression now also holds when the request itself is what disabled the account, which previously surfaced as `already-attempted` and hid the block ([#671](https://github.com/ndycode/codex-multi-auth/pull/671))
+- A corrupt timestamp in stored account state no longer turns the pinned 503 into a generic 500 carrying no account index, reason, or skip map ([#671](https://github.com/ndycode/codex-multi-auth/pull/671))
+
+### Added
+
+- `pin_source`, `reset_at`, and `retry_after_ms` on `codex_pinned_account_unavailable` responses ([#671](https://github.com/ndycode/codex-multi-auth/pull/671))
+
+### Changed
+
+- `docs/reference/error-contracts.md` documents the new fields, both pin kinds, and how `retry_after_ms` differs between the pinned and pool-exhausted codes ([#671](https://github.com/ndycode/codex-multi-auth/pull/671))
+
 ## [2.8.5] - 2026-08-13
 
 Background rotation helpers never shut down — 183 of them at 5.58 GB on one machine, the oldest 33 hours past a 12-hour timeout. [Full notes](docs/releases/v2.8.5.md).

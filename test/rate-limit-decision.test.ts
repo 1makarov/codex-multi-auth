@@ -331,3 +331,38 @@ describe("buildPinnedUnavailableErrorBody", () => {
 		expect(body.message).not.toContain("resets at");
 	});
 });
+
+describe("buildPinnedUnavailableErrorBody recovery bounds", () => {
+	it("drops an out-of-range deadline instead of throwing RangeError", () => {
+		// resetAtMs comes from persisted account state and nothing re-validates
+		// it on load, so a corrupted coolingDownUntil can be finite, positive,
+		// and still past the ECMAScript time limit. toISOString would throw and
+		// collapse this 503 into a generic 500 that carries none of the
+		// diagnostics below.
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "rate-limited"]]),
+			{ pinSource: "forced", resetAtMs: 1e18, now: 1_700_000_000_000 },
+		);
+
+		expect(body.reset_at).toBeNull();
+		expect(body.retry_after_ms).toBeNull();
+		expect(body.code).toBe("codex_pinned_account_unavailable");
+		expect(body.pinnedAccountIndex).toBe(0);
+		expect(body.reason).toBe("rate-limited");
+		expect(body.pin_source).toBe("forced");
+		expect(body.message).not.toContain("resets at");
+	});
+
+	it("still reports a deadline at the edge of the valid range", () => {
+		const maxTimeValue = 8_640_000_000_000_000;
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "rate-limited"]]),
+			{ resetAtMs: maxTimeValue, now: 1_700_000_000_000 },
+		);
+
+		expect(body.reset_at).toBe(new Date(maxTimeValue).toISOString());
+		expect(body.retry_after_ms).toBe(maxTimeValue - 1_700_000_000_000);
+	});
+});

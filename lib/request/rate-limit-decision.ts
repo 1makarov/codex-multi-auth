@@ -193,6 +193,12 @@ export interface PinnedUnavailableErrorBody {
 	account_skip_reasons: Record<string, string>;
 }
 
+/**
+ * Largest epoch-ms value `new Date(...).toISOString()` accepts; anything beyond
+ * throws RangeError (ECMAScript time-value limit, ±100,000,000 days).
+ */
+const MAX_ECMASCRIPT_TIME_VALUE = 8_640_000_000_000_000;
+
 export interface PinnedUnavailableContext {
 	/**
 	 * "forced" when the pin came from the wrapper's forced-account mode
@@ -225,10 +231,19 @@ export function buildPinnedUnavailableErrorBody(
 			? "The pinned account"
 			: `Pinned account ${normalizedPinnedIndex + 1}`;
 	const pinSource = context?.pinSource ?? null;
+	// Upper bound as well as lower: resetAtMs comes from persisted account state
+	// (rateLimitResetTimes, coolingDownUntil), and markAccountCoolingDown clamps
+	// only the low side while nothing re-validates either on load. A finite but
+	// absurd deadline past the ECMAScript time limit would make toISOString below
+	// throw a RangeError inside handleRequestInner, collapsing this diagnostic 503
+	// into a generic 500 that carries no pinnedAccountIndex, reason, or skip map —
+	// the exact payload this branch exists to deliver. Such a value bounds nothing
+	// usable anyway, so treat it as "no known recovery" instead.
 	const resetAtMs =
 		typeof context?.resetAtMs === "number" &&
 		Number.isFinite(context.resetAtMs) &&
-		context.resetAtMs > 0
+		context.resetAtMs > 0 &&
+		context.resetAtMs <= MAX_ECMASCRIPT_TIME_VALUE
 			? context.resetAtMs
 			: null;
 	const now = context?.now ?? Date.now();
@@ -236,8 +251,8 @@ export function buildPinnedUnavailableErrorBody(
 	const resetAt = resetAtMs !== null ? new Date(resetAtMs).toISOString() : null;
 	const waitSuffix =
 		resetAt !== null ? `; the recorded limit resets at ${resetAt}` : "";
-	// A forced pin belongs to the launching process, not to ndy's persisted
-	// pin state, so `unpin` would clear nothing — say what actually helps.
+	// A forced pin belongs to the launching process, not to the persisted pin
+	// state, so `unpin` would clear nothing — say what actually helps.
 	const remedy =
 		pinSource === "forced"
 			? "the pin was set by this session's launcher, so relaunch to select a different account"

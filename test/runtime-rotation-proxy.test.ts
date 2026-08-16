@@ -893,13 +893,27 @@ describe("runtime rotation proxy", () => {
 		// Zero the network-error cooldown so every request reaches upstream
 		// and records a breaker failure; otherwise the cooldown absorbs the
 		// retries and the breaker never opens.
+		// Restored in a finally: if startProxy rejects, an inline unstub never
+		// runs and the zero cooldown leaks into every later test in this file —
+		// the shared afterEach does not clear env stubs. Scoped to the one
+		// variable rather than vi.unstubAllEnvs(), which would also clear stubs
+		// an enclosing hook set.
+		const previousNetworkErrorCooldown =
+			process.env.CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS;
+		let proxy: Awaited<ReturnType<typeof startProxy>>;
 		vi.stubEnv("CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS", "0");
-		const proxy = await startProxy({
-			accountManager,
-			fetchImpl,
-			options: { forcedAccountIndex: 0 },
-		});
-		vi.unstubAllEnvs();
+		try {
+			proxy = await startProxy({
+				accountManager,
+				fetchImpl,
+				options: { forcedAccountIndex: 0 },
+			});
+		} finally {
+			vi.stubEnv(
+				"CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS",
+				previousNetworkErrorCooldown,
+			);
+		}
 		const body = {
 			model: "gpt-5-codex",
 			stream: true,

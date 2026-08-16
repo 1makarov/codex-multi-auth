@@ -192,19 +192,23 @@ describe("runBestCommand", () => {
 				options: {
 					live: true,
 					json: true,
-					model: "gpt-5.6-sol",
+					// The bare alias, NOT the canonical id: resolveNormalizedModel
+					// maps it to "gpt-5.6-sol", so this proves the normalized id
+					// is what reaches evaluation rather than the raw flag value.
+					model: "gpt-5.6",
 					modelProvided: true,
 				} satisfies BestCliOptions,
 			})),
 		});
 		await expect(
-			runBestCommand(["--json", "--live", "--model", "gpt-5.6-sol"], explicitDeps),
+			runBestCommand(["--json", "--live", "--model", "gpt-5.6"], explicitDeps),
 		).resolves.toBe(0);
 		const explicit = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
 			| Array<{ family?: string; model?: string | null }>
 			| undefined;
-		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6-sol").promptFamily);
-		expect(explicit?.[0]?.model).toBe(resolveNormalizedModel("gpt-5.6-sol"));
+		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6").promptFamily);
+		expect(resolveNormalizedModel("gpt-5.6")).not.toBe("gpt-5.6");
+		expect(explicit?.[0]?.model).toBe(resolveNormalizedModel("gpt-5.6"));
 	});
 
 	it("emits json output when no accounts are configured", async () => {

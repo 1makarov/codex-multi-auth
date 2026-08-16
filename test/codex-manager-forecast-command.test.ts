@@ -192,15 +192,17 @@ describe("runForecastCommand", () => {
 		const deps = createDeps({ evaluateForecastAccounts });
 
 		await expect(
-			runForecastCommand(["--json", "--model", "gpt-5.6-sol"], deps),
+			runForecastCommand(["--json", "--model", "gpt-5.6"], deps),
 		).resolves.toBe(0);
 		const explicit = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
 			| Array<{ family?: string; model?: string | null }>
 			| undefined;
-		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6-sol").promptFamily);
-		// The normalized id, not the raw flag value: rate-limit records are keyed
-		// by the model the proxy routes on.
-		expect(explicit?.[0]?.model).toBe(resolveNormalizedModel("gpt-5.6-sol"));
+		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6").promptFamily);
+		// The bare alias is driven in deliberately: resolveNormalizedModel maps
+		// it to "gpt-5.6-sol", so a raw pass-through would fail here. Rate-limit
+		// records are keyed by the model the proxy routes on, not the flag value.
+		expect(resolveNormalizedModel("gpt-5.6")).not.toBe("gpt-5.6");
+		expect(explicit?.[0]?.model).toBe(resolveNormalizedModel("gpt-5.6"));
 
 		await expect(runForecastCommand(["--json"], deps)).resolves.toBe(0);
 		const defaulted = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as

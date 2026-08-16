@@ -1,6 +1,10 @@
 import type { ForecastAccountResult } from "../../forecast.js";
 import { type CodexQuotaSnapshot, describeCodexProbeFailure } from "../../quota-probe.js";
-import { resolveNormalizedModel } from "../../request/helpers/model-map.js";
+import {
+	getModelProfile,
+	type ModelFamily,
+	resolveNormalizedModel,
+} from "../../request/helpers/model-map.js";
 import type { AccountStorageV3 } from "../../storage.js";
 import type { TokenFailure, TokenResult } from "../../types.js";
 import { DEFAULT_LIVE_PROBE_MODEL } from "../quota-cache-helpers.js";
@@ -123,6 +127,8 @@ export interface BestCommandDeps {
 			now: number;
 			refreshFailure?: TokenFailure;
 			liveQuota?: CodexQuotaSnapshot;
+			family?: ModelFamily;
+			model?: string | null;
 		}>,
 	) => ForecastAccountResult[];
 	recommendForecastAccount: (results: ForecastAccountResult[]) => {
@@ -282,6 +288,13 @@ export async function runBestCommand(
 		}
 	}
 
+	// Only an explicit --model moves the recommendation off the codex family;
+	// see the note in the forecast command. `best` exists to pick the account
+	// for wrapper traffic, which is codex-family.
+	const forecastFamily = options.modelProvided
+		? getModelProfile(probeModel).promptFamily
+		: undefined;
+	const forecastModel = options.modelProvided ? probeModel : undefined;
 	const forecastInputs = storage.accounts.map((account, index) => ({
 		index,
 		account,
@@ -289,6 +302,8 @@ export async function runBestCommand(
 		now,
 		refreshFailure: refreshFailures.get(index),
 		liveQuota: liveQuotaByIndex.get(index),
+		family: forecastFamily,
+		model: forecastModel,
 	}));
 	const forecastResults = deps.evaluateForecastAccounts(forecastInputs);
 	const recommendation = deps.recommendForecastAccount(forecastResults);

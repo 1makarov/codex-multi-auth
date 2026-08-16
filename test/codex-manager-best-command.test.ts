@@ -6,6 +6,11 @@ import {
 } from "../lib/codex-manager/commands/best.js";
 import { CodexUnavailableError } from "../lib/errors.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../lib/quota-probe.js";
+import { DEFAULT_LIVE_PROBE_MODEL } from "../lib/codex-manager/quota-cache-helpers.js";
+import {
+	getModelProfile,
+	resolveNormalizedModel,
+} from "../lib/request/helpers/model-map.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 
 function createAccount(
@@ -135,6 +140,75 @@ describe("runBestCommand", () => {
 		expect(deps.logError).toHaveBeenCalledWith(
 			"--model requires --live for codex-multi-auth best",
 		);
+	});
+
+	it("threads the probe model's family and id into forecast evaluation", async () => {
+		const evaluateForecastAccounts = vi.fn((inputs) => {
+			void inputs;
+			return [
+				{
+					index: 0,
+					label: "1. best@example.com",
+					isCurrent: true,
+					availability: "ready",
+					riskScore: 0,
+					riskLevel: "low",
+					waitMs: 0,
+					reasons: [],
+				},
+			] as const;
+		});
+		const deps = createDeps({
+			evaluateForecastAccounts,
+			parseBestArgs: vi.fn(() => ({
+				ok: true as const,
+				options: {
+					live: false,
+					json: true,
+					model: DEFAULT_LIVE_PROBE_MODEL,
+					modelProvided: false,
+				} satisfies BestCliOptions,
+			})),
+		});
+
+		await expect(runBestCommand(["--json"], deps)).resolves.toBe(0);
+		const defaulted = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
+			| Array<{ family?: string; model?: string | null }>
+			| undefined;
+		// `best` picks the account for wrapper traffic, which is codex-family.
+		// DEFAULT_LIVE_PROBE_MODEL is gpt-5.6-sol, whose family is gpt-5.2, so a
+		// bare invocation must leave both unset and fall back to codex rather
+		// than rank accounts against a family no wrapper request uses.
+		expect(getModelProfile(DEFAULT_LIVE_PROBE_MODEL).promptFamily).not.toBe(
+			"codex",
+		);
+		expect(defaulted?.[0]?.family).toBeUndefined();
+		expect(defaulted?.[0]?.model).toBeUndefined();
+
+		const explicitDeps = createDeps({
+			evaluateForecastAccounts,
+			parseBestArgs: vi.fn(() => ({
+				ok: true as const,
+				options: {
+					live: true,
+					json: true,
+					// The bare alias, NOT the canonical id: resolveNormalizedModel
+					// maps it to "gpt-5.6-sol", so this proves the normalized id
+					// is what reaches evaluation rather than the raw flag value.
+					model: "gpt-5.6",
+					modelProvided: true,
+				} satisfies BestCliOptions,
+			})),
+		});
+		await expect(
+			runBestCommand(["--json", "--live", "--model", "gpt-5.6"], explicitDeps),
+		).resolves.toBe(0);
+		const explicit = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
+			| Array<{ family?: string; model?: string | null }>
+			| undefined;
+		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6").promptFamily);
+		expect(resolveNormalizedModel("gpt-5.6")).not.toBe("gpt-5.6");
+		expect(explicit?.[0]?.model).toBe(resolveNormalizedModel("gpt-5.6"));
 	});
 
 	it("emits json output when no accounts are configured", async () => {

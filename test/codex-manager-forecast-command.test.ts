@@ -5,7 +5,11 @@ import {
 } from "../lib/codex-manager/commands/forecast.js";
 import { CodexUnavailableError } from "../lib/errors.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../lib/quota-probe.js";
-import { DEFAULT_PROBE_MODEL } from "../lib/request/helpers/model-map.js";
+import {
+	DEFAULT_PROBE_MODEL,
+	getModelProfile,
+	resolveNormalizedModel,
+} from "../lib/request/helpers/model-map.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 
 function createStorage(): AccountStorageV3 {
@@ -167,6 +171,49 @@ describe("runForecastCommand", () => {
 		expect(deps.logInfo).toHaveBeenCalledWith(
 			expect.stringContaining('"command": "forecast"'),
 		);
+	});
+
+	it("threads the requested model's family and normalized id into forecast evaluation", async () => {
+		const evaluateForecastAccounts = vi.fn((inputs) => {
+			void inputs;
+			return [
+				{
+					index: 0,
+					label: "1. forecast@example.com",
+					isCurrent: true,
+					availability: "ready",
+					riskScore: 0,
+					riskLevel: "low",
+					waitMs: 0,
+					reasons: [],
+				},
+			] as const;
+		});
+		const deps = createDeps({ evaluateForecastAccounts });
+
+		await expect(
+			runForecastCommand(["--json", "--model", "gpt-5.6"], deps),
+		).resolves.toBe(0);
+		const explicit = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
+			| Array<{ family?: string; model?: string | null }>
+			| undefined;
+		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6").promptFamily);
+		// The bare alias is driven in deliberately: resolveNormalizedModel maps
+		// it to "gpt-5.6-sol", so a raw pass-through would fail here. Rate-limit
+		// records are keyed by the model the proxy routes on, not the flag value.
+		expect(resolveNormalizedModel("gpt-5.6")).not.toBe("gpt-5.6");
+		expect(explicit?.[0]?.model).toBe(resolveNormalizedModel("gpt-5.6"));
+
+		await expect(runForecastCommand(["--json"], deps)).resolves.toBe(0);
+		const defaulted = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
+			| Array<{ family?: string; model?: string | null }>
+			| undefined;
+		// DEFAULT_PROBE_MODEL is gpt-5.6-sol, family gpt-5.2 - NOT codex. A bare
+		// `forecast` must leave family and model unset so evaluation keeps the
+		// codex default, matching the family /codex/responses buckets into.
+		expect(getModelProfile(DEFAULT_PROBE_MODEL).promptFamily).not.toBe("codex");
+		expect(defaulted?.[0]?.family).toBeUndefined();
+		expect(defaulted?.[0]?.model).toBeUndefined();
 	});
 
 	it("honors --no-runtime-overlay in json forecast output", async () => {

@@ -1,12 +1,12 @@
 # TEST KNOWLEDGE BASE
 
 Generated: 2026-07-29
-Commit: 8bbc1e7 (2.8.5)
+Commit: 4326706 (2.8.6)
 
 ## OVERVIEW
 
 Vitest suites for OAuth flow, request transforms, response handling, rotation logic, storage, CLI management, repo hygiene, and more.
-**5459 tests** across **341 test files** with 80%+ coverage threshold (2.8.5; 19 tests and 1 file skipped by default).
+**5485 tests** across **341 test files** with 80%+ coverage threshold (2.8.6; 19 tests and 1 file skipped by default).
 
 ## STRUCTURE
 ```

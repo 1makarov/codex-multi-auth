@@ -7,7 +7,10 @@ import {
 import { CodexUnavailableError } from "../lib/errors.js";
 import { CODEX_UNAVAILABLE_PROBE_NOTE } from "../lib/quota-probe.js";
 import { DEFAULT_LIVE_PROBE_MODEL } from "../lib/codex-manager/quota-cache-helpers.js";
-import { getModelProfile } from "../lib/request/helpers/model-map.js";
+import {
+	getModelProfile,
+	resolveNormalizedModel,
+} from "../lib/request/helpers/model-map.js";
 import type { AccountStorageV3 } from "../lib/storage.js";
 
 function createAccount(
@@ -139,7 +142,7 @@ describe("runBestCommand", () => {
 		);
 	});
 
-	it("threads the probe model's family into forecast evaluation", async () => {
+	it("threads the probe model's family and id into forecast evaluation", async () => {
 		const evaluateForecastAccounts = vi.fn((inputs) => {
 			void inputs;
 			return [
@@ -170,11 +173,17 @@ describe("runBestCommand", () => {
 
 		await expect(runBestCommand(["--json"], deps)).resolves.toBe(0);
 		const defaulted = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
-			| Array<{ family?: string }>
+			| Array<{ family?: string; model?: string | null }>
 			| undefined;
-		expect(defaulted?.[0]?.family).toBe(
-			getModelProfile(DEFAULT_LIVE_PROBE_MODEL).promptFamily,
+		// `best` picks the account for wrapper traffic, which is codex-family.
+		// DEFAULT_LIVE_PROBE_MODEL is gpt-5.6-sol, whose family is gpt-5.2, so a
+		// bare invocation must leave both unset and fall back to codex rather
+		// than rank accounts against a family no wrapper request uses.
+		expect(getModelProfile(DEFAULT_LIVE_PROBE_MODEL).promptFamily).not.toBe(
+			"codex",
 		);
+		expect(defaulted?.[0]?.family).toBeUndefined();
+		expect(defaulted?.[0]?.model).toBeUndefined();
 
 		const explicitDeps = createDeps({
 			evaluateForecastAccounts,
@@ -192,9 +201,10 @@ describe("runBestCommand", () => {
 			runBestCommand(["--json", "--live", "--model", "gpt-5.6-sol"], explicitDeps),
 		).resolves.toBe(0);
 		const explicit = evaluateForecastAccounts.mock.calls.at(-1)?.[0] as
-			| Array<{ family?: string }>
+			| Array<{ family?: string; model?: string | null }>
 			| undefined;
 		expect(explicit?.[0]?.family).toBe(getModelProfile("gpt-5.6-sol").promptFamily);
+		expect(explicit?.[0]?.model).toBe(resolveNormalizedModel("gpt-5.6-sol"));
 	});
 
 	it("emits json output when no accounts are configured", async () => {

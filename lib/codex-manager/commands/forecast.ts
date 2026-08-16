@@ -28,6 +28,11 @@ interface ForecastCliOptions {
 	json: boolean;
 	explain: boolean;
 	model: string;
+	/**
+	 * Whether --model was actually passed. The default probe model is not a
+	 * codex-family model, so its family must NOT govern a bare invocation.
+	 */
+	modelProvided: boolean;
 	runtimeOverlay: boolean;
 }
 
@@ -91,6 +96,7 @@ export interface ForecastCommandDeps {
 			allAccounts?: readonly AccountMetadataV3[];
 			runtimeOverlay?: RuntimeForecastOverlay | null;
 			family?: ModelFamily;
+			model?: string | null;
 		}>,
 	) => ForecastAccountResult[];
 	summarizeForecast: (results: ForecastAccountResult[]) => {
@@ -156,6 +162,7 @@ function parseForecastArgs(
 		json: false,
 		explain: false,
 		model: DEFAULT_PROBE_MODEL,
+		modelProvided: false,
 		runtimeOverlay: true,
 	};
 
@@ -184,6 +191,7 @@ function parseForecastArgs(
 				return { ok: false, message: "Missing value for --model" };
 			}
 			options.model = value;
+			options.modelProvided = true;
 			i += 1;
 			continue;
 		}
@@ -193,6 +201,7 @@ function parseForecastArgs(
 				return { ok: false, message: "Missing value for --model" };
 			}
 			options.model = value;
+			options.modelProvided = true;
 			continue;
 		}
 		return { ok: false, message: `Unknown option: ${arg}` };
@@ -364,6 +373,18 @@ export async function runForecastCommand(
 		}
 	}
 
+	// Only an explicit --model moves the forecast off the codex family. The
+	// default probe model is gpt-5.6-sol, whose family is gpt-5.2, so keying a
+	// bare `forecast` on it would evaluate every account against a family no
+	// wrapper request uses - /codex/responses buckets into codex.
+	//
+	// probeModel, not requestedModel: rate-limit records are keyed by the
+	// normalized model the proxy routes on. Resolved once rather than per
+	// account: getModelProfile re-parses the model string on every call.
+	const forecastFamily = options.modelProvided
+		? getModelProfile(requestedModel).promptFamily
+		: undefined;
+	const forecastModel = options.modelProvided ? probeModel : undefined;
 	const forecastInputs = storage.accounts.map((account, index) => ({
 		index,
 		account,
@@ -374,7 +395,8 @@ export async function runForecastCommand(
 		quotaCache,
 		allAccounts: storage.accounts,
 		runtimeOverlay,
-		family: getModelProfile(requestedModel).promptFamily,
+		family: forecastFamily,
+		model: forecastModel,
 	}));
 	const forecastResults = deps.evaluateForecastAccounts(forecastInputs);
 	const summary = deps.summarizeForecast(forecastResults);

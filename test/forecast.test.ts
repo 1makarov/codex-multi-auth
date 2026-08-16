@@ -465,6 +465,109 @@ describe("forecast helpers", () => {
 		expect(result.availability).toBe("ready");
 	});
 
+	it("ignores a sibling model's record in the requested model's family", () => {
+		const now = 1_700_000_000_000;
+		const account = {
+			refreshToken: "refresh-1",
+			addedAt: now - 10_000,
+			lastUsed: now - 10_000,
+			// markRateLimitedWithReason keys token/concurrency limits under
+			// `family:<model>`. Selection checks only the family-wide key and this
+			// request's own model key, so a sibling's record must not gate it.
+			rateLimitResetTimes: { "gpt-5.2:gpt-5.6-terra": now + 30_000 },
+		};
+
+		const sibling = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account,
+			family: "gpt-5.2",
+			model: "gpt-5.6-sol",
+		});
+		expect(sibling.availability).toBe("ready");
+		expect(sibling.waitMs).toBe(0);
+
+		const own = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account,
+			family: "gpt-5.2",
+			model: "gpt-5.6-terra",
+		});
+		expect(own.availability).toBe("delayed");
+		expect(own.waitMs).toBe(30_000);
+	});
+
+	it("waits for the later of the family-wide and model-scoped resets", () => {
+		const now = 1_700_000_000_000;
+		const result = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account: {
+				refreshToken: "refresh-1",
+				addedAt: now - 10_000,
+				lastUsed: now - 10_000,
+				rateLimitResetTimes: {
+					"gpt-5.2": now + 5_000,
+					"gpt-5.2:gpt-5.6-sol": now + 45_000,
+				},
+			},
+			family: "gpt-5.2",
+			model: "gpt-5.6-sol",
+		});
+
+		// The account stays skipped while EITHER key is active, so reporting the
+		// earliest reset would send the caller back before it is selectable.
+		expect(result.availability).toBe("delayed");
+		expect(result.waitMs).toBe(45_000);
+	});
+
+	it("drops a rate-limited overlay backed only by a sibling model's record", () => {
+		const now = 1_700_000_000_000;
+		const result = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account: {
+				refreshToken: "refresh-1",
+				addedAt: now - 10_000,
+				lastUsed: now - 10_000,
+				rateLimitResetTimes: { "gpt-5.2:gpt-5.6-terra": now + 30_000 },
+			},
+			runtimeOverlay: {
+				lastPoolExhaustionSkipReasons: { "0": "rate-limited" },
+			},
+			family: "gpt-5.2",
+			model: "gpt-5.6-sol",
+		});
+
+		expect(result.availability).toBe("ready");
+	});
+
+	it("keeps the family-wide union for a model-less caller", () => {
+		const now = 1_700_000_000_000;
+		const result = evaluateForecastAccount({
+			index: 0,
+			now,
+			isCurrent: false,
+			account: {
+				refreshToken: "refresh-1",
+				addedAt: now - 10_000,
+				lastUsed: now - 10_000,
+				rateLimitResetTimes: { "gpt-5.2:gpt-5.6-terra": now + 30_000 },
+			},
+			family: "gpt-5.2",
+		});
+
+		// status and fix pass no model, so no model key can be singled out: they
+		// keep counting every record in the family, exactly as before.
+		expect(result.availability).toBe("delayed");
+		expect(result.waitMs).toBe(30_000);
+	});
+
 	it("ignores a stale cooling-down overlay when cooldown has elapsed on disk", () => {
 		const now = 1_700_000_000_000;
 		const result = evaluateForecastAccount({

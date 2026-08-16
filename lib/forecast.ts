@@ -11,7 +11,10 @@ import {
 	quotaUsedPercentIsExhausted,
 } from "./quota-readiness.js";
 import type { ModelFamily } from "./request/helpers/model-map.js";
-import { getRateLimitResetTimeForFamily } from "./runtime/account-status.js";
+import {
+	getRateLimitResetTimeForFamily,
+	getRateLimitResetTimeForModel,
+} from "./runtime/account-status.js";
 import type { AccountMetadataV3 } from "./storage.js";
 import type { TokenFailure } from "./types.js";
 
@@ -34,6 +37,12 @@ export interface ForecastAccountInput {
 	 * default preserves the historical behavior for model-less surfaces.
 	 */
 	family?: ModelFamily;
+	/**
+	 * Normalized model the forecast is about, when the caller has one. Selection
+	 * keys token/concurrency limits under `family:<model>`, so without it a
+	 * sibling model's record would be read as gating this one.
+	 */
+	model?: string | null;
 }
 
 export interface RuntimeForecastOverlay {
@@ -249,11 +258,18 @@ export function evaluateForecastAccount(
 		appendWaitReason(reasons, "cooldown remaining", remaining);
 	}
 
-	const rateLimitResetAt = getRateLimitResetTimeForFamily(
-		account,
-		now,
-		input.family ?? "codex",
-	);
+	// With a model in hand, gate on exactly the keys selection consults for that
+	// family/model pair, and on the LATEST of them: a sibling model's record does
+	// not gate this request, and while both the family-wide and model-scoped keys
+	// are active the account stays skipped until the later one expires.
+	//
+	// Without one (status, fix) no model key can be singled out, so keep the
+	// family-wide union - the conservative answer, and the behavior those
+	// surfaces have always had.
+	const forecastFamily = input.family ?? "codex";
+	const rateLimitResetAt = input.model
+		? getRateLimitResetTimeForModel(account, now, forecastFamily, input.model)
+		: getRateLimitResetTimeForFamily(account, now, forecastFamily);
 	if (typeof rateLimitResetAt === "number") {
 		const remaining = Math.max(0, rateLimitResetAt - now);
 		waitMs = Math.max(waitMs, remaining);
@@ -306,9 +322,10 @@ export function evaluateForecastAccount(
 	// active. Each reason validates only against its own backing disk state
 	// ("rate-limited" -> rateLimitResetTimes, "cooling-down" -> coolingDownUntil)
 	// so we never substitute a misleading reason string. The rate-limited
-	// cross-check is family-aware through rateLimitResetAt above: a record for
-	// the forecast's own family keeps the reason, while a record for another
-	// family neither sustains it nor gates this model's availability. Non-time-bounded
+	// cross-check inherits rateLimitResetAt's scope above: a record under one of
+	// the keys that actually gates this family/model request keeps the reason,
+	// while a record for another family - or another model in the same family -
+	// neither sustains it nor gates this request. Non-time-bounded
 	// reasons ("circuit-open", "token-exhausted", "policy-blocked") have no disk
 	// expiry to check and are always applied.
 	const coolingDownActive =

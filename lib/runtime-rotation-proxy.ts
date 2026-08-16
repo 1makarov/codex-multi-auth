@@ -1599,11 +1599,32 @@ async function handleRequestInner(
 			// A permanent blocker (disabled, no enabled workspace, invalidated
 			// auth, policy block, out-of-range pin) outlives every timed record,
 			// so advertising a record's expiry would invite a retry into another
-			// 503. Selection rejects such an account before any attempt, so the
-			// recorded skip reason is the permanent one in exactly these cases.
+			// 503.
+			//
+			// The recorded reason alone is not enough to detect one. It is the
+			// SELECTION verdict, and this request can make the pin permanently
+			// unselectable after selection already ran: a workspace-disabled
+			// 402/403 calls setAccountEnabled(index, false) above and then
+			// continues, so the next pass records "already-attempted" and the
+			// disable never surfaces. With a breaker tripped by the same failure
+			// the 503 would then advertise the circuit's ~30s reset for an
+			// account no timer will ever re-admit. Re-read the pin's CURRENT
+			// runtime state so a permanent blocker cannot hide behind the
+			// verdict; the recorded reason still covers the selection-only
+			// verdicts ("missing", "policy-blocked") that state cannot express.
+			const pinnedCurrentSkipReason =
+				pinnedAccount === null
+					? null
+					: accountManager.getManagedAccountRuntimeSkipReason(
+							pinnedAccount,
+							context.family,
+							context.model,
+						);
 			const pinnedBlockedPermanently =
-				pinnedSkipReason !== null &&
-				PINNED_PERMANENT_SKIP_REASONS.has(pinnedSkipReason);
+				(pinnedSkipReason !== null &&
+					PINNED_PERMANENT_SKIP_REASONS.has(pinnedSkipReason)) ||
+				(pinnedCurrentSkipReason !== null &&
+					PINNED_PERMANENT_SKIP_REASONS.has(pinnedCurrentSkipReason));
 			// Otherwise recovery comes from the pinned account's persisted state, not the
 			// recorded skip reason: a direct 429/cooldown on the pinned account
 			// reaches this 503 as "already-attempted" (the retry loop's selection

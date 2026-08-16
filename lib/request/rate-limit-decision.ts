@@ -202,7 +202,8 @@ const MAX_ECMASCRIPT_TIME_VALUE = 8_640_000_000_000_000;
 export interface PinnedUnavailableContext {
 	/**
 	 * "forced" when the pin came from the wrapper's forced-account mode
-	 * (`--account` / CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX), "manual" when it
+	 * (`--account` / CODEX_MULTI_AUTH_FORCE_ACCOUNT, which the wrapper resolves
+	 * into the internal CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX), "manual" when it
 	 * came from `switch`. `unpin` clears only the manual kind, so the remedy
 	 * line must not suggest it for a forced pin.
 	 */

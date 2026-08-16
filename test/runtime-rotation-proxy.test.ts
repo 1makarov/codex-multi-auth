@@ -884,6 +884,73 @@ describe("runtime rotation proxy", () => {
 		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
 	});
 
+	it("suppresses recovery when this request itself disables the pinned account", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 1));
+		// Two network failures record breaker failures without disabling; the
+		// third response is a workspace-disabled 403, which records the failure
+		// that opens the breaker AND calls setAccountEnabled(index, false).
+		// Selection on the next pass sees the pin in attemptedIndexes and
+		// records "already-attempted", so the disable never reaches the recorded
+		// skip reason — the 503 must still refuse to advertise the circuit's
+		// ~30s reset for an account no timer will re-admit.
+		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => {
+			if (attempt < 3) throw new TypeError("fetch failed");
+			return new Response(
+				JSON.stringify({
+					error: { code: "workspace_disabled", message: "workspace has been disabled" },
+				}),
+				{ status: HTTP_STATUS.FORBIDDEN, headers: { "content-type": "application/json" } },
+			);
+		});
+		const previousNetworkErrorCooldown =
+			process.env.CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS;
+		let proxy: Awaited<ReturnType<typeof startProxy>>;
+		vi.stubEnv("CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS", "0");
+		try {
+			proxy = await startProxy({
+				accountManager,
+				fetchImpl,
+				options: { forcedAccountIndex: 0 },
+			});
+		} finally {
+			vi.stubEnv(
+				"CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS",
+				previousNetworkErrorCooldown,
+			);
+		}
+		const body = {
+			model: "gpt-5-codex",
+			stream: true,
+			input: [{ type: "message", role: "user", content: "hi" }],
+		};
+
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			const failed = await postResponses(proxy, body);
+			expect(failed.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		}
+		expect(calls).toHaveLength(2);
+
+		const response = await postResponses(proxy, body);
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(calls).toHaveLength(3);
+		expect(accountManager.getAccountByIndex(0)?.enabled).toBe(false);
+
+		const payload = (await response.json()) as {
+			error: {
+				code: string;
+				pin_source: string | null;
+				reset_at: string | null;
+				retry_after_ms: number | null;
+			};
+		};
+		expect(payload.error.code).toBe("codex_pinned_account_unavailable");
+		expect(payload.error.pin_source).toBe("forced");
+		// The account is disabled for good; no timer clears that.
+		expect(payload.error.reset_at).toBeNull();
+		expect(payload.error.retry_after_ms).toBeNull();
+	});
+
 	it("advertises the circuit deadline once repeated failures open the pinned account's breaker", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 2));

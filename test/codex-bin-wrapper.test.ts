@@ -4523,6 +4523,83 @@ describe("codex bin wrapper", () => {
 		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
 	});
 
+	// The other alias: `a` resolves to `apply`, which makes no model requests,
+	// so it must skip the rotation transport entirely — exactly like a spelled-
+	// out `codex apply` always did, instead of routing as an unknown token (#673).
+	it("forwards the `a` apply alias without starting the rotation transport (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			"console.log(`ALIAS_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["a"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(existsSync(markerPath)).toBe(false);
+		expect(output).toContain("ALIAS_HOME_IS_ORIGINAL:true");
+		expect(output).toContain("FORWARDED:a");
+		expect(output).not.toContain("model_provider=");
+	});
+
+	// A hidden root subcommand (absent from `codex --help`, real per
+	// `codex help execpolicy`) is still a command, not a prompt: it keeps the
+	// routing fall-through it always had instead of spinning up an interactive
+	// canonical-home helper that would outlive its short clean exit (#673).
+	it("classifies the hidden `execpolicy` subcommand as a command, not a prompt (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["execpolicy", "check"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+	});
+
 	// `resume`/`fork` are interactive TUI entry points, but they carry a forwarded
 	// subcommand, so they used to fall through to the shadow-home transport. The
 	// shadow mirror omits the runtime SQLite state, so the requested thread was

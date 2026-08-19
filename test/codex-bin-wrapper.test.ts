@@ -4329,6 +4329,200 @@ describe("codex bin wrapper", () => {
 		);
 	});
 
+	// The root grammar is `codex [OPTIONS] [PROMPT]`: an initial prompt makes the
+	// launch no less interactive, but the classifier used to read the first
+	// positional as a subcommand, so prompt-bearing launches fell through to the
+	// shadow-home transport. The shadow mirror deliberately omits the runtime
+	// SQLite state, so native Codex rebuilt the entire thread index from
+	// rollouts — a startup stall that scales with session history — before it
+	// submitted the already-delivered prompt (#673).
+	for (const promptForm of [
+		{
+			label: "a prompt after value-consuming options",
+			args: [
+				"-c",
+				'model_reasoning_effort="high"',
+				"-i",
+				"notes.png",
+				// `--cd` ends the greedy image span; without an option (or `--`)
+				// between them, native Codex reads the prompt as a second image.
+				"--cd",
+				".",
+				"Reply with exactly READY, then stop.",
+			],
+			prompt: "Reply with exactly READY, then stop.",
+			// The provider overrides are injected before the prompt, so the
+			// prompt stays the final argument with the last override beside it.
+			penultimateArg: 'model_provider="codex-multi-auth-runtime-proxy"',
+		},
+		{
+			// `--` forces the positional, so prompt text that spells a real
+			// command name must still launch the TUI: native Codex parses
+			// `codex -- exec` as the prompt "exec", not as the exec subcommand.
+			label: "a `--`-forced prompt that spells a command name",
+			args: ["--", "exec"],
+			prompt: "exec",
+			// The overrides must land on the option side of the `--`, or Codex
+			// would read them as prompt text.
+			penultimateArg: "--",
+		},
+		{
+			// `-i/--image` is greedy: native Codex consumes every free token up
+			// to the next option, so the image list must stay contiguous and the
+			// injected overrides must land after it — an override pair splitting
+			// the list would demote the second image to the prompt and make the
+			// real prompt an "unexpected argument" hard error.
+			label: "a prompt after a greedy multi-image option",
+			args: ["-i", "a.png", "b.png", "--cd", ".", "look at these"],
+			prompt: "look at these",
+			penultimateArg: 'model_provider="codex-multi-auth-runtime-proxy"',
+		},
+	] as const) {
+		it(`uses the canonical Codex home for a TUI launch with ${promptForm.label} (#673)`, async () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				'const fs = require("node:fs");',
+				'const path = require("node:path");',
+				"const args = process.argv.slice(2);",
+				'if (args[0] === "app-server") {',
+				'  console.log(`APP_SERVER_FORWARDED:${args.join(" ")}`);',
+				"  process.exit(0);",
+				"}",
+				"console.log(`PROMPT_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				// The thread index only exists in the canonical home; the shadow
+				// mirror omits it, which is what forced the startup rebuild.
+				'const statePath = path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite");',
+				"console.log(`PROMPT_SEES_THREAD_INDEX:${fs.existsSync(statePath)}`);",
+				`console.log(\`PROMPT_ARG_VERBATIM:\${args.includes(${JSON.stringify(
+					promptForm.prompt,
+				)})}\`);`,
+				"console.log(`PROMPT_LAST_ARG:${args[args.length - 1]}`);",
+				"console.log(`PROMPT_PENULTIMATE_ARG:${args[args.length - 2]}`);",
+				'console.log(`PROMPT_HAS_BASE_URL_OVERRIDE:${args.some((arg) => arg.includes("model_providers.codex-multi-auth-runtime-proxy.base_url="))}`);',
+				"console.log(`PROMPT_CLI_PATH_IS_SHIM:${(process.env.CODEX_CLI_PATH ?? \"\").includes(\"app-server-shims\")}`);",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
+			writeFileSync(
+				join(originalHome, "state_5.sqlite"),
+				"canonical-thread-index\n",
+				"utf8",
+			);
+
+			const result = runWrapper(fixtureRoot, [...promptForm.args], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				ORIGINAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				OPENAI_API_KEY: undefined,
+			});
+
+			const output = combinedOutput(result);
+			if (result.status !== 0) {
+				throw new Error(output);
+			}
+			expect(output).toContain("PROMPT_HOME_IS_ORIGINAL:true");
+			expect(output).toContain("PROMPT_SEES_THREAD_INDEX:true");
+			expect(output).toContain("PROMPT_ARG_VERBATIM:true");
+			expect(output).toContain(`PROMPT_LAST_ARG:${promptForm.prompt}`);
+			expect(output).toContain(
+				`PROMPT_PENULTIMATE_ARG:${promptForm.penultimateArg}`,
+			);
+			// Rotation is still active: the proxy overrides ride along as `-c` args.
+			expect(output).toContain("PROMPT_HAS_BASE_URL_OVERRIDE:true");
+			expect(output).toContain("PROMPT_CLI_PATH_IS_SHIM:true");
+			// The canonical home is never rewritten on disk.
+			expect(readFileSync(join(originalHome, "config.toml"), "utf8")).toBe(
+				'model_provider = "openai"\n',
+			);
+			await waitForFileText(markerPath, "start:http://127.0.0.1:4567\nclose\n");
+		});
+	}
+
+	// Native Codex fills the root `[PROMPT]` slot with the first free token and
+	// still tries a later one as a subcommand: `codex hello exec …` runs exec.
+	// The classifier scans past unknown positionals the same way, so this stays
+	// a noninteractive exec on the isolated shadow home (#673).
+	it("classifies a command after a filled prompt slot like native Codex (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["hello", "exec", "echo hi"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+	});
+
+	// The alias resolves through the same allowlist as its canonical command, so
+	// `codex e ...` must classify exactly like `codex exec ...` — a real
+	// noninteractive request on the isolated shadow home, not a prompt (#673).
+	it("keeps the `e` exec alias on the shadow Codex home (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["e", "do something"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
+	});
+
 	// `resume`/`fork` are interactive TUI entry points, but they carry a forwarded
 	// subcommand, so they used to fall through to the shadow-home transport. The
 	// shadow mirror omits the runtime SQLite state, so the requested thread was

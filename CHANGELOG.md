@@ -5,6 +5,24 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md).
 
+## [2.8.7] - 2026-08-21
+
+`codex "your prompt"` took the slow shadow-home startup path, prompt text after `--` was parsed as configuration, and the pinned-account 503 called every recovery deadline a limit reset. [Full notes](docs/releases/v2.8.7.md).
+
+### Fixed
+
+- A root TUI launch carrying the optional initial prompt (`codex "your prompt"`) keeps the canonical `CODEX_HOME`. It was classified as a subcommand launch and took the shadow home, whose omitted SQLite state made Codex rebuild its whole thread index from rollouts before submitting the prompt you had already typed ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+- A prompt forced with `--` is treated as a prompt, so `codex -- exec` opens a session whose prompt is the word "exec" rather than dispatching the exec subcommand — matching how Codex itself parses it ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+- The launcher no longer reads flags out of prompt text: `--account`, `-m`/`--model`, and `--config=` written after a `--` are left alone instead of being stripped, treated as settings, or rewritten in place on a retry ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+- Wrapper-injected options are placed on the option side of `--` instead of appended. Appending put them in the subcommand's positional list, so `codex exec -- ...` failed with `unexpected argument '-c' found`, `codex sandbox -- echo hi` passed the pair to the sandboxed command, and `codex mcp add t -- echo hi` wrote it into that server's stored `args` in `config.toml` ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+- The pinned-account 503 words its recovery deadline by the blocker actually holding the account — circuit breaker, cooldown, or rate limit — instead of calling every deadline a recorded limit reset, which made provider outages read as blown subscription quotas ([#676](https://github.com/ndycode/codex-multi-auth/pull/676))
+- That wording is taken from the pin's live runtime state rather than the retry loop's selection verdict, so the common case where the pinned account 429s mid-request no longer reports the internal token `already-attempted` with a deadline attributed to nothing ([#676](https://github.com/ndycode/codex-multi-auth/pull/676))
+- The quota phrasing is used only when the rate limit is what bounds recovery; when a cooldown or breaker ends later, the deadline is worded neutrally ([#676](https://github.com/ndycode/codex-multi-auth/pull/676))
+
+### Changed
+
+- `docs/development/ARCHITECTURE.md` and `docs/development/CONFIG_FLOW.md` describe the interactive-TUI branch as covering prompt-bearing launches, matching the routing the wrapper now performs ([#674](https://github.com/ndycode/codex-multi-auth/pull/674))
+
 ## [2.8.6] - 2026-08-16
 
 `forecast --model` reported an account `ready` while every request to it failed, and the pinned-account 503 told forced pins to run a command that clears nothing. [Full notes](docs/releases/v2.8.6.md).

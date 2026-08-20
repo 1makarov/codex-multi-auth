@@ -55,7 +55,7 @@ Official Codex CLI
 
 Runtime rotation enabled -> one of two homes, over four branches
   |
-  |- interactive TUI (no forwarded subcommand), resume, fork
+  |- interactive TUI (no forwarded subcommand, or a root [PROMPT]), resume, fork
   |    canonical CODEX_HOME + ephemeral -c provider overrides
   |    (no shadow copy, no provider/transport rewrite of config.toml,
   |     detach on exit; the auth-store reconcile above still applies)
@@ -171,7 +171,7 @@ Policy evaluation (`lib/policy/runtime-policy.ts`) can block paused/drained acco
 
    | Branch | Predicate | Transport |
    | --- | --- | --- |
-   | Interactive TUI | `isCodexInteractiveTuiCommand` — no forwarded subcommand at all | App runtime helper with `useCanonicalHome: true` and `detachOnExit: true`. Runs against the **canonical** `CODEX_HOME`; the provider is passed as ephemeral `-c model_providers.*` overrides. No shadow copy and no state sync-back. Nothing **provider- or transport-related** is written into `config.toml` on this path — the only top-level key the wrapper still reconciles there is `cli_auth_credentials_store`, which is transport-independent (see step 4 note). |
+   | Interactive TUI | `isCodexInteractiveTuiCommand` — no forwarded root subcommand: bare `codex [OPTIONS]`, and `codex [OPTIONS] [PROMPT]` with the optional initial prompt, including one forced by `--`. A first positional that does not name a real root subcommand is that prompt, not a command (#673). | App runtime helper with `useCanonicalHome: true` and `detachOnExit: true`. Runs against the **canonical** `CODEX_HOME`; the provider is passed as ephemeral `-c model_providers.*` overrides. No shadow copy and no state sync-back. Nothing **provider- or transport-related** is written into `config.toml` on this path — the only top-level key the wrapper still reconciles there is `cli_auth_credentials_store`, which is transport-independent (see step 4 note). |
    | Interactive `resume` / `fork` | `isCodexInteractiveResumeCommand` — forwarded command is `resume` or `fork` | Same transport and options as the interactive TUI above. These open a TUI against an existing thread, so they must see the canonical thread index. |
    | `app-server` | `isCodexAppServerCommand` — forwarded command is `app-server` | App runtime helper with `useCanonicalHome: true`, `detachOnExit: false`, `installAppServerShim: false`, and `proxyAppServerAccountRead: true`. Same canonical home as the interactive branches; the differences are that a resident server owns its proxy for its whole lifetime rather than detaching it, and that the account-response rewriting is requested explicitly because no shim is present to set the label env. |
    | `codex app` | `isCodexAppCommand` — forwarded command is `app` | App runtime helper process with a shadow `CODEX_HOME`, plus the app-server CLI shim. |

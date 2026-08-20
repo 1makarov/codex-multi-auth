@@ -1870,6 +1870,11 @@ async function forwardToRealCodex(codexBin, rawArgs, baseEnv = process.env) {
 function hasCliAuthCredentialsStoreOverride(args) {
 	for (let i = 0; i < args.length; i += 1) {
 		const arg = args[i];
+		// Everything after `--` is the root `[PROMPT]` positional, not options:
+		// a prompt whose text spells `--config=cli_auth_credentials_store=...` is
+		// not a caller override, and treating it as one would silently drop the
+		// file auth store this wrapper depends on.
+		if (arg === "--") break;
 		if (arg === "-c" || arg === "--config") {
 			const next = args[i + 1];
 			if (!next || !next.includes("=")) continue;
@@ -4933,7 +4938,7 @@ async function createRuntimeRotationAppHelperContext(
 		args:
 			options.injectArgsBeforeRootPrompt === true
 				? insertArgsBeforeRootPrompt(baseContext.args, injectedArgs)
-				: [...baseContext.args, ...injectedArgs],
+				: insertArgsBeforeForwardedSeparator(baseContext.args, injectedArgs),
 		env: {
 			...baseContext.env,
 			...helperEnv,
@@ -5329,6 +5334,33 @@ function insertArgsBeforeRootPrompt(baseArgs, injectedArgs) {
 	];
 }
 
+// Inserts args before a `--` separator when one is present, else appends.
+// Subcommand argv keeps its leading subcommand token — `resume`/`fork` argv is
+// pinned to it — but anything appended past a `--` lands in the subcommand's
+// own positional list: Codex rejects that outright for `exec`/`review`
+// ("unexpected argument '-c' found"), and worse, silently forwards it as
+// arguments for `sandbox` and into the stored config for `mcp add`. The
+// separator bounds the append.
+function insertArgsBeforeForwardedSeparator(baseArgs, injectedArgs) {
+	// Deliberately not `findRootPositional`: that reports where the option side
+	// ends, stopping at the first positional, and a subcommand's own arguments
+	// are positionals — it would answer `exec` for `exec -- hi`. The question
+	// here is only where the separator sits, and a bare `indexOf` answers it
+	// exactly: clap never consumes `--` as an option value (`codex --cd -- hi`
+	// is "a value is required for '--cd'"), so the first `--` is always the
+	// separator, and it always follows the subcommand token because
+	// `findForwardedCommand` returns null the moment it sees one.
+	const separatorIndex = baseArgs.indexOf("--");
+	if (separatorIndex === -1) {
+		return [...baseArgs, ...injectedArgs];
+	}
+	return [
+		...baseArgs.slice(0, separatorIndex),
+		...injectedArgs,
+		...baseArgs.slice(separatorIndex),
+	];
+}
+
 function findForwardedSubcommand(rawArgs, commandIndex) {
 	const { index, terminatorIndex } = findRootPositional(
 		rawArgs,
@@ -5641,7 +5673,7 @@ function buildForwardArgs(rawArgs) {
 		args:
 			findForwardedCommand(compatibilityArgs) === null
 				? insertArgsBeforeRootPrompt(compatibilityArgs, authStoreArgs)
-				: [...compatibilityArgs, ...authStoreArgs],
+				: insertArgsBeforeForwardedSeparator(compatibilityArgs, authStoreArgs),
 		requestedModel,
 	};
 }

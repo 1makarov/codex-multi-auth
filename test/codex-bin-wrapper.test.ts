@@ -4753,6 +4753,55 @@ describe("codex bin wrapper", () => {
 		});
 	}
 
+	// The rotation helper injects its own options (shim args plus
+	// `-c model_provider=...`) into subcommand argv, and appending those past a
+	// `--` hands them to the subcommand as positionals instead. The separator
+	// bounds that injection too (#673).
+	it("injects rotation helper args before a `--` on the resume path (#673)", async () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			"const args = process.argv.slice(2);",
+			'if (args[0] === "app-server") process.exit(0);',
+			"const sep = args.indexOf(\"--\");",
+			"console.log(`SEP_INDEX:${sep}`);",
+			"console.log(`AFTER_SEP:${args.slice(sep + 1).join(\" \")}`);",
+			'console.log(`OVERRIDE_BEFORE_SEP:${args.slice(0, sep).some((a) => a.startsWith("model_provider="))}`);',
+			"console.log(`FIRST_ARG:${args[0]}`);",
+			"process.exit(0);",
+		]);
+		const originalHome = join(fixtureRoot, "codex-home");
+		const markerPath = join(fixtureRoot, "proxy-marker.txt");
+		mkdirSync(originalHome, { recursive: true });
+		writeFileSync(
+			join(originalHome, "config.toml"),
+			'model_provider = "openai"\n',
+			"utf8",
+		);
+
+		const result = runWrapper(fixtureRoot, ["resume", "--last", "--", "do it"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			CODEX_HOME: originalHome,
+			ORIGINAL_CODEX_HOME: originalHome,
+			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+			CODEX_MULTI_AUTH_APP_ROTATION_IDLE_MS: "200",
+			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+			OPENAI_API_KEY: undefined,
+		});
+
+		const output = combinedOutput(result);
+		if (result.status !== 0) {
+			throw new Error(output);
+		}
+		// The subcommand still leads, the injected overrides sit on the option
+		// side, and only the user's own text survives past the separator.
+		expect(output).toContain("FIRST_ARG:resume");
+		expect(output).toContain("AFTER_SEP:do it");
+		expect(output).toContain("OVERRIDE_BEFORE_SEP:true");
+		await waitForFileText(markerPath, "start:http://127.0.0.1:4567\nclose\n");
+	});
+
 	// Printing help makes no model requests, so it must not pay for the rotation
 	// transport at all. This matters most for resume/fork now that they are
 	// interactive: that branch detaches its helper on a clean exit, so a helper
@@ -5453,6 +5502,47 @@ describe("codex bin wrapper", () => {
 		expect(
 			result.stdout.match(/cli_auth_credentials_store=/g) ?? [],
 		).toHaveLength(1);
+	});
+
+	// Everything after `--` is the root prompt, so prompt text that happens to
+	// spell the override is not a caller override. Scanning past `--` would let
+	// it suppress the injection and silently drop the file auth store (#673).
+	it("still injects the file auth store when the prompt text spells the override (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		// A single token, which is the only runnable shape that tripped the old
+		// scan: a two-token `-c <assignment>` prompt is surplus positionals that
+		// Codex rejects before any of this matters.
+		const result = runWrapper(
+			fixtureRoot,
+			["--", '--config=cli_auth_credentials_store="keyring"'],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+			},
+		);
+
+		expect(result.status).toBe(0);
+		// The wrapper's own override is injected ahead of the `--`, and the
+		// prompt text reaches Codex untouched behind it.
+		expect(result.stdout).toContain(
+			'FORWARDED:-c cli_auth_credentials_store="file" -- --config=cli_auth_credentials_store="keyring"',
+		);
+	});
+
+	// Appending past a `--` puts the injected pair in the subcommand's own
+	// positional list, which Codex rejects with "unexpected argument '-c'".
+	// The separator bounds the append for subcommand argv too (#673).
+	it("injects the file auth store before a subcommand's `--` separator (#673)", () => {
+		const fixtureRoot = createWrapperFixture();
+		const fakeBin = createFakeCodexBin(fixtureRoot);
+		const result = runWrapper(fixtureRoot, ["exec", "--", "do the thing"], {
+			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+		});
+
+		expect(result.status).toBe(0);
+		expect(result.stdout).toContain(
+			'FORWARDED:exec -c cli_auth_credentials_store="file" -- do the thing',
+		);
 	});
 
 	it("propagates downstream file-store write errors from forwarded wrapper execution", () => {

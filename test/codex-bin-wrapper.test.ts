@@ -1287,6 +1287,76 @@ describe("codex bin wrapper", () => {
 		expect(output).not.toContain("--account");
 	});
 
+	// `--` makes everything after it the root `[PROMPT]` positional, so a
+	// launcher-only flag spelled inside that prompt is the user's text. The
+	// stripper walked the whole argv, so it both mangled the prompt and pinned
+	// the run to an account nobody selected — or hard-failed on a range check
+	// for a launch that contained no flag at all.
+	it("leaves a `--account` inside a `--`-forced prompt as prompt text", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeAccountsFixture(originalHome, 3);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			'console.log(`FORCED_INDEX:${process.env.CODEX_MULTI_AUTH_FORCE_ACCOUNT_INDEX ?? ""}`);',
+			"process.exit(0);",
+		]);
+
+		const result = runWrapper(
+			fixtureRoot,
+			["exec", "--", "--account", "3", "is", "wrong"],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+				OPENAI_API_KEY: undefined,
+			},
+		);
+
+		const output = combinedOutput(result);
+		expect(result.status).toBe(0);
+		// The prompt reaches Codex intact, flag tokens and all.
+		expect(output).toContain("-- --account 3 is wrong");
+		// And no pin was inferred from the user's prose.
+		expect(output).toContain("FORCED_INDEX:");
+		expect(output).not.toContain("FORCED_INDEX:2");
+	});
+
+	// Same boundary, different scanner: a `-m` inside the prompt named no
+	// model, but the wrapper read one and then rewrote it in place on the
+	// unsupported-model retry — editing the user's prompt text before
+	// re-forwarding it.
+	it("does not read or rewrite a `-m` inside a `--`-forced prompt", () => {
+		const fixtureRoot = createWrapperFixture();
+		createRuntimeRotationProxyFixtureModule(fixtureRoot);
+		const originalHome = join(fixtureRoot, "codex-home");
+		mkdirSync(originalHome, { recursive: true });
+		writeAccountsFixture(originalHome, 1);
+		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+			"#!/usr/bin/env node",
+			'console.log(`FORWARDED:${process.argv.slice(2).join(" ")}`);',
+			"process.exit(0);",
+		]);
+
+		const result = runWrapper(
+			fixtureRoot,
+			["exec", "--", "-m", "gpt-4", "please", "fix"],
+			{
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "0",
+				OPENAI_API_KEY: undefined,
+			},
+		);
+
+		const output = combinedOutput(result);
+		expect(result.status).toBe(0);
+		expect(output).toContain("-- -m gpt-4 please fix");
+	});
+
 	it("repairs local session index and suppresses known Codex rollout-store noise", () => {
 		const fixtureRoot = createWrapperFixture();
 		const codexHome = join(fixtureRoot, "codex-home");
@@ -4564,41 +4634,51 @@ describe("codex bin wrapper", () => {
 	});
 
 	// A hidden root subcommand (absent from `codex --help`, real per
-	// `codex help execpolicy`) is still a command, not a prompt: it keeps the
+	// `codex help <name>`) is still a command, not a prompt: it keeps the
 	// routing fall-through it always had instead of spinning up an interactive
 	// canonical-home helper that would outlive its short clean exit (#673).
-	it("classifies the hidden `execpolicy` subcommand as a command, not a prompt (#673)", () => {
-		const fixtureRoot = createWrapperFixture();
-		createRuntimeRotationProxyFixtureModule(fixtureRoot);
-		const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
-			"#!/usr/bin/env node",
-			"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
-			"process.exit(0);",
-		]);
-		const originalHome = join(fixtureRoot, "codex-home");
-		const markerPath = join(fixtureRoot, "proxy-marker.txt");
-		mkdirSync(originalHome, { recursive: true });
-		writeFileSync(
-			join(originalHome, "config.toml"),
-			'model_provider = "openai"\n',
-			"utf8",
-		);
+	//
+	// The allowlist is what decides this, so a real root command missing from
+	// it is misrouted rather than merely misnamed. `stdio-to-uds` is that case:
+	// it is a genuine hidden root subcommand of codex-cli, and every invocation
+	// classified as a prompt left a detached helper idling behind it.
+	for (const args of [
+		["execpolicy", "check"],
+		["stdio-to-uds", "/tmp/codex.sock"],
+	] as const) {
+		it(`classifies the hidden \`${args[0]}\` subcommand as a command, not a prompt (#673)`, () => {
+			const fixtureRoot = createWrapperFixture();
+			createRuntimeRotationProxyFixtureModule(fixtureRoot);
+			const fakeBin = createCustomFakeCodexBin(fixtureRoot, [
+				"#!/usr/bin/env node",
+				"console.log(`SHADOW_HOME_IS_ORIGINAL:${process.env.CODEX_HOME === process.env.ORIGINAL_CODEX_HOME}`);",
+				"process.exit(0);",
+			]);
+			const originalHome = join(fixtureRoot, "codex-home");
+			const markerPath = join(fixtureRoot, "proxy-marker.txt");
+			mkdirSync(originalHome, { recursive: true });
+			writeFileSync(
+				join(originalHome, "config.toml"),
+				'model_provider = "openai"\n',
+				"utf8",
+			);
 
-		const result = runWrapper(fixtureRoot, ["execpolicy", "check"], {
-			CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
-			CODEX_HOME: originalHome,
-			ORIGINAL_CODEX_HOME: originalHome,
-			CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
-			CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
-			OPENAI_API_KEY: undefined,
+			const result = runWrapper(fixtureRoot, [...args], {
+				CODEX_MULTI_AUTH_REAL_CODEX_BIN: fakeBin,
+				CODEX_HOME: originalHome,
+				ORIGINAL_CODEX_HOME: originalHome,
+				CODEX_MULTI_AUTH_RUNTIME_ROTATION_PROXY: "1",
+				CODEX_MULTI_AUTH_TEST_PROXY_MARKER: markerPath,
+				OPENAI_API_KEY: undefined,
+			});
+
+			const output = combinedOutput(result);
+			if (result.status !== 0) {
+				throw new Error(output);
+			}
+			expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
 		});
-
-		const output = combinedOutput(result);
-		if (result.status !== 0) {
-			throw new Error(output);
-		}
-		expect(output).toContain("SHADOW_HOME_IS_ORIGINAL:false");
-	});
+	}
 
 	// `resume`/`fork` are interactive TUI entry points, but they carry a forwarded
 	// subcommand, so they used to fall through to the shadow-home transport. The

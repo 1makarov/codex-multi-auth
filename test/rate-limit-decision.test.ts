@@ -389,6 +389,51 @@ describe("buildPinnedUnavailableErrorBody", () => {
 		);
 	});
 
+	it("keeps quota phrasing when the rate limit supplies the recovery bound", () => {
+		const resetAtMs = 1_700_000_030_000;
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "rate-limited"]]),
+			{
+				pinSource: "manual",
+				resetAtMs,
+				rateLimitResetAtMs: resetAtMs,
+				now: 1_700_000_000_000,
+			},
+		);
+		expect(body.message).toContain(
+			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+		);
+	});
+
+	it("does not call a later breaker or cooldown deadline a rate-limit reset", () => {
+		// Skip-reason precedence reports "rate-limited" whenever a live limit
+		// exists, but the recovery bound is the max of every gating record — a
+		// breaker tripped seconds ago can end after a limit about to expire.
+		// Wording that later timestamp as the limit's reset would be the same
+		// misattribution this change removes from the transient classes.
+		const rateLimitResetAtMs = 1_700_000_010_000;
+		const resetAtMs = 1_700_000_030_000;
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "rate-limited"]]),
+			{
+				pinSource: "forced",
+				resetAtMs,
+				rateLimitResetAtMs,
+				now: 1_700_000_000_000,
+			},
+		);
+		// Contract untouched: reset_at still advertises the full recovery bound.
+		expect(body.reason).toBe("rate-limited");
+		expect(body.reset_at).toBe(new Date(resetAtMs).toISOString());
+		expect(body.message).toContain("(rate-limited)");
+		expect(body.message).toContain(
+			`the account is expected to be available again at ${new Date(resetAtMs).toISOString()}`,
+		);
+		expect(body.message).not.toContain("limit resets");
+	});
+
 	it("passes an unknown skip token through verbatim with neutral recovery wording", () => {
 		// The retry loop reports selection verdicts like "already-attempted"
 		// through the same seam; those must stay legible without claiming a

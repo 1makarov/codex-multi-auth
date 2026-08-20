@@ -73,7 +73,10 @@ import {
 	responseHeadersForClient,
 	withTimeout,
 } from "./request/stream-failover-runtime.js";
-import { getAccountRecoveryTimeForFamily } from "./runtime/account-status.js";
+import {
+	getAccountRecoveryTimeForFamily,
+	getRateLimitRecoveryTimeForFamily,
+} from "./runtime/account-status.js";
 import { chooseAccount } from "./runtime/rotation-account-selection.js";
 import {
 	createRotationProxyState,
@@ -1655,6 +1658,18 @@ async function handleRequestInner(
 							pinnedStateRecoveryAtMs ?? 0,
 							pinnedCircuitRecoveryAtMs ?? 0,
 						);
+			// The rate-limit records' own bound, so the message only words the
+			// recovery deadline as a rate-limit reset when the rate limit is in
+			// fact what supplies it — a breaker or cooldown can end later.
+			const pinnedRateLimitResetAtMs =
+				pinnedAccount === null
+					? null
+					: getRateLimitRecoveryTimeForFamily(
+							pinnedAccount,
+							state.now(),
+							context.family,
+							context.model,
+						);
 			const errorBody = buildPinnedUnavailableErrorBody(
 				pinnedIndex,
 				accountSkipReasons,
@@ -1663,6 +1678,7 @@ async function handleRequestInner(
 					pinSource:
 						typeof state.forcedAccountIndex === "number" ? "forced" : "manual",
 					resetAtMs: pinnedResetAtMs,
+					rateLimitResetAtMs: pinnedRateLimitResetAtMs,
 					now: state.now(),
 				},
 			);

@@ -75,6 +75,37 @@ export function getAccountRecoveryTimeForFamily(
 	return latest;
 }
 
+/**
+ * The rate-limit portion of getAccountRecoveryTimeForFamily: the latest
+ * active bound among exactly the two keys selection consults, with cooldowns
+ * excluded. The pinned-503 uses it to decide whether the recovery deadline it
+ * advertises is in fact the rate limit's own reset — with a breaker or
+ * cooldown ending later, the full recovery bound outlives the rate limit and
+ * must not be worded as its reset. Null when no rate-limit record gates the
+ * request.
+ */
+export function getRateLimitRecoveryTimeForFamily(
+	account: {
+		rateLimitResetTimes?: Record<string, number | undefined>;
+	},
+	now: number,
+	family: ModelFamily,
+	model?: string | null,
+): number | null {
+	let latest: number | null = null;
+	const consider = (value: number | undefined): void => {
+		if (typeof value !== "number" || !Number.isFinite(value)) return;
+		if (value <= now) return;
+		if (latest === null || value > latest) latest = value;
+	};
+	const times = account.rateLimitResetTimes;
+	if (times) {
+		consider(times[getQuotaKey(family)]);
+		if (model) consider(times[getQuotaKey(family, model)]);
+	}
+	return latest;
+}
+
 export function formatRateLimitEntry(
 	account: { rateLimitResetTimes?: Record<string, number | undefined> },
 	now: number,

@@ -210,6 +210,15 @@ export interface PinnedUnavailableContext {
 	pinSource?: "forced" | "manual" | null;
 	/** Epoch ms when the blocking record ends (rate limit or cooldown). */
 	resetAtMs?: number | null;
+	/**
+	 * Epoch ms when the rate-limit records alone stop gating the request,
+	 * when the caller knows it. `resetAtMs` is the max across every gating
+	 * record, so a `rate-limited` skip reason can carry a deadline supplied
+	 * by a breaker or cooldown that ends later — the quota phrasing is only
+	 * used when the rate limit itself is that bound. Omitted entirely means
+	 * unknown: trust the skip reason.
+	 */
+	rateLimitResetAtMs?: number | null;
 	now?: number;
 }
 
@@ -222,7 +231,10 @@ export interface PinnedUnavailableContext {
  * backend incident as a blown subscription quota. Only the message changes —
  * the machine-readable `reason` keeps the raw skip token.
  */
-function describePinnedBlocker(skipReason: string | null): {
+function describePinnedBlocker(
+	skipReason: string | null,
+	rateLimitBoundsRecovery: boolean,
+): {
 	parenthetical: string | null;
 	deadline: (resetAt: string) => string;
 } {
@@ -236,7 +248,13 @@ function describePinnedBlocker(skipReason: string | null): {
 		case "rate-limited":
 			return {
 				parenthetical: "rate-limited",
-				deadline: (resetAt) => `the rate limit resets at ${resetAt}`,
+				// A breaker or cooldown can outlive the rate limit; the deadline
+				// is the max of every gating record, so it is only worded as the
+				// limit's reset when the rate limit actually supplies it.
+				deadline: rateLimitBoundsRecovery
+					? (resetAt) => `the rate limit resets at ${resetAt}`
+					: (resetAt) =>
+							`the account is expected to be available again at ${resetAt}`,
 			};
 		case "circuit-open":
 			return {
@@ -291,10 +309,6 @@ export function buildPinnedUnavailableErrorBody(
 		normalizedPinnedIndex !== null
 			? accountSkipReasons.get(normalizedPinnedIndex) ?? null
 			: null;
-	const blocker = describePinnedBlocker(skipReason);
-	const reasonSuffix = blocker.parenthetical
-		? ` (${blocker.parenthetical})`
-		: "";
 	// On the desync path the pin index is unknown (null); claiming "account 1"
 	// there would contradict the machine-readable pinnedAccountIndex: null.
 	const accountPhrase =
@@ -320,6 +334,20 @@ export function buildPinnedUnavailableErrorBody(
 	const now = context?.now ?? Date.now();
 	const retryAfterMs = resetAtMs !== null ? Math.max(0, resetAtMs - now) : null;
 	const resetAt = resetAtMs !== null ? new Date(resetAtMs).toISOString() : null;
+	// A context without the key at all means the caller did not measure the
+	// rate-limit bound (older callers, unit seams): trust the skip reason. A
+	// present key whose value is not a live bound at-or-past the recovery
+	// deadline — null, undefined, or earlier — demotes to the neutral
+	// phrasing, which stays true for a live rate limit either way.
+	const rateLimitBoundsRecovery =
+		!("rateLimitResetAtMs" in (context ?? {})) ||
+		(typeof context?.rateLimitResetAtMs === "number" &&
+			resetAtMs !== null &&
+			context.rateLimitResetAtMs >= resetAtMs);
+	const blocker = describePinnedBlocker(skipReason, rateLimitBoundsRecovery);
+	const reasonSuffix = blocker.parenthetical
+		? ` (${blocker.parenthetical})`
+		: "";
 	const waitSuffix = resetAt !== null ? `; ${blocker.deadline(resetAt)}` : "";
 	// A forced pin belongs to the launching process, not to the persisted pin
 	// state, so `unpin` would clear nothing — say what actually helps.

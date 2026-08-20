@@ -1,6 +1,6 @@
 # Command Reference
 
-Complete command, flag, and hotkey reference for `codex-multi-auth` (package `2.8.6`).
+Complete command, flag, and hotkey reference for `codex-multi-auth` (package `2.8.7`).
 
 ---
 

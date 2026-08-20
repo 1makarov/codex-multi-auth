@@ -32,7 +32,8 @@ Public documentation for the `codex-multi-auth` Codex CLI multi-account OAuth ma
 
 | Document | Focus |
 | --- | --- |
-| [releases/v2.8.6.md](releases/v2.8.6.md) | Current stable release notes (install via `npm i -g codex-multi-auth`) |
+| [releases/v2.8.7.md](releases/v2.8.7.md) | Current stable release notes (install via `npm i -g codex-multi-auth`) |
+| [releases/v2.8.6.md](releases/v2.8.6.md) | Prior stable release notes |
 | [releases/v2.8.5.md](releases/v2.8.5.md) | Prior stable release notes |
 | [releases/v2.8.4.md](releases/v2.8.4.md) | Prior stable release notes |
 | [releases/v2.8.3.md](releases/v2.8.3.md) | Prior stable release notes |

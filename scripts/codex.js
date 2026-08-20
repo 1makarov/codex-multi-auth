@@ -421,6 +421,14 @@ function extractForcedAccountFlag(args) {
 	let sawFlag = false;
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
+		// `--` ends option parsing: everything after it is Codex's root
+		// `[PROMPT]` text. A `--account` spelled in there is the user's prompt,
+		// not a launcher flag — stripping it would both mangle the prompt and
+		// silently pin the run to an account nobody selected.
+		if (arg === "--") {
+			strippedArgs.push(...args.slice(index));
+			break;
+		}
 		if (arg === "--account") {
 			sawFlag = true;
 			const next = args[index + 1];
@@ -1365,6 +1373,9 @@ function replaceRequestedModel(args, nextModel) {
 	const nextArgs = [...args];
 	for (let i = 0; i < nextArgs.length; i += 1) {
 		const arg = nextArgs[i];
+		// Past `--` the tokens are the user's prompt. Rewriting one in place
+		// would edit the prompt text itself before re-forwarding it.
+		if (arg === "--") break;
 		if ((arg === "--model" || arg === "-m") && typeof nextArgs[i + 1] === "string") {
 			nextArgs[i + 1] = nextModel;
 			return nextArgs;
@@ -1859,6 +1870,11 @@ async function forwardToRealCodex(codexBin, rawArgs, baseEnv = process.env) {
 function hasCliAuthCredentialsStoreOverride(args) {
 	for (let i = 0; i < args.length; i += 1) {
 		const arg = args[i];
+		// Everything after `--` is the root `[PROMPT]` positional, not options:
+		// a prompt whose text spells `--config=cli_auth_credentials_store=...` is
+		// not a caller override, and treating it as one would silently drop the
+		// file auth store this wrapper depends on.
+		if (arg === "--") break;
 		if (arg === "-c" || arg === "--config") {
 			const next = args[i + 1];
 			if (!next || !next.includes("=")) continue;
@@ -2357,6 +2373,10 @@ function coerceReasoningEffortForModel(model, effort) {
 function extractRequestedModel(args) {
 	for (let i = 0; i < args.length; i += 1) {
 		const arg = args[i];
+		// Past `--` every token is root `[PROMPT]` text; a `-m` in there names
+		// no model, and reading one would coerce reasoning config for a model
+		// the user never requested.
+		if (arg === "--") break;
 		if (arg === "--model" || arg === "-m") {
 			const next = args[i + 1];
 			if (typeof next === "string" && next.trim().length > 0) {
@@ -2427,6 +2447,8 @@ function rewriteReasoningConfigArgs(rawArgs) {
 	const nextArgs = [...rawArgs];
 	for (let i = 0; i < nextArgs.length; i += 1) {
 		const arg = nextArgs[i];
+		// Past `--` a `-c key=value` pair is prompt text, not a config override.
+		if (arg === "--") break;
 		if ((arg === "-c" || arg === "--config") && typeof nextArgs[i + 1] === "string") {
 			nextArgs[i + 1] = rewriteReasoningConfigAssignment(
 				nextArgs[i + 1],
@@ -4903,13 +4925,20 @@ async function createRuntimeRotationAppHelperContext(
 		}
 	};
 
+	const injectedArgs = [
+		...helperArgs,
+		"-c",
+		`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
+	];
 	return {
-		args: [
-			...baseContext.args,
-			...helperArgs,
-			"-c",
-			`model_provider=${configTomlModule.tomlStringLiteral(RUNTIME_ROTATION_PROXY_PROVIDER_ID)}`,
-		],
+		// Root TUI argv can end in the optional `[PROMPT]` positional, and `--`
+		// binds everything after it to that positional — overrides appended
+		// there would become prompt text, so the interactive branch asks for
+		// them to be injected ahead of the prompt instead.
+		args:
+			options.injectArgsBeforeRootPrompt === true
+				? insertArgsBeforeRootPrompt(baseContext.args, injectedArgs)
+				: insertArgsBeforeForwardedSeparator(baseContext.args, injectedArgs),
 		env: {
 			...baseContext.env,
 			...helperEnv,
@@ -4991,13 +5020,19 @@ async function createRuntimeRotationProxyContextIfEnabled(
 	if (isCodexAppCommand(rawArgs)) {
 		return startAppHelperContext();
 	}
-	if (
-		isCodexInteractiveTuiCommand(rawArgs) ||
-		isCodexInteractiveResumeCommand(rawArgs)
-	) {
+	// Classify once: each predicate re-walks the whole argv, and the root-TUI
+	// answer is needed twice below.
+	const isRootTuiLaunch = isCodexInteractiveTuiCommand(rawArgs);
+	if (isRootTuiLaunch || isCodexInteractiveResumeCommand(rawArgs)) {
 		return startAppHelperContext({
 			detachOnExit: true,
 			useCanonicalHome: true,
+			// Root TUI launches may carry the optional `[PROMPT]` positional
+			// (possibly forced by `--`); the provider overrides must stay on the
+			// option side of it. `resume`/`fork` keep the appended ordering their
+			// argv has always forwarded with — their tokens are subcommand args,
+			// not the root prompt.
+			injectArgsBeforeRootPrompt: isRootTuiLaunch,
 		});
 	}
 
@@ -5088,90 +5123,257 @@ function isPureHelpOrVersionArgs(rawArgs) {
 	);
 }
 
+// Hoisted: every argv walk calls consumesNextArg once per token, and a Set
+// rebuilt per call allocated this list on every one of them.
+const OPTIONS_CONSUMING_NEXT_ARG = new Set([
+	"-c",
+	"--config",
+	"--enable",
+	"--disable",
+	"--listen",
+	"--remote",
+	"--remote-auth-token-env",
+	"--ws-auth",
+	"--ws-token-file",
+	"--ws-token-sha256",
+	"--ws-shared-secret-file",
+	"--ws-issuer",
+	"--ws-audience",
+	"--ws-max-clock-skew-seconds",
+	"--download-url",
+	"-i",
+	"--image",
+	"-m",
+	"--model",
+	"--local-provider",
+	"-p",
+	"--profile",
+	"-s",
+	"--sandbox",
+	"-a",
+	"--ask-for-approval",
+	"-C",
+	"--cd",
+	"--add-dir",
+	"--output-schema",
+	"--color",
+	"-o",
+	"--output-last-message",
+]);
+
 function consumesNextArg(arg) {
-	return new Set([
-		"-c",
-		"--config",
-		"--enable",
-		"--disable",
-		"--listen",
-		"--remote",
-		"--remote-auth-token-env",
-		"--ws-auth",
-		"--ws-token-file",
-		"--ws-token-sha256",
-		"--ws-shared-secret-file",
-		"--ws-issuer",
-		"--ws-audience",
-		"--ws-max-clock-skew-seconds",
-		"--download-url",
-		"-i",
-		"--image",
-		"-m",
-		"--model",
-		"--local-provider",
-		"-p",
-		"--profile",
-		"-s",
-		"--sandbox",
-		"-a",
-		"--ask-for-approval",
-		"-C",
-		"--cd",
-		"--add-dir",
-		"--output-schema",
-		"--color",
-		"-o",
-		"--output-last-message",
-	]).has(arg);
+	return OPTIONS_CONSUMING_NEXT_ARG.has(arg);
+}
+
+// Codex's root grammar is `codex [OPTIONS] [PROMPT]` / `codex [OPTIONS]
+// <COMMAND> [ARGS]`, so the first positional is only a command when it names a
+// real root subcommand — otherwise it is the optional initial prompt of an
+// interactive TUI launch. The allowlist mirrors `codex --help`; treating an
+// unknown positional as a prompt matches native Codex, where an unrecognized
+// token also falls through to the prompt positional rather than erroring as a
+// bad subcommand. Routing predicates all resolve through this map so aliases
+// classify like their canonical command.
+//
+// A real root subcommand missing from this set is misrouted, not merely
+// misnamed: it classifies as an interactive prompt and takes the app-helper
+// branch with `detachOnExit: true`, so a short-lived command leaves a detached
+// helper and its loopback proxy idling until the rotation idle timeout. Keep
+// the set in sync with the upstream grammar — clap publishes the authoritative
+// root list in its own completions, so
+//   codex completion bash | grep -oE 'opts="[^"]*"' | grep ' exec '
+// prints every root command (and alias) for the installed codex-cli.
+
+const CODEX_ROOT_COMMAND_ALIASES = new Map([
+	["e", "exec"],
+	["a", "apply"],
+]);
+const CODEX_ROOT_COMMANDS = new Set([
+	"exec",
+	"review",
+	"login",
+	"logout",
+	"mcp",
+	"plugin",
+	"mcp-server",
+	"app-server",
+	"remote-control",
+	"app",
+	"completion",
+	"update",
+	"doctor",
+	"sandbox",
+	"debug",
+	"apply",
+	"resume",
+	"archive",
+	"delete",
+	"migrate-rollouts",
+	"unarchive",
+	"fork",
+	"cloud",
+	"exec-server",
+	"features",
+	"help",
+	"auth",
+	// Hidden root subcommands: absent from `codex --help`, but real — each is
+	// documented by `codex help <name>`.
+	"responses-api-proxy",
+	"cloud-tasks",
+	"execpolicy",
+	// Internal stdio/UDS relay. Hidden like the three above, and short-lived:
+	// omitting it classified `codex stdio-to-uds <socket>` as a root prompt,
+	// which took the detached app-helper branch and leaked a helper per call.
+	"stdio-to-uds",
+]);
+
+function resolveCodexRootCommand(token) {
+	const command = CODEX_ROOT_COMMAND_ALIASES.get(token) ?? token;
+	return CODEX_ROOT_COMMANDS.has(command) ? command : null;
+}
+
+// `-i/--image` is greedy (`<FILE>...`): native Codex consumes every following
+// free token up to the next option-like token, so a prompt can only follow the
+// image list after another option or a `--`. Every argv walker below skips the
+// same span, or the wrapper would disagree with native Codex about where the
+// positional side starts.
+function consumesRemainingFreeArgs(arg) {
+	return arg === "-i" || arg === "--image";
+}
+
+function skipOptionValueSpan(args, i) {
+	const arg = args[i];
+	if (consumesRemainingFreeArgs(arg)) {
+		let end = i;
+		while (
+			end + 1 < args.length &&
+			typeof args[end + 1] === "string" &&
+			args[end + 1].length > 0 &&
+			(args[end + 1] === "-" || !args[end + 1].startsWith("-"))
+		) {
+			end += 1;
+		}
+		return end;
+	}
+	return consumesNextArg(arg) ? i + 1 : i;
+}
+
+/**
+ * The single definition of where an argv's option side ends. Walking from
+ * `startIndex`, skips option flags and the values they consume — including a
+ * greedy `-i a.png b.png` span — and reports what stopped the walk:
+ *
+ * - `index`: the first free (positional) token, or null when there is none.
+ * - `terminatorIndex`: the bare `--` that ended option parsing, or null.
+ * - `boundary`: where option-side content ends, i.e. the positional, the
+ *   `--`, or `args.length`. This is where injected overrides belong.
+ *
+ * Callers keep their own policy for `--` (the root grammar binds everything
+ * after it to `[PROMPT]`; a subcommand's does not), but they must not keep
+ * their own copy of the walk: a classifier and an injector that disagree by
+ * one token put a `-c` override into prompt text or read prompt text as a
+ * subcommand.
+ */
+function findRootPositional(args, startIndex = 0) {
+	if (!Array.isArray(args)) {
+		return { index: null, terminatorIndex: null, boundary: 0 };
+	}
+	for (let i = startIndex; i < args.length; i += 1) {
+		const arg = args[i];
+		if (typeof arg !== "string" || arg.length === 0) continue;
+		if (arg === "--") {
+			return { index: null, terminatorIndex: i, boundary: i };
+		}
+		if (arg.startsWith("--config=")) {
+			continue;
+		}
+		if (arg.startsWith("--") || (arg.startsWith("-") && arg !== "-")) {
+			i = skipOptionValueSpan(args, i);
+			continue;
+		}
+		return { index: i, terminatorIndex: null, boundary: i };
+	}
+	return { index: null, terminatorIndex: null, boundary: args.length };
 }
 
 function findForwardedCommand(rawArgs) {
 	if (!Array.isArray(rawArgs) || rawArgs.length === 0) {
 		return null;
 	}
-	for (let i = 0; i < rawArgs.length; i += 1) {
-		const arg = rawArgs[i];
-		if (typeof arg !== "string" || arg.length === 0) continue;
-		if (arg === "--") {
-			return i + 1 < rawArgs.length
-				? { command: rawArgs[i + 1], index: i + 1 }
-				: null;
+	// `--` ends option parsing: everything after it binds to the root
+	// `[PROMPT]` positional, never to a subcommand, even when the text happens
+	// to spell a command name. `findRootPositional` reports it as a terminator
+	// and yields no positional, which settles the launch as interactive.
+	//
+	// Native Codex fills the root `[PROMPT]` slot with the first free token and
+	// still tries a later one as a subcommand (`codex hello exec …` runs exec),
+	// so an unknown positional keeps the scan going.
+	for (
+		let cursor = findRootPositional(rawArgs, 0);
+		cursor.index !== null;
+		cursor = findRootPositional(rawArgs, cursor.index + 1)
+	) {
+		const command = resolveCodexRootCommand(rawArgs[cursor.index]);
+		if (command !== null) {
+			return { command, index: cursor.index };
 		}
-		if (arg.startsWith("--config=")) {
-			continue;
-		}
-		if (arg.startsWith("--") || (arg.startsWith("-") && arg !== "-")) {
-			if (consumesNextArg(arg)) {
-				i += 1;
-			}
-			continue;
-		}
-		return { command: arg, index: i };
 	}
 
 	return null;
 }
 
-function findForwardedSubcommand(rawArgs, commandIndex) {
-	for (let i = commandIndex + 1; i < rawArgs.length; i += 1) {
-		const arg = rawArgs[i];
-		if (typeof arg !== "string" || arg.length === 0) continue;
-		if (arg === "--") {
-			return i + 1 < rawArgs.length ? rawArgs[i + 1] : null;
-		}
-		if (arg.startsWith("--config=")) {
-			continue;
-		}
-		if (arg.startsWith("--") || (arg.startsWith("-") && arg !== "-")) {
-			if (consumesNextArg(arg)) {
-				i += 1;
-			}
-			continue;
-		}
-		return arg;
+// Inserts option-side args ahead of the root `[PROMPT]` positional (or the
+// `--` that forces one), so injected overrides cannot be read as prompt text.
+// With no positional at all this is a plain append, which keeps bare-TUI argv
+// byte-identical to the pre-insertion shape.
+function insertArgsBeforeRootPrompt(baseArgs, injectedArgs) {
+	const { boundary } = findRootPositional(baseArgs);
+	return [
+		...baseArgs.slice(0, boundary),
+		...injectedArgs,
+		...baseArgs.slice(boundary),
+	];
+}
+
+// Inserts args before a `--` separator when one is present, else appends.
+// Subcommand argv keeps its leading subcommand token — `resume`/`fork` argv is
+// pinned to it — but anything appended past a `--` lands in the subcommand's
+// own positional list: Codex rejects that outright for `exec`/`review`
+// ("unexpected argument '-c' found"), and worse, silently forwards it as
+// arguments for `sandbox` and into the stored config for `mcp add`. The
+// separator bounds the append.
+function insertArgsBeforeForwardedSeparator(baseArgs, injectedArgs) {
+	// Deliberately not `findRootPositional`: that reports where the option side
+	// ends, stopping at the first positional, and a subcommand's own arguments
+	// are positionals — it would answer `exec` for `exec -- hi`. The question
+	// here is only where the separator sits, and a bare `indexOf` answers it
+	// exactly: clap never consumes `--` as an option value (`codex --cd -- hi`
+	// is "a value is required for '--cd'"), so the first `--` is always the
+	// separator, and it always follows the subcommand token because
+	// `findForwardedCommand` returns null the moment it sees one.
+	const separatorIndex = baseArgs.indexOf("--");
+	if (separatorIndex === -1) {
+		return [...baseArgs, ...injectedArgs];
 	}
-	return null;
+	return [
+		...baseArgs.slice(0, separatorIndex),
+		...injectedArgs,
+		...baseArgs.slice(separatorIndex),
+	];
+}
+
+function findForwardedSubcommand(rawArgs, commandIndex) {
+	const { index, terminatorIndex } = findRootPositional(
+		rawArgs,
+		commandIndex + 1,
+	);
+	// Unlike the root grammar, a subcommand's `--` still precedes its own
+	// positional args, so the token after it is the nested subcommand.
+	if (terminatorIndex !== null) {
+		return terminatorIndex + 1 < rawArgs.length
+			? rawArgs[terminatorIndex + 1]
+			: null;
+	}
+	return index === null ? null : rawArgs[index];
 }
 
 function hasHelpFlagAfterCommand(rawArgs, commandIndex) {
@@ -5179,8 +5381,8 @@ function hasHelpFlagAfterCommand(rawArgs, commandIndex) {
 		const arg = rawArgs[i];
 		if (arg === "--") return false;
 		if (arg === "--help" || arg === "-h" || arg === "help") return true;
-		if (typeof arg === "string" && consumesNextArg(arg)) {
-			i += 1;
+		if (typeof arg === "string") {
+			i = skipOptionValueSpan(rawArgs, i);
 		}
 	}
 	return false;
@@ -5194,6 +5396,11 @@ function isCodexAppServerCommand(rawArgs) {
 	return findForwardedCommand(rawArgs)?.command === "app-server";
 }
 
+// True for every root TUI launch: bare `codex [OPTIONS]`, and `codex
+// [OPTIONS] [PROMPT]` with the optional initial prompt — including a prompt
+// forced by `--`. Both shapes start the same interactive session and need the
+// canonical home, or Codex stalls rebuilding the omitted thread index inside
+// the shadow mirror before it can submit the already-delivered prompt.
 function isCodexInteractiveTuiCommand(rawArgs) {
 	return findForwardedCommand(rawArgs) === null;
 }
@@ -5219,7 +5426,14 @@ function shouldUseRuntimeRoutingForForwardedArgs(rawArgs) {
 
 	const command = findForwardedCommand(rawArgs);
 	if (!command) {
-		return true;
+		// A help flag alongside a root prompt (`codex "prompt" --help`) prints
+		// help and exits clean, so it must skip the transport for the same
+		// reason as the request-command help forms below: the interactive
+		// branch detaches its helper on a clean exit, and a helper started
+		// just to print help would idle until its detached timeout. The scan
+		// stops at `--`, so help-looking text inside a forced prompt still
+		// routes normally.
+		return !hasHelpFlagAfterCommand(rawArgs, -1);
 	}
 
 	const requestCommands = new Set(["exec", "review", "resume", "fork", "app"]);
@@ -5450,12 +5664,16 @@ function buildForwardArgs(rawArgs) {
 		return { args: compatibilityArgs, requestedModel };
 	}
 
+	const authStoreArgs = ["-c", 'cli_auth_credentials_store="file"'];
 	return {
-		args: [
-			...compatibilityArgs,
-			"-c",
-			'cli_auth_credentials_store="file"',
-		],
+		// A root launch may end in the `[PROMPT]` positional — possibly forced
+		// by `--`, where an appended `-c` pair would be read as prompt text —
+		// so the override is inserted on the option side of the prompt there.
+		// Subcommand argv keeps the appended ordering it has always forwarded.
+		args:
+			findForwardedCommand(compatibilityArgs) === null
+				? insertArgsBeforeRootPrompt(compatibilityArgs, authStoreArgs)
+				: insertArgsBeforeForwardedSeparator(compatibilityArgs, authStoreArgs),
 		requestedModel,
 	};
 }

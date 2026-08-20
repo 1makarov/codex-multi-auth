@@ -329,15 +329,20 @@ describe("buildPinnedUnavailableErrorBody", () => {
 			parenthetical: "(paused after repeated upstream errors)",
 			deadlineNoun: "the next attempt is allowed at",
 		},
+		// Every `cooling-down:*` variant is bounded by the same
+		// `coolingDownUntil` field, so they share one deadline noun: two of
+		// them used to say "the next attempt is allowed at" while the rest
+		// said "the cooldown ends at", which reads as two different mechanisms
+		// to an operator comparing two 503s from the same cause.
 		{
 			reason: "cooling-down:server-error",
 			parenthetical: "(cooling down after upstream server errors)",
-			deadlineNoun: "the next attempt is allowed at",
+			deadlineNoun: "the cooldown ends at",
 		},
 		{
 			reason: "cooling-down:network-error",
 			parenthetical: "(cooling down after network errors)",
-			deadlineNoun: "the next attempt is allowed at",
+			deadlineNoun: "the cooldown ends at",
 		},
 		{
 			reason: "cooling-down:auth-failure",
@@ -397,7 +402,7 @@ describe("buildPinnedUnavailableErrorBody", () => {
 			{
 				pinSource: "manual",
 				resetAtMs,
-				rateLimitResetAtMs: resetAtMs,
+				recoveryBound: "rate-limit",
 				now: 1_700_000_000_000,
 			},
 		);
@@ -412,7 +417,6 @@ describe("buildPinnedUnavailableErrorBody", () => {
 		// breaker tripped seconds ago can end after a limit about to expire.
 		// Wording that later timestamp as the limit's reset would be the same
 		// misattribution this change removes from the transient classes.
-		const rateLimitResetAtMs = 1_700_000_010_000;
 		const resetAtMs = 1_700_000_030_000;
 		const body = buildPinnedUnavailableErrorBody(
 			0,
@@ -420,7 +424,7 @@ describe("buildPinnedUnavailableErrorBody", () => {
 			{
 				pinSource: "forced",
 				resetAtMs,
-				rateLimitResetAtMs,
+				recoveryBound: "other",
 				now: 1_700_000_000_000,
 			},
 		);
@@ -450,6 +454,89 @@ describe("buildPinnedUnavailableErrorBody", () => {
 			`the account is expected to be available again at ${new Date(resetAtMs).toISOString()}`,
 		);
 		expect(body.message).not.toContain("limit resets");
+	});
+
+	// The dominant #675 path: the pin takes a 503/429 during the request, the
+	// retry loop re-enters selection, and selection records "already-attempted"
+	// over whatever class actually blocks the account. Wording the sentence
+	// from that recorded verdict is what shipped an internal token and a
+	// class-less deadline to operators.
+	it("words the sentence from the re-read runtime blocker, not the loop's verdict", () => {
+		const resetAtMs = 1_700_000_030_000;
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "already-attempted"]]),
+			{
+				pinSource: "forced",
+				resetAtMs,
+				recoveryBound: "other",
+				currentSkipReason: "circuit-open",
+				now: 1_700_000_000_000,
+			},
+		);
+		// The machine-readable contract still reports what selection decided.
+		expect(body.reason).toBe("already-attempted");
+		// The human sentence describes what is actually gating the pin.
+		expect(body.message).toContain("(paused after repeated upstream errors)");
+		expect(body.message).toContain(
+			`the next attempt is allowed at ${new Date(resetAtMs).toISOString()}`,
+		);
+		expect(body.message).not.toContain("already-attempted");
+		expect(body.message).not.toContain("circuit-open");
+	});
+
+	it("keeps a recorded selection-only verdict that runtime state cannot express", () => {
+		// "policy-blocked" has no runtime-state equivalent, so a null re-read
+		// must not erase it from the sentence.
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "policy-blocked"]]),
+			{ pinSource: "manual", currentSkipReason: null },
+		);
+		expect(body.reason).toBe("policy-blocked");
+		expect(body.message).toContain("(policy-blocked)");
+	});
+
+	it("prefers the recorded verdict when it already names a blocker class", () => {
+		// A recorded "rate-limited" is a real class; a later re-read that has
+		// moved on to the cooldown it caused must not relabel the 503.
+		const resetAtMs = 1_700_000_030_000;
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "rate-limited"]]),
+			{
+				resetAtMs,
+				recoveryBound: "rate-limit",
+				currentSkipReason: "cooling-down:rate-limit",
+				now: 1_700_000_000_000,
+			},
+		);
+		expect(body.message).toContain("(rate-limited)");
+		expect(body.message).toContain(
+			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+		);
+	});
+
+	// The bound used to be inferred from whether a second deadline key was
+	// present on the context object, so a caller that spread the key with an
+	// `undefined` value got the opposite wording from one that omitted it —
+	// with nothing in the type to say so. Both shapes must now agree.
+	it("treats an explicit undefined recovery bound as unmeasured, not as `other`", () => {
+		const resetAtMs = 1_700_000_030_000;
+		const omitted = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "rate-limited"]]),
+			{ resetAtMs, now: 1_700_000_000_000 },
+		);
+		const explicitUndefined = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "rate-limited"]]),
+			{ resetAtMs, recoveryBound: undefined, now: 1_700_000_000_000 },
+		);
+		expect(explicitUndefined.message).toBe(omitted.message);
+		expect(explicitUndefined.message).toContain(
+			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+		);
 	});
 
 	it("keeps the unpin advice for manual pins and nulls an unknown reset", () => {

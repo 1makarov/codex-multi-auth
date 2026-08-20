@@ -73,10 +73,7 @@ import {
 	responseHeadersForClient,
 	withTimeout,
 } from "./request/stream-failover-runtime.js";
-import {
-	getAccountRecoveryTimeForFamily,
-	getRateLimitRecoveryTimeForFamily,
-} from "./runtime/account-status.js";
+import { getAccountRecoveryBoundsForFamily } from "./runtime/account-status.js";
 import { chooseAccount } from "./runtime/rotation-account-selection.js";
 import {
 	createRotationProxyState,
@@ -1635,21 +1632,30 @@ async function handleRequestInner(
 			// recovery — and with several overlapping records the account stays
 			// skipped until the LAST one expires, so the latest bound is the one
 			// worth advertising.
-			const pinnedStateRecoveryAtMs =
+			//
+			// One clock for the whole body. The recovery bound and the
+			// rate-limit bound are compared against each other below, so
+			// reading state.now() per lookup would let a record expire between
+			// them and report a rate-limited pin as bounded by something else.
+			const evaluatedAtMs = state.now();
+			// Both bounds come from a single pass over the account's records.
+			const pinnedRecoveryBounds =
 				pinnedAccount === null
 					? null
-					: getAccountRecoveryTimeForFamily(
+					: getAccountRecoveryBoundsForFamily(
 							pinnedAccount,
-							state.now(),
+							evaluatedAtMs,
 							context.family,
 							context.model,
 						);
+			const pinnedStateRecoveryAtMs =
+				pinnedRecoveryBounds?.recoveryAtMs ?? null;
 			// An open circuit outlives the short failure cooldowns that tripped
 			// it; its deadline lives in the breaker, not the account record.
 			const pinnedCircuitRecoveryAtMs =
 				pinnedAccount === null
 					? null
-					: accountManager.getCircuitRecoveryTime(pinnedAccount, state.now());
+					: accountManager.getCircuitRecoveryTime(pinnedAccount, evaluatedAtMs);
 			const pinnedResetAtMs =
 				pinnedBlockedPermanently ||
 				(pinnedStateRecoveryAtMs === null && pinnedCircuitRecoveryAtMs === null)
@@ -1658,18 +1664,17 @@ async function handleRequestInner(
 							pinnedStateRecoveryAtMs ?? 0,
 							pinnedCircuitRecoveryAtMs ?? 0,
 						);
-			// The rate-limit records' own bound, so the message only words the
-			// recovery deadline as a rate-limit reset when the rate limit is in
-			// fact what supplies it — a breaker or cooldown can end later.
+			// The message only words the recovery deadline as a rate-limit reset
+			// when the rate-limit records are in fact what supplies it — a
+			// breaker or cooldown can end later and then bounds it instead.
 			const pinnedRateLimitResetAtMs =
-				pinnedAccount === null
-					? null
-					: getRateLimitRecoveryTimeForFamily(
-							pinnedAccount,
-							state.now(),
-							context.family,
-							context.model,
-						);
+				pinnedRecoveryBounds?.rateLimitAtMs ?? null;
+			const recoveryBound =
+				pinnedResetAtMs !== null &&
+				pinnedRateLimitResetAtMs !== null &&
+				pinnedRateLimitResetAtMs >= pinnedResetAtMs
+					? "rate-limit"
+					: "other";
 			const errorBody = buildPinnedUnavailableErrorBody(
 				pinnedIndex,
 				accountSkipReasons,
@@ -1678,8 +1683,12 @@ async function handleRequestInner(
 					pinSource:
 						typeof state.forcedAccountIndex === "number" ? "forced" : "manual",
 					resetAtMs: pinnedResetAtMs,
-					rateLimitResetAtMs: pinnedRateLimitResetAtMs,
-					now: state.now(),
+					recoveryBound,
+					// The recorded verdict above is the retry loop's
+					// "already-attempted" on the dominant path; the re-read runtime
+					// state is what the operator-facing sentence should describe.
+					currentSkipReason: pinnedCurrentSkipReason,
+					now: evaluatedAtMs,
 				},
 			);
 			if (errorBody.reason === null) {

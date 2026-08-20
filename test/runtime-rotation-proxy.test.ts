@@ -844,9 +844,15 @@ describe("runtime rotation proxy", () => {
 		expect(payload.error.reason).toBe("already-attempted");
 		expect(payload.error.retry_after_ms).toBeGreaterThan(0);
 		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
-		expect(payload.error.message).toContain(
-			"the account is expected to be available again at",
-		);
+		// This is the dominant #675 path, and the reason above is exactly why
+		// it was reported: selection had already overwritten the real class
+		// with its own bookkeeping token by the time the body was built. The
+		// sentence follows the pin's re-read runtime state instead, so the 429
+		// that just landed is described as the rate limit it is — while the
+		// machine-readable `reason` still reports the selection verdict.
+		expect(payload.error.message).toContain("(rate-limited)");
+		expect(payload.error.message).toContain("the rate limit resets at");
+		expect(payload.error.message).not.toContain("already-attempted");
 		expect(payload.error.message).toContain("launcher");
 		expect(payload.error.message).not.toContain("unpin");
 	});

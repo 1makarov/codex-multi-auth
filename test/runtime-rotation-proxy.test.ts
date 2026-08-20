@@ -844,7 +844,9 @@ describe("runtime rotation proxy", () => {
 		expect(payload.error.reason).toBe("already-attempted");
 		expect(payload.error.retry_after_ms).toBeGreaterThan(0);
 		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
-		expect(payload.error.message).toContain("the recorded limit resets at");
+		expect(payload.error.message).toContain(
+			"the account is expected to be available again at",
+		);
 		expect(payload.error.message).toContain("launcher");
 		expect(payload.error.message).not.toContain("unpin");
 	});

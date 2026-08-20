@@ -213,6 +213,73 @@ export interface PinnedUnavailableContext {
 	now?: number;
 }
 
+/**
+ * The human sentence derives its parenthetical and its deadline noun from the
+ * blocker class. The deadline is max(rate-limit reset, cooldown end, breaker
+ * next-attempt), so calling it a "limit" is only true for the rate-limit
+ * class: during a provider outage a tripped breaker or a server-error
+ * cooldown printed "the recorded limit resets at …", and operators read a
+ * backend incident as a blown subscription quota. Only the message changes —
+ * the machine-readable `reason` keeps the raw skip token.
+ */
+function describePinnedBlocker(skipReason: string | null): {
+	parenthetical: string | null;
+	deadline: (resetAt: string) => string;
+} {
+	switch (skipReason) {
+		case null:
+			return {
+				parenthetical: null,
+				deadline: (resetAt) =>
+					`the account is expected to be available again at ${resetAt}`,
+			};
+		case "rate-limited":
+			return {
+				parenthetical: "rate-limited",
+				deadline: (resetAt) => `the rate limit resets at ${resetAt}`,
+			};
+		case "circuit-open":
+			return {
+				parenthetical: "paused after repeated upstream errors",
+				deadline: (resetAt) => `the next attempt is allowed at ${resetAt}`,
+			};
+		case "cooling-down:server-error":
+			return {
+				parenthetical: "cooling down after upstream server errors",
+				deadline: (resetAt) => `the next attempt is allowed at ${resetAt}`,
+			};
+		case "cooling-down:network-error":
+			return {
+				parenthetical: "cooling down after network errors",
+				deadline: (resetAt) => `the next attempt is allowed at ${resetAt}`,
+			};
+		case "cooling-down:auth-failure":
+			return {
+				parenthetical: "cooling down after authentication failures",
+				deadline: (resetAt) => `the cooldown ends at ${resetAt}`,
+			};
+		case "cooling-down:rate-limit":
+			return {
+				parenthetical: "cooling down after a rate limit",
+				deadline: (resetAt) => `the cooldown ends at ${resetAt}`,
+			};
+		case "cooling-down":
+			return {
+				parenthetical: "cooling down",
+				deadline: (resetAt) => `the cooldown ends at ${resetAt}`,
+			};
+		default:
+			// Permanent blockers never reach the deadline clause (the call site
+			// suppresses their reset time), and future or internal tokens such as
+			// the retry loop's "already-attempted" stay legible verbatim.
+			return {
+				parenthetical: skipReason,
+				deadline: (resetAt) =>
+					`the account is expected to be available again at ${resetAt}`,
+			};
+	}
+}
+
 export function buildPinnedUnavailableErrorBody(
 	pinnedIndex: number | null | undefined,
 	accountSkipReasons: ReadonlyMap<number, string>,
@@ -224,7 +291,10 @@ export function buildPinnedUnavailableErrorBody(
 		normalizedPinnedIndex !== null
 			? accountSkipReasons.get(normalizedPinnedIndex) ?? null
 			: null;
-	const reasonSuffix = skipReason ? ` (${skipReason})` : "";
+	const blocker = describePinnedBlocker(skipReason);
+	const reasonSuffix = blocker.parenthetical
+		? ` (${blocker.parenthetical})`
+		: "";
 	// On the desync path the pin index is unknown (null); claiming "account 1"
 	// there would contradict the machine-readable pinnedAccountIndex: null.
 	const accountPhrase =
@@ -250,8 +320,7 @@ export function buildPinnedUnavailableErrorBody(
 	const now = context?.now ?? Date.now();
 	const retryAfterMs = resetAtMs !== null ? Math.max(0, resetAtMs - now) : null;
 	const resetAt = resetAtMs !== null ? new Date(resetAtMs).toISOString() : null;
-	const waitSuffix =
-		resetAt !== null ? `; the recorded limit resets at ${resetAt}` : "";
+	const waitSuffix = resetAt !== null ? `; ${blocker.deadline(resetAt)}` : "";
 	// A forced pin belongs to the launching process, not to the persisted pin
 	// state, so `unpin` would clear nothing — say what actually helps.
 	const remedy =

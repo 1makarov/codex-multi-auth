@@ -311,11 +311,100 @@ describe("buildPinnedUnavailableErrorBody", () => {
 		expect(body.reset_at).toBe(new Date(resetAtMs).toISOString());
 		expect(body.retry_after_ms).toBe(30_000);
 		expect(body.message).toContain(
-			`the recorded limit resets at ${new Date(resetAtMs).toISOString()}`,
+			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
 		);
 		// A forced pin is not cleared by `unpin`; the remedy must not suggest it.
 		expect(body.message).toContain("set by this session's launcher");
 		expect(body.message).not.toContain("unpin");
+	});
+
+	// The deadline is max(rate-limit reset, cooldown end, breaker next-attempt),
+	// so "limit" is only true for the rate-limit class. During the 2026-08-20
+	// provider outage, a breaker deadline printed as "the recorded limit resets
+	// at …" read as a blown subscription quota; the noun now follows the
+	// blocker, while the machine-readable `reason` keeps the raw token.
+	for (const { reason, parenthetical, deadlineNoun } of [
+		{
+			reason: "circuit-open",
+			parenthetical: "(paused after repeated upstream errors)",
+			deadlineNoun: "the next attempt is allowed at",
+		},
+		{
+			reason: "cooling-down:server-error",
+			parenthetical: "(cooling down after upstream server errors)",
+			deadlineNoun: "the next attempt is allowed at",
+		},
+		{
+			reason: "cooling-down:network-error",
+			parenthetical: "(cooling down after network errors)",
+			deadlineNoun: "the next attempt is allowed at",
+		},
+		{
+			reason: "cooling-down:auth-failure",
+			parenthetical: "(cooling down after authentication failures)",
+			deadlineNoun: "the cooldown ends at",
+		},
+		{
+			reason: "cooling-down:rate-limit",
+			parenthetical: "(cooling down after a rate limit)",
+			deadlineNoun: "the cooldown ends at",
+		},
+		{
+			reason: "cooling-down",
+			parenthetical: "(cooling down)",
+			deadlineNoun: "the cooldown ends at",
+		},
+	] as const) {
+		it(`words a \`${reason}\` deadline as transient recovery, not a limit`, () => {
+			const resetAtMs = 1_700_000_030_000;
+			const body = buildPinnedUnavailableErrorBody(
+				1,
+				new Map([[1, reason]]),
+				{ pinSource: "forced", resetAtMs, now: 1_700_000_000_000 },
+			);
+			// The JSON contract is untouched: raw token, same deadline fields.
+			expect(body.reason).toBe(reason);
+			expect(body.reset_at).toBe(new Date(resetAtMs).toISOString());
+			expect(body.retry_after_ms).toBe(30_000);
+			expect(body.message).toContain(parenthetical);
+			expect(body.message).toContain(
+				`${deadlineNoun} ${new Date(resetAtMs).toISOString()}`,
+			);
+			expect(body.message).not.toContain("limit resets");
+			expect(body.message).not.toContain("circuit-open");
+		});
+	}
+
+	it("keeps quota phrasing for a genuine rate limit", () => {
+		const resetAtMs = 1_700_000_030_000;
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "rate-limited"]]),
+			{ pinSource: "manual", resetAtMs, now: 1_700_000_000_000 },
+		);
+		expect(body.reason).toBe("rate-limited");
+		expect(body.message).toContain("(rate-limited)");
+		expect(body.message).toContain(
+			`the rate limit resets at ${new Date(resetAtMs).toISOString()}`,
+		);
+	});
+
+	it("passes an unknown skip token through verbatim with neutral recovery wording", () => {
+		// The retry loop reports selection verdicts like "already-attempted"
+		// through the same seam; those must stay legible without claiming a
+		// limit or inventing a translation.
+		const resetAtMs = 1_700_000_030_000;
+		const body = buildPinnedUnavailableErrorBody(
+			0,
+			new Map([[0, "already-attempted"]]),
+			{ pinSource: "forced", resetAtMs, now: 1_700_000_000_000 },
+		);
+		expect(body.reason).toBe("already-attempted");
+		expect(body.message).toContain("(already-attempted)");
+		expect(body.message).toContain(
+			`the account is expected to be available again at ${new Date(resetAtMs).toISOString()}`,
+		);
+		expect(body.message).not.toContain("limit resets");
 	});
 
 	it("keeps the unpin advice for manual pins and nulls an unknown reset", () => {

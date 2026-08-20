@@ -844,7 +844,15 @@ describe("runtime rotation proxy", () => {
 		expect(payload.error.reason).toBe("already-attempted");
 		expect(payload.error.retry_after_ms).toBeGreaterThan(0);
 		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
-		expect(payload.error.message).toContain("the recorded limit resets at");
+		// This is the dominant #675 path, and the reason above is exactly why
+		// it was reported: selection had already overwritten the real class
+		// with its own bookkeeping token by the time the body was built. The
+		// sentence follows the pin's re-read runtime state instead, so the 429
+		// that just landed is described as the rate limit it is — while the
+		// machine-readable `reason` still reports the selection verdict.
+		expect(payload.error.message).toContain("(rate-limited)");
+		expect(payload.error.message).toContain("the rate limit resets at");
+		expect(payload.error.message).not.toContain("already-attempted");
 		expect(payload.error.message).toContain("launcher");
 		expect(payload.error.message).not.toContain("unpin");
 	});
@@ -1014,6 +1022,63 @@ describe("runtime rotation proxy", () => {
 		expect(payload.error.retry_after_ms).toBeGreaterThan(10_000);
 		expect(payload.error.retry_after_ms).toBeLessThanOrEqual(30_000);
 		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
+	});
+
+	it("does not word a later cooldown deadline as the rate-limit reset (#675)", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		const pinned = accountManager.getAccountByIndex(0);
+		if (!pinned) throw new Error("setup failed");
+		// Both records gate the account. Selection reports "rate-limited" by
+		// precedence, but recovery is bounded by whichever record ends last —
+		// here a server-error cooldown that outlives the limit by 50s. The
+		// sentence must not attribute that later timestamp to the rate limit.
+		// The record is keyed by the requested model's family ("gpt-5-codex"
+		// maps to its own family, not "codex"), or it would not gate at all.
+		pinned.rateLimitResetTimes = { "gpt-5-codex": now + 10_000 };
+		pinned.coolingDownUntil = now + 60_000;
+		pinned.cooldownReason = "server-error";
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			textEventStream("data: should-not-be-reached\n\n"),
+		);
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { forcedAccountIndex: 0 },
+		});
+
+		const response = await postResponses(proxy, {
+			model: "gpt-5-codex",
+			stream: true,
+			input: [{ type: "message", role: "user", content: "hi" }],
+		});
+
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(calls).toHaveLength(0);
+		const payload = (await response.json()) as {
+			error: {
+				code: string;
+				reason: string | null;
+				reset_at: string | null;
+				retry_after_ms: number | null;
+				message: string;
+			};
+		};
+		expect(payload.error.code).toBe("codex_pinned_account_unavailable");
+		expect(payload.error.reason).toBe("rate-limited");
+		// The machine contract still advertises the full recovery bound: the
+		// cooldown's end, not the limit's earlier reset.
+		expect(payload.error.retry_after_ms).toBeGreaterThan(10_000);
+		expect(payload.error.retry_after_ms).toBeLessThanOrEqual(60_000);
+		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(
+			now + 10_000,
+		);
+		// The sentence names the blocker but keeps the deadline neutral.
+		expect(payload.error.message).toContain("(rate-limited)");
+		expect(payload.error.message).toContain(
+			"the account is expected to be available again at",
+		);
+		expect(payload.error.message).not.toContain("limit resets");
 	});
 
 	it("suppresses timed recovery when a permanent blocker holds the pinned account", async () => {

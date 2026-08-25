@@ -1244,15 +1244,41 @@ async function handleRequestInner(
 					`upstream fetch timed out after ${state.fetchTimeoutMs}ms`,
 				);
 			} catch (error) {
-				state.status.lastError = error instanceof Error ? error.message : String(error);
+				// errors-logging-08: a custom fetchImpl, a proxy agent, or an undici
+				// cause chain can embed the request URL or credential material in the
+				// raw message, so mask before it reaches any state.status consumer.
+				const transportError = maskString(
+					error instanceof Error ? error.message : String(error),
+				);
+				state.status.lastError = transportError;
+				// errors-logging-01: give the failure a structured, trace-correlated
+				// line instead of only a last-write-wins status string. Nothing else
+				// on this path reaches proxyLog, because the request does not throw.
+				proxyLog.error("upstream transport failure", {
+					traceId,
+					code: "codex_runtime_rotation_transport_error",
+					error: transportError,
+				});
 				accountManager.refundToken(refreshed.account, context.family, context.model);
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
+				// A pre-header transport exception is a property of the network path,
+				// not of this account's credentials or quota, so it must NOT feed the
+				// account's circuit breaker / health tracker: that is what would
+				// otherwise retire a healthy account for an outage it did not cause.
+				// See #677.
+				//
+				// The short timed cooldown IS still applied. It is self-healing, it
+				// keeps an account whose upstream hangs from stalling 1/N of every
+				// later request for the full fetch timeout, and it is what gives the
+				// exhaustion 503 a non-zero `retry_after_ms` to back the client off
+				// with (`getMinWaitTimeForFamily` returns 0 while any account is
+				// still selectable).
 				accountManager.markAccountCoolingDown(
 					refreshed.account,
 					state.networkErrorCooldownMs,
 					"network-error",
 				);
 				accountManager.saveToDiskDebounced();
+				accountSkipReasons.set(refreshed.account.index, "network-error");
 				exhaustionReason = "network-error";
 				transientAttempts += 1;
 				transientExhaustionReason = "network-error";
@@ -1543,6 +1569,12 @@ async function handleRequestInner(
 				res,
 				state.status,
 				() => {
+					// Deliberately NOT the pre-header transport policy above,
+					// which skips recordFailure (#677). By this point the
+					// upstream accepted the request and began responding, so a
+					// broken stream is a signal about THIS account's session
+					// (upstream tearing it down) rather than about the shared
+					// network path, and it should still credit the breaker.
 					accountManager.recordFailure(
 						refreshed.account,
 						context.family,

@@ -5,6 +5,26 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md).
 
+## [2.9.0] - 2026-08-25
+
+`budget set --cost` and `--tokens` were accepted but never enforced, a dead network path counted against account health, and account removal left live sessions routed to the wrong account. [Full notes](docs/releases/v2.9.0.md).
+
+### Added
+
+- The usage ledger records real token counts and cost. Both the runtime rotation proxy and the plugin host read the upstream `usage` object out of the response as it streams past, so `codex-multi-auth usage` reports actual consumption instead of zeros ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- Transport failures emit a trace-correlated `proxyLog.error` line. That path never throws, so it previously produced no structured log entry at all ([#677](https://github.com/ndycode/codex-multi-auth/pull/677))
+
+### Fixed
+
+- `maxTokens` and `maxCostUsd` budget limits are enforced. Every ledger row recorded zero tokens and zero cost, so the guard compared `0 >= limit` and never fired — `budget set --cost 50` allowed unlimited spend, with only `--requests` doing anything ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- Reasoning tokens are subtracted out of the output bucket before recording. The upstream reports `output_tokens` inclusive of `output_tokens_details.reasoning_tokens` while the cost estimator prices the two as disjoint, so recording both raw would bill reasoning twice and trip a cost cap early ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- A streaming request's ledger row is written when the stream ends rather than when the handler returns, which is the only point at which its token counts exist. A client that disconnects mid-stream still records a row, without counts ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- An upstream transport failure before response headers no longer feeds the account's circuit breaker or health tracker. A socket reset, TLS drop, or fetch timeout is a property of the network path, not of the account, and three of them used to open that account's breaker for ~30s during an outage that affected every account equally ([#677](https://github.com/ndycode/codex-multi-auth/pull/677))
+- Deleting an account, restoring a backup, and the automatic removal of revoked-token accounts bump `affinityGeneration`. Session affinity is keyed by account index, so without the bump a running proxy kept routing in-flight conversations to whatever account slid into the vacated slot ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- Two accounts with neither an `accountId` nor an email no longer share one account-policy entry. Both hashed the literal `"unknown"`, so pausing, draining, or tagging one applied to all of them; the key now falls back to the refresh token and remains independent of account position ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- `withStreamingFailover` respects consumer backpressure. It enqueued every chunk as fast as the upstream delivered it, so a slow client buffered the whole response in memory — a 50-chunk stream was fully drained for a consumer that had read one chunk ([#678](https://github.com/ndycode/codex-multi-auth/pull/678))
+- A transport failure records a runtime skip reason for the account it happened on, instead of clearing the skip-reason overlay that `forecast` and `report` read ([#677](https://github.com/ndycode/codex-multi-auth/pull/677))
+
 ## [2.8.7] - 2026-08-21
 
 `codex "your prompt"` took the slow shadow-home startup path, prompt text after `--` was parsed as configuration, and the pinned-account 503 called every recovery deadline a limit reset. [Full notes](docs/releases/v2.8.7.md).

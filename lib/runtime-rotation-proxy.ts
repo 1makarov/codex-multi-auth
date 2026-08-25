@@ -1698,7 +1698,11 @@ async function handleRequestInner(
 			statusCode: normalizeExhaustionStatus(exhaustionReason),
 			errorCode: isThreadGoalRequest && context.upstreamPath.endsWith("/get") ? "thread_goal_pool_exhausted" : exhaustionReason,
 		});
-		if (isThreadGoalRequest && context.upstreamPath.endsWith("/get")) {
+		if (
+			isThreadGoalRequest &&
+			context.upstreamPath.endsWith("/get") &&
+			exhaustionReason !== "network-error"
+		) {
 			writeJson(res, HTTP_STATUS.OK, { goal: null });
 		} else {
 			writePoolExhausted({

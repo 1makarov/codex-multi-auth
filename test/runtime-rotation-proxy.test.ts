@@ -1214,6 +1214,22 @@ describe("runtime rotation proxy", () => {
 		});
 	});
 
+	it("returns a retryable 503 for TUI thread goal transport failures", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now));
+		const { calls, fetchImpl } = createRecordingFetch(() => {
+			throw new TypeError("fetch failed");
+		});
+		const proxy = await startProxy({ accountManager, fetchImpl });
+
+		const response = await postThreadGoal(proxy, { threadId: "thread-1" });
+		const payload = (await response.json()) as { error: { reason: string } };
+
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(payload.error.reason).toBe("network-error");
+		expect(calls).toHaveLength(1);
+	});
+
 	it("forwards TUI thread goal set requests without duplicating codex path", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now));

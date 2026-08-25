@@ -1215,7 +1215,7 @@ describe("runtime rotation proxy", () => {
 	});
 
 	it("returns a retryable 503 for TUI thread goal transport failures", async () => {
-		const now = Date.now();
+		const now = Date.UTC(2099, 0, 1);
 		const accountManager = new AccountManager(undefined, createStorage(now));
 		const { calls, fetchImpl } = createRecordingFetch(() => {
 			throw new TypeError("fetch failed");

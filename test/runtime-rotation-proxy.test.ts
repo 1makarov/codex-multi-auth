@@ -945,6 +945,56 @@ describe("runtime rotation proxy", () => {
 		expect(payload.error.retry_after_ms).toBeNull();
 	});
 
+	it("advertises the circuit deadline after repeated pinned-account 5xx responses", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		const { calls, fetchImpl } = createRecordingFetch(() =>
+			new Response("upstream failed", { status: HTTP_STATUS.SERVICE_UNAVAILABLE }),
+		);
+		const previousServerErrorCooldown =
+			process.env.CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS;
+		let proxy: Awaited<ReturnType<typeof startProxy>>;
+		vi.stubEnv("CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS", "0");
+		try {
+			proxy = await startProxy({
+				accountManager,
+				fetchImpl,
+				options: { forcedAccountIndex: 0 },
+			});
+		} finally {
+			vi.stubEnv(
+				"CODEX_AUTH_SERVER_ERROR_COOLDOWN_MS",
+				previousServerErrorCooldown,
+			);
+		}
+		const body = {
+			model: "gpt-5-codex",
+			stream: true,
+			input: [{ type: "message", role: "user", content: "hi" }],
+		};
+
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			const failed = await postResponses(proxy, body);
+			expect(failed.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		}
+		expect(calls).toHaveLength(3);
+
+		const response = await postResponses(proxy, body);
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(calls).toHaveLength(3);
+		const payload = (await response.json()) as {
+			error: {
+				code: string;
+				retry_after_ms: number | null;
+				reset_at: string | null;
+			};
+		};
+		expect(payload.error.code).toBe("codex_pinned_account_unavailable");
+		expect(payload.error.retry_after_ms).toBeGreaterThan(10_000);
+		expect(payload.error.retry_after_ms).toBeLessThanOrEqual(30_000);
+		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
+	});
+
 	it("does not word a later cooldown deadline as the rate-limit reset (#675)", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 2));

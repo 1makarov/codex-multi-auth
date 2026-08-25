@@ -141,3 +141,4 @@ npm run vendor:verify    # vendored dependency provenance check
 - App bind state/logs: `~/.codex/multi-auth/app-bind/`.
 - Prompt templates sync from Codex CLI GitHub releases with ETag caching.
 - Historical audit evidence under `docs/audits/evidence/` is snapshot evidence, not current architecture guidance.
+

@@ -857,7 +857,7 @@ describe("runtime rotation proxy", () => {
 		expect(payload.error.message).not.toContain("unpin");
 	});
 
-	it("carries cooldown recovery metadata when the forced account fails with a network error", async () => {
+	it("reports a forced-account transport failure without penalizing the account", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 2));
 		const { calls, fetchImpl } = createRecordingFetch(() => {
@@ -880,24 +880,22 @@ describe("runtime rotation proxy", () => {
 		const payload = (await response.json()) as {
 			error: {
 				code: string;
-				pin_source: string | null;
-				reset_at: string | null;
-				retry_after_ms: number | null;
+				reason: string;
 			};
 		};
-		expect(payload.error.code).toBe("codex_pinned_account_unavailable");
-		expect(payload.error.pin_source).toBe("forced");
-		// The network-error cooldown bounds recovery.
-		expect(payload.error.retry_after_ms).toBeGreaterThan(0);
-		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
+		expect(payload.error).toMatchObject({
+			code: "codex_runtime_rotation_pool_exhausted",
+			reason: "network-error",
+		});
+		expect(accountManager.getAccountByIndex(0)?.coolingDownUntil).toBeUndefined();
+		expect(proxy.getStatus().rotations).toBe(0);
 	});
 
 	it("suppresses recovery when this request itself disables the pinned account", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
-		// Two network failures record breaker failures without disabling; the
-		// third response is a workspace-disabled 403, which records the failure
-		// that opens the breaker AND calls setAccountEnabled(index, false).
+		// Two transport failures leave account health untouched; the third response
+		// is an explicit workspace-disabled 403 that calls setAccountEnabled(index, false).
 		// Selection on the next pass sees the pin in attemptedIndexes and
 		// records "already-attempted", so the disable never reaches the recorded
 		// skip reason — the 503 must still refuse to advertise the circuit's
@@ -911,22 +909,11 @@ describe("runtime rotation proxy", () => {
 				{ status: HTTP_STATUS.FORBIDDEN, headers: { "content-type": "application/json" } },
 			);
 		});
-		const previousNetworkErrorCooldown =
-			process.env.CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS;
-		let proxy: Awaited<ReturnType<typeof startProxy>>;
-		vi.stubEnv("CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS", "0");
-		try {
-			proxy = await startProxy({
-				accountManager,
-				fetchImpl,
-				options: { forcedAccountIndex: 0 },
-			});
-		} finally {
-			vi.stubEnv(
-				"CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS",
-				previousNetworkErrorCooldown,
-			);
-		}
+		const proxy = await startProxy({
+			accountManager,
+			fetchImpl,
+			options: { forcedAccountIndex: 0 },
+		});
 		const body = {
 			model: "gpt-5-codex",
 			stream: true,
@@ -957,71 +944,6 @@ describe("runtime rotation proxy", () => {
 		// The account is disabled for good; no timer clears that.
 		expect(payload.error.reset_at).toBeNull();
 		expect(payload.error.retry_after_ms).toBeNull();
-	});
-
-	it("advertises the circuit deadline once repeated failures open the pinned account's breaker", async () => {
-		const now = Date.now();
-		const accountManager = new AccountManager(undefined, createStorage(now, 2));
-		const { calls, fetchImpl } = createRecordingFetch(() => {
-			throw new TypeError("fetch failed");
-		});
-		// Zero the network-error cooldown so every request reaches upstream
-		// and records a breaker failure; otherwise the cooldown absorbs the
-		// retries and the breaker never opens.
-		// Restored in a finally: if startProxy rejects, an inline unstub never
-		// runs and the zero cooldown leaks into every later test in this file —
-		// the shared afterEach does not clear env stubs. Scoped to the one
-		// variable rather than vi.unstubAllEnvs(), which would also clear stubs
-		// an enclosing hook set.
-		const previousNetworkErrorCooldown =
-			process.env.CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS;
-		let proxy: Awaited<ReturnType<typeof startProxy>>;
-		vi.stubEnv("CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS", "0");
-		try {
-			proxy = await startProxy({
-				accountManager,
-				fetchImpl,
-				options: { forcedAccountIndex: 0 },
-			});
-		} finally {
-			vi.stubEnv(
-				"CODEX_AUTH_NETWORK_ERROR_COOLDOWN_MS",
-				previousNetworkErrorCooldown,
-			);
-		}
-		const body = {
-			model: "gpt-5-codex",
-			stream: true,
-			input: [{ type: "message", role: "user", content: "hi" }],
-		};
-
-		// Three failing requests trip the default breaker (threshold 3).
-		for (let attempt = 0; attempt < 3; attempt += 1) {
-			const failed = await postResponses(proxy, body);
-			expect(failed.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
-		}
-		expect(calls).toHaveLength(3);
-
-		const response = await postResponses(proxy, body);
-		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
-		// Circuit-open skips before any upstream attempt.
-		expect(calls).toHaveLength(3);
-		const payload = (await response.json()) as {
-			error: {
-				code: string;
-				pin_source: string | null;
-				reset_at: string | null;
-				retry_after_ms: number | null;
-			};
-		};
-		expect(payload.error.code).toBe("codex_pinned_account_unavailable");
-		expect(payload.error.pin_source).toBe("forced");
-		// The breaker's 30s reset outlives the short network-error cooldown
-		// that tripped it; the advertised recovery must be the circuit
-		// deadline, not the already-elapsed cooldown.
-		expect(payload.error.retry_after_ms).toBeGreaterThan(10_000);
-		expect(payload.error.retry_after_ms).toBeLessThanOrEqual(30_000);
-		expect(Date.parse(payload.error.reset_at ?? "")).toBeGreaterThan(now);
 	});
 
 	it("does not word a later cooldown deadline as the rate-limit reset (#675)", async () => {
@@ -2278,33 +2200,30 @@ describe("runtime rotation proxy", () => {
 		]);
 	});
 
-	it("cools down server-error and network-failure accounts before retrying", async () => {
+	it("returns one retryable 503 without penalizing accounts on a transport failure", async () => {
 		const now = Date.now();
-		const accountManager = new AccountManager(undefined, createStorage(now, 3));
-		const saveToDiskDebouncedSpy = vi.spyOn(accountManager, "saveToDiskDebounced");
-		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => {
-			if (attempt === 1) {
-				return new Response("upstream failed", { status: 503 });
-			}
-			if (attempt === 2) {
-				throw new Error("socket closed");
-			}
-			return textEventStream("data: third\n\n");
+		const accountManager = new AccountManager(undefined, createStorage(now, 2));
+		const { calls, fetchImpl } = createRecordingFetch(() => {
+			throw new TypeError("fetch failed");
 		});
 		const proxy = await startProxy({ accountManager, fetchImpl });
 
 		const response = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
+		const payload = (await response.json()) as { error: { code: string; reason: string } };
 
-		expect(response.status).toBe(HTTP_STATUS.OK);
-		expect(await response.text()).toBe("data: third\n\n");
-		expect(calls.map((call) => call.headers.get(OPENAI_HEADERS.ACCOUNT_ID))).toEqual([
-			"acc_1",
-			"acc_2",
-			"acc_3",
-		]);
-		expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe("server-error");
-		expect(accountManager.getAccountByIndex(1)?.cooldownReason).toBe("network-error");
-		expect(saveToDiskDebouncedSpy).toHaveBeenCalled();
+		expect(response.status).toBe(HTTP_STATUS.SERVICE_UNAVAILABLE);
+		expect(payload.error).toMatchObject({
+			code: "codex_runtime_rotation_pool_exhausted",
+			reason: "network-error",
+		});
+		expect(calls).toHaveLength(1);
+		expect(proxy.getStatus()).toMatchObject({ retries: 0, rotations: 0 });
+		expect(accountManager.getAccountsSnapshot()).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({ enabled: true, coolingDownUntil: undefined }),
+				expect.objectContaining({ enabled: true, coolingDownUntil: undefined }),
+			]),
+		);
 	});
 
 	it("persists the cooldown when an account has no resolvable accountId", async () => {
@@ -2812,7 +2731,7 @@ describe("runtime rotation proxy", () => {
 		expect(calls).toHaveLength(4);
 	});
 
-	it("times out a hung upstream fetch and cools down the account", async () => {
+	it("times out a hung upstream fetch without penalizing the account", async () => {
 		const now = Date.now();
 		const accountManager = new AccountManager(undefined, createStorage(now, 1));
 		const { calls, fetchImpl } = createRecordingFetch(
@@ -2830,9 +2749,8 @@ describe("runtime rotation proxy", () => {
 		expect(response.status).toBe(503);
 		expect(payload.error.reason).toBe("network-error");
 		expect(calls).toHaveLength(1);
-		expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBe(
-			"network-error",
-		);
+		expect(accountManager.getAccountByIndex(0)?.cooldownReason).toBeUndefined();
+		expect(proxy.getStatus().rotations).toBe(0);
 	});
 
 	it("does not replay a request after the upstream stream has started", async () => {

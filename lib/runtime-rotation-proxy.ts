@@ -1246,19 +1246,8 @@ async function handleRequestInner(
 			} catch (error) {
 				state.status.lastError = error instanceof Error ? error.message : String(error);
 				accountManager.refundToken(refreshed.account, context.family, context.model);
-				accountManager.recordFailure(refreshed.account, context.family, context.model);
-				accountManager.markAccountCoolingDown(
-					refreshed.account,
-					state.networkErrorCooldownMs,
-					"network-error",
-				);
-				accountManager.saveToDiskDebounced();
 				exhaustionReason = "network-error";
-				transientAttempts += 1;
-				transientExhaustionReason = "network-error";
-				state.status.retries += 1;
-				state.status.rotations += 1;
-				continue;
+				break;
 			}
 			const quotaSnapshot = readQuotaSchedulerSnapshot(
 				upstream.headers,
@@ -1587,7 +1576,8 @@ async function handleRequestInner(
 		// and a structured `reason` field, mirroring `writePoolExhausted`. A
 		// null reason indicates a forecast/runtime state desync (the pinned
 		// account was selected but no skip reason was recorded) — see #486.
-		if (isPinned) {
+		// A transport failure says nothing about the pinned account's availability.
+		if (isPinned && exhaustionReason !== "network-error") {
 			const pinnedAccount =
 				typeof pinnedIndex === "number"
 					? accountManager.getAccountByIndex(pinnedIndex)

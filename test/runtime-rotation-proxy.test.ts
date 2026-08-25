@@ -3562,4 +3562,43 @@ describe("chooseAccount sequential mode (issue #509)", () => {
 
 		expect(selected).toBeNull();
 	});
+
+	it("records upstream token usage so the cost and token budget caps can fire", async () => {
+		const now = Date.now();
+		const accountManager = new AccountManager(undefined, createStorage(now, 1));
+		const recorded: Record<string, unknown>[] = [];
+		vi.spyOn(runtimePolicy, "createRuntimeUsageRecorder").mockImplementation(
+			() => ({
+				hasRecorded: () => recorded.length > 0,
+				record: async (input) => {
+					recorded.push(input as unknown as Record<string, unknown>);
+				},
+			}),
+		);
+		const { fetchImpl } = createRecordingFetch(() =>
+			textEventStream(
+				'data: {"type":"response.output_text.delta","delta":"hi"}\n\n' +
+					'data: {"type":"response.completed","response":{"usage":{"input_tokens":1000,"input_tokens_details":{"cached_tokens":400},"output_tokens":500,"output_tokens_details":{"reasoning_tokens":200},"total_tokens":1500}}}\n\n',
+			),
+		);
+		const proxy = await startProxy({ accountManager, fetchImpl });
+
+		const response = await postResponses(proxy, { model: "gpt-5-codex", stream: true });
+		expect(response.status).toBe(HTTP_STATUS.OK);
+		await response.text();
+
+		// Every ledger row used to land with all-zero tokens, so
+		// evaluateBudgetGuard compared `0 >= limit` for maxTokens/maxCostUsd and
+		// those caps never fired — only --requests was enforced.
+		expect(recorded.at(-1)).toMatchObject({
+			outcome: "success",
+			inputTokens: 1000,
+			// reasoning_tokens is a SUBSET of output_tokens upstream, but pricing
+			// treats the two buckets as disjoint, so it is subtracted out here.
+			outputTokens: 300,
+			cachedInputTokens: 400,
+			reasoningTokens: 200,
+			totalTokens: 1500,
+		});
+	});
 });

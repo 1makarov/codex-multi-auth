@@ -1351,6 +1351,40 @@ export function readAffinityGenerationFromDisk(path: string): number {
 }
 
 /**
+ * Advance the session-affinity generation so a running runtime proxy drops its
+ * sticky session→account bindings on the next request.
+ *
+ * Session affinity remembers an account by ITS INDEX, so any mutation that
+ * reshuffles the pool (removing an account, restoring a backup) silently
+ * re-points every live session at a different account until the generation
+ * changes. `switch`/`best`/`unpin` already bump it; the reshuffling paths are
+ * the ones that need it most, because they move every index at once.
+ *
+ * Re-reads the on-disk generation first so concurrent CLI processes do not lose
+ * increments via lost-update on the load+mutate pair. `Math.max` keeps the
+ * counter monotonic: an extra bump only costs one additional affinity
+ * invalidation, while a missed bump lets the proxy cling to the wrong account.
+ * See issue #474.
+ */
+export function bumpStorageAffinityGeneration(
+	storage: { affinityGeneration?: number },
+	storagePath?: string | null,
+): number {
+	let diskGeneration = 0;
+	try {
+		const path = storagePath ?? getStoragePath();
+		if (path) diskGeneration = readAffinityGenerationFromDisk(path);
+	} catch {
+		// No resolvable storage path (never configured). The in-memory counter
+		// is still bumped below; only the lost-update guard is unavailable.
+	}
+	const inMemoryGeneration = storage.affinityGeneration ?? 0;
+	const next = Math.max(inMemoryGeneration, diskGeneration) + 1;
+	storage.affinityGeneration = next;
+	return next;
+}
+
+/**
  * Synchronously reads both the top-level `pinnedAccountIndex` and
  * `affinityGeneration` fields from the accounts storage file. Used by
  * `AccountManager.buildStorageSnapshot` to refresh from disk just before

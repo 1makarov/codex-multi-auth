@@ -141,6 +141,15 @@ import {
 	type RuntimeUsageRecorder,
 	type RuntimeUsageRecordInput,
 } from "./lib/policy/runtime-policy.js";
+import { createStreamUsageDeferral } from "./lib/usage/stream-usage-deferral.js";
+
+/**
+ * How long a streaming request's usage-ledger row may wait for the upstream
+ * `usage` event before it is written without token counts. Long enough not to
+ * truncate a genuinely slow completion; the timer is unref'd so it never holds
+ * the process open. See createStreamUsageDeferral.
+ */
+const USAGE_STREAM_RECORD_FALLBACK_MS = 15 * 60_000;
 import {
 	getModelFamily,
 	MODEL_FAMILIES,
@@ -943,6 +952,20 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 						): Promise<Response> {
 							let usageRecorder: RuntimeUsageRecorder | null = null;
 							let usageCompletion: RuntimeUsageRecordInput | null = null;
+							// A non-streaming response reports its token counts while
+							// handleSuccessResponse is still assembling the body, so they
+							// are folded straight into usageCompletion below. A streaming
+							// one reports them only as the client drains the body, long
+							// after the `finally` that writes the row — so that row is
+							// handed to the deferral instead of written empty.
+							const usageDeferral = createStreamUsageDeferral<RuntimeUsageRecordInput>(
+								{
+									record: (completion) => {
+										void usageRecorder?.record(completion);
+									},
+									fallbackMs: USAGE_STREAM_RECORD_FALLBACK_MS,
+								},
+							);
 							try {
 								if (
 									cachedAccountManager &&
@@ -2740,6 +2763,7 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														);
 														storedResponseIdForSuccess = true;
 													},
+													onUsage: usageDeferral.onUsage,
 													streamStallTimeoutMs,
 												},
 											);
@@ -2887,7 +2911,20 @@ export const OpenAIOAuthPlugin: Plugin = async ({ client }: PluginInput) => {
 														successAccountForResponse.accountId ?? null,
 													email: successAccountForResponse.email ?? null,
 												},
+												// Already known for a non-streaming response, which
+												// reported its usage while the body was being
+												// assembled above.
+												...(usageDeferral.captured() ?? {}),
 											};
+											if (isStreaming && !usageDeferral.captured()) {
+												// Writing the row in the `finally` below would stamp
+												// zero tokens — the client has not read a byte yet —
+												// and the ledger is append-only, so the real counts
+												// could never correct it. Zero tokens is exactly what
+												// left maxTokens / maxCostUsd unenforceable here.
+												usageDeferral.defer(usageCompletion);
+												usageCompletion = null;
+											}
 											if (
 												lastCodexCliActiveSyncIndex !==
 												successAccountForResponse.index

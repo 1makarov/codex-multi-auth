@@ -30,6 +30,13 @@ export interface RuntimePolicyAccount {
 	index: number;
 	accountId?: string | null;
 	email?: string | null;
+	/**
+	 * Only used to key account policy for an account with no accountId and no
+	 * email. Without it the runtime would key such an account as "unknown"
+	 * while the CLI keys it by refresh-token digest, and pause/drain/tag state
+	 * written by one would be invisible to the other.
+	 */
+	refreshToken?: string | null;
 }
 
 export interface RuntimePolicyDecision {
@@ -184,6 +191,7 @@ export async function evaluateRuntimePolicy(input: {
 			{
 				accountId: account.accountId ?? undefined,
 				email: account.email ?? undefined,
+				refreshToken: account.refreshToken ?? undefined,
 			},
 			account.index,
 		);

@@ -897,9 +897,8 @@ describe("runtime rotation proxy", () => {
 		// Two transport failures leave account health untouched; the third response
 		// is an explicit workspace-disabled 403 that calls setAccountEnabled(index, false).
 		// Selection on the next pass sees the pin in attemptedIndexes and
-		// records "already-attempted", so the disable never reaches the recorded
-		// skip reason — the 503 must still refuse to advertise the circuit's
-		// ~30s reset for an account no timer will re-admit.
+		// records "already-attempted", so the 503 must still avoid advertising a
+		// timed reset for an account no timer will re-admit.
 		const { calls, fetchImpl } = createRecordingFetch((_call, attempt) => {
 			if (attempt < 3) throw new TypeError("fetch failed");
 			return new Response(
@@ -2218,12 +2217,16 @@ describe("runtime rotation proxy", () => {
 		});
 		expect(calls).toHaveLength(1);
 		expect(proxy.getStatus()).toMatchObject({ retries: 0, rotations: 0 });
-		expect(accountManager.getAccountsSnapshot()).toEqual(
-			expect.arrayContaining([
-				expect.objectContaining({ enabled: true, coolingDownUntil: undefined }),
-				expect.objectContaining({ enabled: true, coolingDownUntil: undefined }),
-			]),
-		);
+		const accounts = accountManager.getAccountsSnapshot();
+		expect(accounts).toHaveLength(2);
+		expect(
+			accounts.every(
+				(account) =>
+					account.enabled &&
+					account.coolingDownUntil === undefined &&
+					account.cooldownReason === undefined,
+			),
+		).toBe(true);
 	});
 
 	it("persists the cooldown when an account has no resolvable accountId", async () => {

@@ -35,3 +35,9 @@ test-results.md
 
 # OMC session scratch (never publish)
 .omc/
+
+# ftask: per-slug runtime files (env + sim artifacts) — never committed
+.ftask/*/.env
+.ftask/*/sim_artifacts/
+.ftask/*/STATE.json
+.ftask/*/STATE.json.tmp

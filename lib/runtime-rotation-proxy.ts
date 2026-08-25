@@ -49,6 +49,7 @@ import {
 	loadRuntimePolicyState,
 	type RuntimePolicyDecision,
 } from "./policy/runtime-policy.js";
+import { createUsageStreamScanner } from "./usage/usage-extraction.js";
 import { isWorkspaceDisabledError } from "./request/fetch-helpers.js";
 import {
 	PreemptiveQuotaScheduler,
@@ -1564,6 +1565,14 @@ async function handleRequestInner(
 				state.schedulingStrategy,
 			);
 
+			// Recover the upstream token counts as the body streams past. Without
+			// them every ledger row lands with all-zero tokens and a zero cost, so
+			// evaluateBudgetGuard compares `0 >= limit` for maxTokens/maxCostUsd
+			// and those caps never fire — `budget set --cost 50` would allow
+			// unlimited spend, with only --requests actually enforced.
+			const usageScanner = createUsageStreamScanner({
+				contentType: upstream.headers.get("content-type"),
+			});
 			const forwarded = await forwardStreamingResponse(
 				upstream,
 				res,
@@ -1589,12 +1598,17 @@ async function handleRequestInner(
 					accountManager.saveToDiskDebounced();
 				},
 				state.streamStallTimeoutMs,
+				usageScanner.push,
 			);
+			// A stream that broke mid-flight still bills for whatever the upstream
+			// reported before the break, so record the counts on both outcomes.
+			const usageTokens = usageScanner.result();
 			await usageRecorder.record({
 				outcome: forwarded ? "success" : "failure",
 				statusCode: upstream.status,
 				errorCode: forwarded ? null : "stream_forward_failed",
 				account: refreshed.account,
+				...(usageTokens ?? {}),
 			});
 			return;
 		}

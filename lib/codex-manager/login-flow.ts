@@ -460,6 +460,13 @@ async function runAuthLoginFlow(
 								parsed: targetIndex + 1,
 								switchReason: "restore",
 								preserveActiveIndexByFamily: true,
+								// A restore replaces the whole account list, so every
+								// index moves. Session affinity remembers accounts BY
+								// INDEX, so without this a live proxy keeps routing
+								// in-flight sessions to whatever now occupies the old
+								// slot. `switch`/`best` already bump for a single
+								// move; a restore moves everything. See issue #474.
+								bumpAffinityGeneration: true,
 							});
 							console.log(
 								UI_COPY.oauth.restoreBackupLoaded(

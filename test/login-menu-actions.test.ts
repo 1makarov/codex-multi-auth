@@ -307,6 +307,24 @@ describe("handleManageAction delete", () => {
 		expect(saved.pinnedAccountIndex).toBeUndefined();
 		expect(storage.pinnedAccountIndex).toBeUndefined();
 	});
+
+	it("bumps the affinity generation so a live proxy drops stale session bindings", async () => {
+		const storage = storageWith([account("a"), account("b"), account("c")]);
+		storage.affinityGeneration = 4;
+		loadedStorage = structuredClone(storage);
+
+		await handleManageAction(storage, {
+			mode: "manage",
+			deleteAccountIndex: 0,
+		} satisfies MenuResult);
+
+		const saved = persisted[0];
+		// Session affinity is keyed by account INDEX, and the splice shifts every
+		// index above the removed slot. Reconciling the pin is not enough: without
+		// a generation bump the proxy keeps gluing in-flight sessions to whatever
+		// slid into the old slot. See issue #474.
+		expect(saved.affinityGeneration).toBeGreaterThan(4);
+	});
 });
 
 describe("handleManageAction toggle", () => {

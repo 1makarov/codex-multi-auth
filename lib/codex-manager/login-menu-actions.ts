@@ -5,6 +5,7 @@ import { MODEL_FAMILIES } from "../prompts/codex.js";
 import {
 	type AccountMetadataV3,
 	type AccountStorageV3,
+	bumpStorageAffinityGeneration,
 	findMatchingAccountIndex,
 	loadAccounts,
 	reconcilePinnedAccountIndex,
@@ -350,6 +351,12 @@ export async function handleManageAction(
 					pinnedAccount,
 					nextStorage.accounts,
 				);
+				// The splice shifts every index above the removed slot, and session
+				// affinity remembers accounts BY INDEX. Without a generation bump a
+				// live proxy keeps routing in-flight sessions to the account that
+				// slid into the old slot. Reconciling the pin is not enough — the
+				// affinity map is separate state. See issue #474.
+				bumpStorageAffinityGeneration(nextStorage);
 				await persist(nextStorage);
 				replaceManageActionStorage(storage, nextStorage);
 				deleted = true;

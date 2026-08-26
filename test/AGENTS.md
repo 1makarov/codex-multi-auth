@@ -1,12 +1,12 @@
 # TEST KNOWLEDGE BASE
 
 Generated: 2026-07-29
-Commit: 1645baf (2.9.0)
+Commit: 1645baf (2.9.0-auth-json.1)
 
 ## OVERVIEW
 
 Vitest suites for OAuth flow, request transforms, response handling, rotation logic, storage, CLI management, repo hygiene, and more.
-**5548 tests** across **344 test files** with 80%+ coverage threshold (2.9.0; 22 tests and 2 files skipped by default).
+**5563 tests** across **345 test files** with 80%+ coverage threshold (2.9.0-auth-json.1; 22 tests and 2 files skipped by default).
 
 ## STRUCTURE
 ```

@@ -92,6 +92,43 @@ codex-multi-auth forecast --live
 
 Live diagnostic probes lead with `gpt-5.6-sol` (falling back through the probe chain when an account lacks entitlement). General routing defaults remain on `gpt-5.5`.
 
+## Add From an Existing auth.json
+
+If the official Codex CLI already wrote ChatGPT OAuth credentials to an
+`auth.json` file, add them to the multi-auth pool without opening a new login:
+
+```bash
+codex-multi-auth add --auth-json ~/.codex/auth.json
+```
+
+For a pipe, redirected file, or raw paste, keep the JSON out of command-line
+arguments:
+
+```bash
+codex-multi-auth add --raw-auth-json < ~/.codex/auth.json
+```
+
+Run `codex-multi-auth add` with no flags in an interactive terminal to choose
+between a path and a hidden multiline paste. The path prompt defaults to the
+official `~/.codex/auth.json` (or the resolved `CODEX_HOME` equivalent).
+
+The import requires ChatGPT `access_token` and `refresh_token` fields and accepts
+the usual optional `id_token`, `account_id`, and metadata fields. It parses JWT
+claims locally for identity, workspace, email, and expiry hints; it does not
+verify a signature, refresh a token, or make a network call. The account is
+appended or safely deduplicated, while the existing active indexes, runtime pin,
+and official Codex auth state stay unchanged. When the pool was empty, the new
+single row naturally occupies index `0`, but no official state is written.
+
+Treat every source file as a live secret: keep restrictive filesystem
+permissions, never commit it, and do not pass raw JSON as a CLI argument. The
+source file is not modified or removed. Its credentials are copied into the
+normal multi-auth account storage and backups. Verify them afterward:
+
+```bash
+codex-multi-auth check
+```
+
 ## Alternate Login Paths
 
 Use these only when the normal browser-first flow is unavailable.
@@ -146,7 +183,8 @@ See upgrade note: [onboarding restore behavior](upgrade.md#onboarding-restore-no
 
 ## Add More Accounts
 
-Repeat `codex-multi-auth login` for each account you want to manage.
+Repeat `codex-multi-auth login` for a fresh OAuth flow, or use
+`codex-multi-auth add` for an existing official `auth.json`.
 
 When you are done, choose the best account for the next session:
 

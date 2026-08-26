@@ -32,6 +32,7 @@ test-results.md
 # local env files
 .env
 .env.local
+/auth.json
 
 # OMC session scratch (never publish)
 .omc/

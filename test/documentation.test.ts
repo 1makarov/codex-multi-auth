@@ -277,16 +277,19 @@ describe("Documentation Integrity", () => {
 		}
 	});
 
-	it("documents mcodex, login --org, and budget flag names that match the CLI", () => {
+	it("documents mcodex, auth.json add, login --org, and budget flags that match the CLI", () => {
 		const commands = read("docs/reference/commands.md");
 		const help = read("lib/codex-manager/help.ts");
 		expect(commands).toContain("## `mcodex`");
+		expect(commands).toContain("add --auth-json");
+		expect(commands).toContain("add --raw-auth-json");
 		expect(commands).toContain("login --org");
 		expect(commands).toContain("[--requests N] [--tokens N] [--cost USD]");
 		expect(commands).not.toContain("--max-requests");
 		expect(help).toContain("--no-runtime-overlay");
 		expect(help).toContain("--max-accounts");
 		expect(help).toContain("init-config");
+		expect(help).toContain("--raw-auth-json");
 	});
 
 	it("keeps the AGENTS.md package-version claim in sync with package.json", () => {

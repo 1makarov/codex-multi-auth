@@ -144,6 +144,20 @@ npm i -g codex-multi-auth
 codex-multi-auth login
 ```
 
+Already have file-backed ChatGPT credentials from the official Codex CLI? Add
+that account without starting another OAuth flow:
+
+```bash
+codex-multi-auth add --auth-json ~/.codex/auth.json
+# Or pipe/paste the raw JSON without putting tokens in shell arguments:
+codex-multi-auth add --raw-auth-json < ~/.codex/auth.json
+```
+
+Plain `codex-multi-auth add` opens an interactive choice between a file path and
+a hidden raw-JSON paste. Import is offline and does not change the current
+account selection or rewrite the official `~/.codex/auth.json`. Run
+`codex-multi-auth check` afterward to verify the credentials live.
+
 Verify the manager and the new account:
 
 ```bash
@@ -171,6 +185,7 @@ For remote or headless shells, prefer `codex-multi-auth login --device-auth`.
 | Command | What it answers |
 | --- | --- |
 | `codex-multi-auth login` | How do I add or re-open the account menu? |
+| `codex-multi-auth add` | How do I add credentials from an official `auth.json` file or raw JSON paste? |
 | `codex-multi-auth status` | What does my account pool, pin, and runtime metrics look like? (`list` is the same output) |
 | `codex-multi-auth check` | Do live health probes against my saved accounts succeed? |
 
@@ -392,6 +407,7 @@ codex-multi-auth doctor --json
 
 ## Release Notes
 
+- Current prerelease: [docs/releases/v2.9.0-auth-json.1.md](docs/releases/v2.9.0-auth-json.1.md) — install via `npm i -g codex-multi-auth@auth-json`
 - Current stable: [docs/releases/v2.9.0.md](docs/releases/v2.9.0.md) — install via `npm i -g codex-multi-auth`
 - Previous stable: [docs/releases/v2.8.3.md](docs/releases/v2.8.3.md)
 - Previous stable: [docs/releases/v2.8.2.md](docs/releases/v2.8.2.md)

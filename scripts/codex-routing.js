@@ -1,5 +1,6 @@
 const AUTH_SUBCOMMANDS = new Set([
 	"login",
+	"add",
 	"list",
 	"status",
 	"switch",

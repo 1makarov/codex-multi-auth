@@ -1,6 +1,6 @@
 # Command Reference
 
-Complete command, flag, and hotkey reference for `codex-multi-auth` (package `2.9.0`).
+Complete command, flag, and hotkey reference for `codex-multi-auth` (package `2.9.0-auth-json.1`).
 
 ---
 
@@ -39,8 +39,41 @@ Compatibility forms are supported for migrations and wrapper-routed environments
 | Command | Description |
 | --- | --- |
 | `codex-multi-auth login` | Open interactive auth dashboard. Flags: `--device-auth`, `--manual`/`--no-browser`, `login --org <org_id>` |
+| `codex-multi-auth add` | Add one ChatGPT account from an official `auth.json` path or hidden/raw stdin, without changing the current selection |
 | `codex-multi-auth status` | Print account pool, pin, runtime metrics, and storage summary (`list` is the same command) |
 | `codex-multi-auth check` | Live-probe account health against the Codex backend |
+
+---
+
+## `codex-multi-auth add`
+
+Adds or updates one account from file-backed official Codex ChatGPT OAuth state.
+This command is separate from `login`: it performs no OAuth flow and no network
+request.
+
+```bash
+codex-multi-auth add
+codex-multi-auth add --auth-json ~/.codex/auth.json
+codex-multi-auth add --raw-auth-json < ~/.codex/auth.json
+```
+
+With no flags, an interactive terminal offers `Read auth.json From a File` and
+`Paste Raw auth.json`. The paste is multiline, hidden, and completes when the
+top-level JSON object closes. Non-interactive callers must provide
+`--auth-json <path>` or `--raw-auth-json`; the latter reads stdin to EOF. Inputs
+are capped at 4 MiB.
+
+Only ChatGPT OAuth state is accepted. `tokens.access_token` and
+`tokens.refresh_token` are required; `id_token`, `account_id`, top-level email,
+and `_meta` are optional. Unknown bookkeeping fields are ignored. Malformed
+errors name fields but never echo credential values.
+
+An identity match updates credentials and uses the same workspace dedup rules as
+login; otherwise a row is appended. The command preserves `activeIndex`,
+per-family indexes, manual pin, and affinity generation, and never syncs the
+import back into the official Codex auth files. An unreadable/expired JWT expiry
+is a warning rather than an import failure because validation is offline; use
+`codex-multi-auth check` for a live refresh and verification.
 
 ---
 
@@ -144,6 +177,8 @@ Turning `showQuotaDetails` off reduces the line to a bare `live session OK`.
 | Flag | Applies to | Meaning |
 | --- | --- | --- |
 | `--account <index\|email\|id>` | `codex-multi-auth-codex` (forwarded Codex runs) | Force one account for this invocation only; the session never rotates and persisted `switch` state is untouched. Requires the runtime rotation proxy. See [Force an account for one invocation](#force-an-account-for-one-invocation) |
+| `--auth-json <path>` | add | Read one official Codex ChatGPT `auth.json` file |
+| `--raw-auth-json` | add | Read raw `auth.json` from hidden TTY paste or stdin to EOF |
 | `--device-auth` | login | Use the OpenAI Codex device-code flow for remote/headless login (mutually exclusive with `--manual` / `--no-browser`) |
 | `--manual`, `--no-browser` | login | Skip browser launch and use manual callback flow (mutually exclusive with `--device-auth`) |
 | `--org <org_id>` | login | Bind this login to a specific ChatGPT workspace/org id (same seat can be registered as personal vs team/business) |

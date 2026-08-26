@@ -98,6 +98,7 @@ All governance data stays under `~/.codex/multi-auth`. Nothing here is a hosted 
 | In-dashboard settings hub | Runtime and display tuning without editing files directly | dashboard settings |
 | Experimental settings hotkeys | Keyboard shortcuts for sync preview, backup export, and refresh-guard tuning | dashboard experimental |
 | Browser-first OAuth with device/manual fallback | Browser-first login; `--device-auth` for remote/headless; `--manual`, `--no-browser`, and `CODEX_AUTH_NO_BROWSER=1` as callback-paste fallbacks | `codex-multi-auth login` |
+| Offline auth.json account import | Add or update one official ChatGPT OAuth credential set from a path or hidden/raw stdin without changing the current selection | `codex-multi-auth add` |
 | Provider-agnostic history | Lists local Codex rollout sessions regardless of active model provider (avoids `/resume` provider-filter gaps when rotation is on) | `codex-multi-auth history` |
 | `mcodex` convenience launcher | Default-forwards to the wrapper; `--monitor` live-lists accounts; `--tmux` / `-t` opens a tmux session (optional `--live-accounts`) | `mcodex` |
 

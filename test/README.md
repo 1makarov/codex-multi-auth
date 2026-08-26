@@ -2,7 +2,7 @@
 
 This directory contains the test suite for the OpenAI Codex OAuth plugin.
 
-**Stats**: 5548 tests across 344 test files with 80%+ coverage threshold (2.9.0; 22 tests and 2 files skipped by default).
+**Stats**: 5563 tests across 345 test files with 80%+ coverage threshold (2.9.0-auth-json.1; 22 tests and 2 files skipped by default).
 
 ## Test Structure
 
@@ -16,6 +16,7 @@ test/
 ├── auth-menu-hotkeys.test.ts          # Auth menu hotkey behavior
 ├── auth-rate-limit.test.ts            # Token bucket rate limiting
 ├── auth.test.ts                       # OAuth authentication tests (PKCE + JWT)
+├── auth-json-add.test.ts              # Offline auth.json parsing, input, and add semantics
 ├── update-notice.test.ts              # npm version notice tests
 ├── browser.test.ts                    # Platform-specific browser open behavior
 ├── capability-policy.test.ts          # Model capability enforcement

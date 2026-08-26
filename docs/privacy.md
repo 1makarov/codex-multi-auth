@@ -44,6 +44,14 @@ Windows override locations).
 
 Runtime rotation uses loopback-only local HTTP listeners. The per-session proxy and persistent app router forward requests to the official Codex backend with the selected managed account token, but the project does not operate a remote telemetry service.
 
+`codex-multi-auth add` can read an official ChatGPT `auth.json` from an explicit
+path or raw stdin. Parsing is local and offline. The source is not changed or
+deleted, raw JSON and tokens are never logged, and imported credentials are
+copied into the canonical multi-auth account pool (and its normal backup/WAL
+artifacts). Import does not rewrite the official Codex auth state or change the
+current account selection. Because offline parsing does not prove that a token
+is valid, run `codex-multi-auth check` when live verification is required.
+
 The optional local bridge is also loopback-only and exposes only `/health`,
 `/v1/models`, and `/v1/responses`. It requires a local bearer token by default.
 The token file stores SHA-256 hashes, not plaintext tokens.

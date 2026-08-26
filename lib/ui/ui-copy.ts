@@ -84,6 +84,18 @@ export const UI_COPY = {
 		callbackStateMismatch:
 			"OAuth state mismatch. That callback URL was generated for a different login attempt. Restart login and paste the callback URL from this attempt.",
 	},
+	authJsonImport: {
+		title: "Add Account From auth.json",
+		subtitle: "Choose where to read the official Codex credentials.",
+		path: "Read auth.json From a File",
+		raw: "Paste Raw auth.json",
+		back: "Back",
+		help: "↑↓ Move | Enter Select | 1 File | 2 Paste | Q Back",
+		pathPrompt: (defaultPath: string) =>
+			`Path to auth.json [${defaultPath}]: `,
+		pastePrompt:
+			"Paste the complete auth.json object. Input is hidden and finishes at the closing brace. Ctrl+C cancels.",
+	},
 	returnFlow: {
 		continuePrompt: "Press Enter to go back.",
 		actionFailedPrompt: "Action failed. Press Enter to go back.",

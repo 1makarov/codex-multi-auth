@@ -361,6 +361,44 @@ export const TokenResultSchema = z.discriminatedUnion("type", [
 export type TokenResultFromSchema = z.infer<typeof TokenResultSchema>;
 
 // ============================================================================
+// Official Codex auth.json Schema
+// ============================================================================
+
+const NonEmptyAuthJsonStringSchema = z.string().trim().min(1);
+
+/**
+ * File-backed ChatGPT OAuth state written by the official Codex CLI.
+ *
+ * The official file may gain bookkeeping fields over time, so both the root
+ * object and its nested metadata objects are passthrough schemas. Import only
+ * consumes the credential/identity fields declared here.
+ */
+export const CodexAuthJsonSchema = z
+	.object({
+		auth_mode: z.literal("chatgpt").optional(),
+		tokens: z
+			.object({
+				access_token: NonEmptyAuthJsonStringSchema,
+				refresh_token: NonEmptyAuthJsonStringSchema,
+				id_token: NonEmptyAuthJsonStringSchema.optional(),
+				account_id: NonEmptyAuthJsonStringSchema.optional(),
+			})
+			.passthrough(),
+		email: z.string().optional(),
+		_meta: z
+			.object({
+				email: z.string().optional(),
+				plan_type: z.string().optional(),
+				imported_at: z.string().optional(),
+			})
+			.passthrough()
+			.optional(),
+	})
+	.passthrough();
+
+export type CodexAuthJsonFromSchema = z.infer<typeof CodexAuthJsonSchema>;
+
+// ============================================================================
 // OAuth Response Schemas (for validating API responses)
 // ============================================================================
 

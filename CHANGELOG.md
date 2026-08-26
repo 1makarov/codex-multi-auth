@@ -5,6 +5,16 @@ Dates use ISO format (`YYYY-MM-DD`).
 
 This repository's current stable release line is `2.x`. Full release notes live in [`docs/releases/`](docs/releases/) — this file is the short version. Pre-`0.1.0` iteration history is archived in [`docs/releases/legacy-pre-0.1-history.md`](docs/releases/legacy-pre-0.1-history.md).
 
+## [2.9.0-auth-json.1] - 2026-08-26
+
+Adds an offline path for importing an existing official Codex ChatGPT `auth.json` account without changing the current selection. [Full notes](docs/releases/v2.9.0-auth-json.1.md).
+
+### Added
+
+- `codex-multi-auth add --auth-json <path>` reads one official ChatGPT OAuth credential file, and `--raw-auth-json` accepts a hidden TTY paste or stdin.
+- Imports reuse the login account-pool deduplication rules while preserving active indexes, pins, affinity state, and the official Codex auth files.
+- Malformed input errors do not echo credential values; file and raw input are limited to 4 MiB.
+
 ## [2.9.0] - 2026-08-25
 
 `budget set --cost` and `--tokens` were accepted but never enforced, a dead network path counted against account health, and account removal left live sessions routed to the wrong account. [Full notes](docs/releases/v2.9.0.md).

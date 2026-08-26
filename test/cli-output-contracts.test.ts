@@ -230,6 +230,7 @@ describe("cli output contracts", () => {
 		// removed or renamed line is a breaking change to the documented surface.
 		const DOCUMENTED_COMMAND_LINES = [
 			"codex-multi-auth login [--device-auth|--manual|--no-browser] [--org <org_id>]",
+			"codex-multi-auth add [--auth-json <path>|--raw-auth-json]",
 			"codex-multi-auth status [--json]",
 			"codex-multi-auth check",
 			"codex-multi-auth list [--json]",

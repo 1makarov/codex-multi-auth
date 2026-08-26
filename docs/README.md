@@ -28,6 +28,12 @@ Public documentation for the `codex-multi-auth` Codex CLI multi-account OAuth ma
 
 ## Release History
 
+### Prereleases
+
+| Document | Focus |
+| --- | --- |
+| [releases/v2.9.0-auth-json.1.md](releases/v2.9.0-auth-json.1.md) | Current auth.json import prerelease (install via `npm i -g codex-multi-auth@auth-json`) |
+
 ### Stable Releases
 
 | Document | Focus |
@@ -174,4 +180,3 @@ These are snapshot archives. Prefer current `development/ARCHITECTURE.md`, refer
 - Contribution policy: [../CONTRIBUTING.md](../CONTRIBUTING.md)
 - Code of conduct: [../CODE_OF_CONDUCT.md](../CODE_OF_CONDUCT.md)
 - Security policy: [../SECURITY.md](../SECURITY.md)
-

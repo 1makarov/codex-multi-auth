@@ -14,6 +14,7 @@ import {
 	printBestUsage,
 	runBestCommand,
 } from "./codex-manager/commands/best.js";
+import { runAddCommand } from "./codex-manager/commands/add.js";
 import {
 	applyTokenAccountIdentity,
 	hasLikelyInvalidRefreshToken,
@@ -516,6 +517,7 @@ const CLI_COMMAND_HANDLERS: ReadonlyMap<string, CliCommandHandler> = new Map<
 	CliCommandHandler
 >([
 	["login", (rest) => runAuthLogin(rest, { runForecast, createRepairCommandDeps })],
+	["add", (rest) => runAddCommand(rest)],
 	["list", runListOrStatusCommand],
 	["status", runListOrStatusCommand],
 	[

@@ -24,7 +24,7 @@ lib/
 ├── codex-cli/                     # official Codex CLI state sync and output writer helpers
 ├── codex-manager.ts               # codex-multi-auth command dispatcher
 ├── codex-manager/
-│   ├── commands/                  # focused command implementations (account, best, bridge, budget, check, config-explain, debug-bundle, forecast, history, init-config, integrations, models, monitor, report, rotation, status, switch, uninstall, unpin, usage, verify, why-selected, workspace)
+│   ├── commands/                  # focused command implementations (account, best, bridge, budget, check, config-explain, debug-bundle, forecast, history, init-config, integrations, models, monitor, remove, report, rotation, status, switch, uninstall, unpin, usage, verify, why-selected, workspace)
 │   ├── formatters/                # shared CLI text/account/model/quota formatters
 │   ├── settings-hub.ts            # back-compat re-export stub
 │   └── settings-hub/              # shared/dashboard/backend/experimental/index panels

@@ -32,7 +32,7 @@ Public documentation for the `codex-multi-auth` Codex CLI multi-account OAuth ma
 
 | Document | Focus |
 | --- | --- |
-| [releases/v2.9.0-auth-json.1.md](releases/v2.9.0-auth-json.1.md) | Current auth.json import prerelease (install via `npm i -g codex-multi-auth@auth-json`) |
+| [releases/v2.9.0-auth-json.1.md](releases/v2.9.0-auth-json.1.md) | Current auth.json import and checked-removal prerelease (install via `npm i -g codex-multi-auth@auth-json`) |
 
 ### Stable Releases
 

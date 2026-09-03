@@ -129,6 +129,30 @@ normal multi-auth account storage and backups. Verify them afterward:
 codex-multi-auth check
 ```
 
+## Remove an Account
+
+Run the interactive removal flow to live-check the pool first, then choose an
+account from a list showing the same `Codex available`, `signed in only`, and
+`need re-login` outcomes as `codex-multi-auth check`:
+
+```bash
+codex-multi-auth remove
+```
+
+The selected account is removed only after confirmation. For scripts, provide
+the 1-based index and explicit confirmation; use `--no-check` only when the
+live probe should be skipped:
+
+```bash
+codex-multi-auth remove 2 --yes
+codex-multi-auth remove 2 --yes --no-check
+```
+
+Removal repairs active and per-model-family indexes, follows or clears the
+manual pin by account identity, and invalidates stale runtime affinity. It does
+not delete or rewrite the official Codex `~/.codex/auth.json` state. Recovery
+snapshots created by normal storage persistence remain available.
+
 ## Alternate Login Paths
 
 Use these only when the normal browser-first flow is unavailable.

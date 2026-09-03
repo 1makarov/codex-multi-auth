@@ -2,7 +2,7 @@
 
 This directory contains the test suite for the OpenAI Codex OAuth plugin.
 
-**Stats**: 5563 tests across 345 test files with 80%+ coverage threshold (2.9.0-auth-json.1; 22 tests and 2 files skipped by default).
+**Stats**: 5574 tests across 346 test files with 80%+ coverage threshold (2.9.0-auth-json.1; 22 tests and 2 files skipped by default).
 
 ## Test Structure
 
@@ -30,6 +30,7 @@ test/
 ├── codex-cli-sync.test.ts             # CLI sync coordination
 ├── codex-host-resolver.test.ts        # Host resolver
 ├── codex-manager-cli.test.ts          # CLI settings Q cancel, all 5 panels
+├── codex-manager-remove-command.test.ts # Checked account removal command and storage invariants
 ├── codex-prompts.test.ts              # Codex prompt generation tests
 ├── codex-routing.test.ts              # Codex routing decisions
 ├── codex.test.ts                      # Codex prompt/instructions behavior

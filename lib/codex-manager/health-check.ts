@@ -62,6 +62,45 @@ export interface HealthCheckOptions {
 	liveProbe?: boolean;
 	model?: string;
 	display?: DashboardDisplaySettings;
+	syncActiveAccount?: boolean;
+	onAccountResult?: (result: HealthCheckAccountResult) => void;
+}
+
+/**
+ * Credential-free per-account outcome emitted by the same code path that renders
+ * `codex-multi-auth check`. Consumers such as the interactive remove command
+ * can reuse the live result without parsing terminal output or receiving
+ * credentials.
+ */
+export interface HealthCheckAccountResult {
+	index: number;
+	recordId?: string;
+	accountId?: string;
+	email?: string;
+	status:
+		| "codex-available"
+		| "signed-in-only"
+		| "working"
+		| "warning"
+		| "needs-relogin";
+	detail: string;
+}
+
+function emitAccountResult(
+	options: HealthCheckOptions,
+	account: { recordId?: string; accountId?: string; email?: string },
+	index: number,
+	status: HealthCheckAccountResult["status"],
+	detail: string,
+): void {
+	options.onAccountResult?.({
+		index,
+		recordId: account.recordId,
+		accountId: account.accountId,
+		email: account.email,
+		status,
+		detail,
+	});
 }
 
 export async function runHealthCheck(
@@ -185,6 +224,19 @@ export async function runHealthCheck(
 					`  ${stylePromptText(healthMarker, healthTone)} ${labelText} ${stylePromptText("|", "muted")} ${styleAccountDetailText(healthDetail, healthTone)}`,
 				);
 			}
+			emitAccountResult(
+				options,
+				account,
+				i,
+				liveProbe
+					? healthTone === "success"
+						? "codex-available"
+						: "signed-in-only"
+					: healthTone === "success"
+						? "working"
+						: "warning",
+				healthDetail,
+			);
 			continue;
 		}
 		const result = await queuedRefresh(account.refreshToken);
@@ -291,13 +343,26 @@ export async function runHealthCheck(
 					}
 				}
 			}
+			healthyMessage = appendAuthInvalidationMarker(account, healthyMessage);
 			if (display.showPerAccountRows) {
-				healthyMessage = appendAuthInvalidationMarker(account, healthyMessage);
 				const healthyMarker = healthyTone === "success" ? "✓" : "!";
 				console.log(
 					`  ${stylePromptText(healthyMarker, healthyTone)} ${labelText} ${stylePromptText("|", "muted")} ${styleAccountDetailText(healthyMessage, healthyTone)}`,
 				);
 			}
+			emitAccountResult(
+				options,
+				account,
+				i,
+				liveProbe
+					? healthyTone === "success"
+						? "codex-available"
+						: "signed-in-only"
+					: healthyTone === "success"
+						? "working"
+						: "warning",
+				healthyMessage,
+			);
 		} else {
 			const detail = normalizeFailureDetail(result.message, result.reason);
 			if (sessionLikelyValid) {
@@ -305,23 +370,37 @@ export async function runHealthCheck(
 				if (liveProbe) {
 					signedInOnly += 1;
 				}
+				const detailWithMarker = appendAuthInvalidationMarker(
+					account,
+					`refresh failed (${detail}) but this account still works right now`,
+				);
 				if (display.showPerAccountRows) {
-					const detailWithMarker = appendAuthInvalidationMarker(
-						account,
-						`refresh failed (${detail}) but this account still works right now`,
-					);
 					console.log(
 						`  ${stylePromptText("!", "warning")} ${labelText} ${stylePromptText("|", "muted")} ${stylePromptText(detailWithMarker, "warning")}`,
 					);
 				}
+				emitAccountResult(
+					options,
+					account,
+					i,
+					liveProbe ? "signed-in-only" : "warning",
+					detailWithMarker,
+				);
 			} else {
 				failed += 1;
+				const detailWithMarker = appendAuthInvalidationMarker(account, detail);
 				if (display.showPerAccountRows) {
-					const detailWithMarker = appendAuthInvalidationMarker(account, detail);
 					console.log(
 						`  ${stylePromptText("✗", "danger")} ${labelText} ${stylePromptText("|", "muted")} ${stylePromptText(detailWithMarker, "danger")}`,
 					);
 				}
+				emitAccountResult(
+					options,
+					account,
+					i,
+					"needs-relogin",
+					detailWithMarker,
+				);
 			}
 		}
 	}
@@ -351,6 +430,7 @@ export async function runHealthCheck(
 	}
 
 	if (
+		options.syncActiveAccount !== false &&
 		activeAccountRefreshed &&
 		activeIndex >= 0 &&
 		activeIndex < storage.accounts.length

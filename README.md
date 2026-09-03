@@ -171,6 +171,7 @@ Use these next:
 codex-multi-auth list
 codex-multi-auth switch 2
 codex-multi-auth forecast --live
+codex-multi-auth remove
 ```
 
 If browser launch is blocked, use the alternate login paths in [docs/getting-started.md](docs/getting-started.md#alternate-login-paths).
@@ -186,6 +187,7 @@ For remote or headless shells, prefer `codex-multi-auth login --device-auth`.
 | --- | --- |
 | `codex-multi-auth login` | How do I add or re-open the account menu? |
 | `codex-multi-auth add` | How do I add credentials from an official `auth.json` file or raw JSON paste? |
+| `codex-multi-auth remove` | Which account should I remove after seeing its live `check` status? |
 | `codex-multi-auth status` | What does my account pool, pin, and runtime metrics look like? (`list` is the same output) |
 | `codex-multi-auth check` | Do live health probes against my saved accounts succeed? |
 

@@ -1,14 +1,11 @@
 ﻿import { stdin as input, stdout as output } from "node:process";
 import { sanitizeEmail } from "../accounts.js";
 import type { promptLoginMode } from "../cli.js";
-import { MODEL_FAMILIES } from "../prompts/codex.js";
 import {
 	type AccountMetadataV3,
 	type AccountStorageV3,
-	bumpStorageAffinityGeneration,
 	findMatchingAccountIndex,
 	loadAccounts,
-	reconcilePinnedAccountIndex,
 	type NamedBackupSummary,
 	setStoragePath,
 	withAccountStorageTransaction,
@@ -29,6 +26,7 @@ import {
 	syncSelectionToCodex,
 } from "./login-oauth.js";
 import { persistAndSyncSelectedAccount } from "./persist-selected-account.js";
+import { removeAccountFromStorage } from "./account-removal.js";
 
 /**
  * Per-menu-item action handlers for the login dashboard: sign-in mode and
@@ -193,57 +191,6 @@ export async function promptManualBackupSelection(
 	return selected;
 }
 
-function adjustManageActionSelectionIndex(
-	currentIndex: number | undefined,
-	removedIndex: number,
-	remainingCount: number,
-): number {
-	if (remainingCount <= 0) {
-		return 0;
-	}
-	if (typeof currentIndex !== "number" || currentIndex < 0) {
-		return 0;
-	}
-	if (currentIndex < removedIndex) {
-		return Math.min(currentIndex, remainingCount - 1);
-	}
-	if (currentIndex > removedIndex) {
-		return currentIndex - 1;
-	}
-	return Math.min(removedIndex, remainingCount - 1);
-}
-
-function resetManageActionSelection(
-	storage: AccountStorageV3,
-	removedIndex: number,
-): void {
-	const remainingCount = storage.accounts.length;
-	if (remainingCount <= 0) {
-		storage.activeIndex = 0;
-		storage.activeIndexByFamily = {};
-		for (const family of MODEL_FAMILIES) {
-			storage.activeIndexByFamily[family] = 0;
-		}
-		return;
-	}
-
-	const previousActiveIndex = storage.activeIndex;
-	const previousByFamily = { ...storage.activeIndexByFamily };
-	storage.activeIndex = adjustManageActionSelectionIndex(
-		previousActiveIndex,
-		removedIndex,
-		remainingCount,
-	);
-	storage.activeIndexByFamily = {};
-	for (const family of MODEL_FAMILIES) {
-		storage.activeIndexByFamily[family] = adjustManageActionSelectionIndex(
-			previousByFamily[family] ?? previousActiveIndex,
-			removedIndex,
-			remainingCount,
-		);
-	}
-}
-
 function replaceManageActionStorage(
 	target: AccountStorageV3,
 	source: AccountStorageV3,
@@ -257,6 +204,7 @@ function replaceManageActionStorage(
 	// Keep the in-memory view's manual pin in sync with what was just persisted;
 	// the pin was re-resolved (or cleared) against the post-deletion account list.
 	target.pinnedAccountIndex = source.pinnedAccountIndex;
+	target.affinityGeneration = source.affinityGeneration;
 }
 
 function resolveManageActionAccountIndex(
@@ -321,46 +269,11 @@ export async function handleManageAction(
 		const selectedAccount = storage.accounts[idx];
 		let deleted = false;
 		if (selectedAccount) {
-			await withAccountStorageTransaction(async (loadedStorage, persist) => {
-				const nextStorage = loadedStorage
-					? structuredClone(loadedStorage)
-					: structuredClone(storage);
-				const nextIndex = resolveManageActionAccountIndex(
-					nextStorage,
-					idx,
-					selectedAccount,
-				);
-				if (nextIndex === null) {
-					return;
-				}
-				const nextAccount = nextStorage.accounts[nextIndex];
-				if (!matchesManageActionAccount(selectedAccount, nextAccount)) {
-					return;
-				}
-				// Capture the pinned account BEFORE the splice so the manual pin can be
-				// followed by identity afterwards. resetManageActionSelection only remaps
-				// activeIndex; without this the pin keeps its raw slot and silently points
-				// at a different account (or wedges the pool). See #474.
-				const pinnedAccount =
-					typeof nextStorage.pinnedAccountIndex === "number"
-						? nextStorage.accounts[nextStorage.pinnedAccountIndex]
-						: undefined;
-				nextStorage.accounts.splice(nextIndex, 1);
-				resetManageActionSelection(nextStorage, nextIndex);
-				nextStorage.pinnedAccountIndex = reconcilePinnedAccountIndex(
-					pinnedAccount,
-					nextStorage.accounts,
-				);
-				// The splice shifts every index above the removed slot, and session
-				// affinity remembers accounts BY INDEX. Without a generation bump a
-				// live proxy keeps routing in-flight sessions to the account that
-				// slid into the old slot. Reconciling the pin is not enough — the
-				// affinity map is separate state. See issue #474.
-				bumpStorageAffinityGeneration(nextStorage);
-				await persist(nextStorage);
-				replaceManageActionStorage(storage, nextStorage);
+			const result = await removeAccountFromStorage(selectedAccount);
+			if (result.removed) {
+				replaceManageActionStorage(storage, result.storage);
 				deleted = true;
-			});
+			}
 		}
 		if (deleted) {
 			console.log(`Deleted account ${idx + 1}.`);

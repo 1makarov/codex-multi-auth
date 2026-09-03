@@ -13,6 +13,7 @@
 export const ACCOUNT_MANAGER_COMMANDS = new Set([
 	"login",
 	"add",
+	"remove",
 	"list",
 	"status",
 	"switch",

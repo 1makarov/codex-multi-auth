@@ -52,6 +52,13 @@ artifacts). Import does not rewrite the official Codex auth state or change the
 current account selection. Because offline parsing does not prove that a token
 is valid, run `codex-multi-auth check` when live verification is required.
 
+`codex-multi-auth remove` deletes the selected credential row from the active
+multi-auth pool after confirmation. Its default pre-removal check may refresh
+tokens and update the local quota cache, but suppresses the check command's
+normal official-Codex active-account sync. The removal does not edit official
+Codex auth files; normal multi-auth recovery snapshots may still contain the
+removed credentials until those artifacts are separately cleaned up.
+
 The optional local bridge is also loopback-only and exposes only `/health`,
 `/v1/models`, and `/v1/responses`. It requires a local bearer token by default.
 The token file stores SHA-256 hashes, not plaintext tokens.

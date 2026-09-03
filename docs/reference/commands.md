@@ -40,6 +40,7 @@ Compatibility forms are supported for migrations and wrapper-routed environments
 | --- | --- |
 | `codex-multi-auth login` | Open interactive auth dashboard. Flags: `--device-auth`, `--manual`/`--no-browser`, `login --org <org_id>` |
 | `codex-multi-auth add` | Add one ChatGPT account from an official `auth.json` path or hidden/raw stdin, without changing the current selection |
+| `codex-multi-auth remove` | Live-check saved accounts, show their check outcomes, and remove one selected account |
 | `codex-multi-auth status` | Print account pool, pin, runtime metrics, and storage summary (`list` is the same command) |
 | `codex-multi-auth check` | Live-probe account health against the Codex backend |
 
@@ -74,6 +75,33 @@ per-family indexes, manual pin, and affinity generation, and never syncs the
 import back into the official Codex auth files. An unreadable/expired JWT expiry
 is a warning rather than an import failure because validation is offline; use
 `codex-multi-auth check` for a live refresh and verification.
+
+---
+
+## `codex-multi-auth remove`
+
+Removes one account from multi-auth storage. With no index, the interactive
+flow first runs the same live probe as `codex-multi-auth check`, then shows each
+account with its `Codex available`, `signed in only`, or `need re-login` result:
+
+```bash
+codex-multi-auth remove
+codex-multi-auth remove 2 --yes
+codex-multi-auth remove 2 --yes --no-check
+```
+
+Interactive removal always asks for confirmation. Non-interactive callers must
+provide a 1-based index and `--yes`; `--no-check` skips the live check for
+offline or time-sensitive automation. If the check itself fails before the
+picker opens, removal stops without deleting anything and reports that
+`--no-check` is available.
+
+The deletion transaction re-resolves the selected account by identity so a
+concurrent reorder cannot delete the wrong row. It repairs the active and
+per-model-family indexes, follows or clears a manual pin by identity, and bumps
+the affinity generation so running proxies discard stale positional bindings.
+The removal path never deletes or rewrites official Codex auth files; the
+embedded check also suppresses its normal active-account sync for this command.
 
 ---
 
@@ -179,6 +207,8 @@ Turning `showQuotaDetails` off reduces the line to a bare `live session OK`.
 | `--account <index\|email\|id>` | `codex-multi-auth-codex` (forwarded Codex runs) | Force one account for this invocation only; the session never rotates and persisted `switch` state is untouched. Requires the runtime rotation proxy. See [Force an account for one invocation](#force-an-account-for-one-invocation) |
 | `--auth-json <path>` | add | Read one official Codex ChatGPT `auth.json` file |
 | `--raw-auth-json` | add | Read raw `auth.json` from hidden TTY paste or stdin to EOF |
+| `--yes`, `-y` | remove | Confirm indexed removal without an interactive prompt |
+| `--no-check` | remove | Skip the live health check before account selection/removal |
 | `--device-auth` | login | Use the OpenAI Codex device-code flow for remote/headless login (mutually exclusive with `--manual` / `--no-browser`) |
 | `--manual`, `--no-browser` | login | Skip browser launch and use manual callback flow (mutually exclusive with `--device-auth`) |
 | `--org <org_id>` | login | Bind this login to a specific ChatGPT workspace/org id (same seat can be registered as personal vs team/business) |

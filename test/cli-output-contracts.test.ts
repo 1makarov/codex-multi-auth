@@ -231,6 +231,7 @@ describe("cli output contracts", () => {
 		const DOCUMENTED_COMMAND_LINES = [
 			"codex-multi-auth login [--device-auth|--manual|--no-browser] [--org <org_id>]",
 			"codex-multi-auth add [--auth-json <path>|--raw-auth-json]",
+			"codex-multi-auth remove [<index>] [--yes] [--no-check]",
 			"codex-multi-auth status [--json]",
 			"codex-multi-auth check",
 			"codex-multi-auth list [--json]",

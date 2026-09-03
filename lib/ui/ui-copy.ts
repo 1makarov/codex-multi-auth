@@ -96,6 +96,13 @@ export const UI_COPY = {
 		pastePrompt:
 			"Paste the complete auth.json object. Input is hidden and finishes at the closing brace. Ctrl+C cancels.",
 	},
+	accountRemoval: {
+		title: "Remove Account",
+		subtitle: "Live results from codex-multi-auth check. Select an account to remove.",
+		skippedSubtitle: "Account check skipped. Select an account to remove.",
+		back: "Cancel",
+		help: "↑↓ Move | Enter Select | Q Cancel",
+	},
 	returnFlow: {
 		continuePrompt: "Press Enter to go back.",
 		actionFailedPrompt: "Action failed. Press Enter to go back.",

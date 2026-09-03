@@ -7,13 +7,14 @@ This repository's current stable release line is `2.x`. Full release notes live 
 
 ## [2.9.0-auth-json.1] - 2026-08-26
 
-Adds an offline path for importing an existing official Codex ChatGPT `auth.json` account without changing the current selection. [Full notes](docs/releases/v2.9.0-auth-json.1.md).
+Adds offline `auth.json` import plus a standalone, health-aware account removal flow. [Full notes](docs/releases/v2.9.0-auth-json.1.md).
 
 ### Added
 
 - `codex-multi-auth add --auth-json <path>` reads one official ChatGPT OAuth credential file, and `--raw-auth-json` accepts a hidden TTY paste or stdin.
 - Imports reuse the login account-pool deduplication rules while preserving active indexes, pins, affinity state, and the official Codex auth files.
 - Malformed input errors do not echo credential values; file and raw input are limited to 4 MiB.
+- `codex-multi-auth remove` runs the live `check` path, shows each account's result in an interactive picker, and safely repairs active indexes, pins, and runtime affinity after deletion. Scripts can use `remove <index> --yes` and opt out of probing with `--no-check`.
 
 ## [2.9.0] - 2026-08-25
 

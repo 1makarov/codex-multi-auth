@@ -6,7 +6,7 @@ Commit: 1645baf (2.9.0-auth-json.1)
 ## OVERVIEW
 
 Vitest suites for OAuth flow, request transforms, response handling, rotation logic, storage, CLI management, repo hygiene, and more.
-**5563 tests** across **345 test files** with 80%+ coverage threshold (2.9.0-auth-json.1; 22 tests and 2 files skipped by default).
+**5574 tests** across **346 test files** with 80%+ coverage threshold (2.9.0-auth-json.1; 22 tests and 2 files skipped by default).
 
 ## STRUCTURE
 ```
@@ -31,6 +31,7 @@ test/
 ├── codex-cli-sync.test.ts          # CLI sync coordination
 ├── codex-host-resolver.test.ts     # host resolver
 ├── codex-manager-cli.test.ts       # CLI settings Q cancel, all 5 panels
+├── codex-manager-remove-command.test.ts # Checked removal command and storage invariants
 ├── codex-prompts.test.ts           # Codex prompt generation
 ├── codex-routing.test.ts           # Codex routing decisions
 ├── codex.test.ts                   # Codex instructions/caching

@@ -15,6 +15,7 @@ import {
 	runBestCommand,
 } from "./codex-manager/commands/best.js";
 import { runAddCommand } from "./codex-manager/commands/add.js";
+import { runRemoveCommand } from "./codex-manager/commands/remove.js";
 import {
 	applyTokenAccountIdentity,
 	hasLikelyInvalidRefreshToken,
@@ -232,6 +233,7 @@ const IMPLEMENTED_FEATURES: ImplementedFeature[] = [
 	{ id: 52, name: "Why-selected and monitor diagnostics" },
 	{ id: 53, name: "Config explain, init-config templates, and debug bundle" },
 	{ id: 54, name: "mcodex convenience launcher (monitor/tmux/forward)" },
+	{ id: 55, name: "Standalone account removal with live check status" },
 ];
 
 async function runForecast(args: string[]): Promise<number> {
@@ -518,6 +520,7 @@ const CLI_COMMAND_HANDLERS: ReadonlyMap<string, CliCommandHandler> = new Map<
 >([
 	["login", (rest) => runAuthLogin(rest, { runForecast, createRepairCommandDeps })],
 	["add", (rest) => runAddCommand(rest)],
+	["remove", (rest) => runRemoveCommand(rest)],
 	["list", runListOrStatusCommand],
 	["status", runListOrStatusCommand],
 	[

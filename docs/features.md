@@ -99,6 +99,7 @@ All governance data stays under `~/.codex/multi-auth`. Nothing here is a hosted 
 | Experimental settings hotkeys | Keyboard shortcuts for sync preview, backup export, and refresh-guard tuning | dashboard experimental |
 | Browser-first OAuth with device/manual fallback | Browser-first login; `--device-auth` for remote/headless; `--manual`, `--no-browser`, and `CODEX_AUTH_NO_BROWSER=1` as callback-paste fallbacks | `codex-multi-auth login` |
 | Offline auth.json account import | Add or update one official ChatGPT OAuth credential set from a path or hidden/raw stdin without changing the current selection | `codex-multi-auth add` |
+| Checked account removal | Live-check the saved pool, show the per-account outcomes, and safely remove one selected account while repairing pins and positional state | `codex-multi-auth remove` |
 | Provider-agnostic history | Lists local Codex rollout sessions regardless of active model provider (avoids `/resume` provider-filter gaps when rotation is on) | `codex-multi-auth history` |
 | `mcodex` convenience launcher | Default-forwards to the wrapper; `--monitor` live-lists accounts; `--tmux` / `-t` opens a tmux session (optional `--live-accounts`) | `mcodex` |
 
@@ -123,8 +124,9 @@ Device auth prints `https://auth.openai.com/codex/device` plus a one-time code a
 capabilities used by automation and smoke tests. It is **not** the full product
 map: prefer this page and [reference/commands.md](reference/commands.md) for the
 complete surface (rotation, governance, bridge, history, mcodex, app bind, and
-newer diagnostics). The checklist was extended through feature id 54 to cover
-device auth, runtime rotation, governance, bridge, history, and mcodex.
+newer diagnostics). The checklist was extended through feature id 55 to cover
+device auth, runtime rotation, governance, bridge, history, mcodex, and checked
+account removal.
 
 ---
 
